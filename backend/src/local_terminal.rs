@@ -186,6 +186,8 @@ impl LocalTerminalRuntime {
         spawn_pump(
             session_id.clone(),
             request.workbench_id,
+            rows,
+            cols,
             pair.master,
             reader,
             writer,
@@ -343,6 +345,8 @@ async fn publish_local_terminal(
 fn spawn_pump(
     session_id: String,
     workbench_id: String,
+    pty_rows: u16,
+    pty_cols: u16,
     master: Box<dyn MasterPty + Send>,
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
@@ -383,6 +387,8 @@ fn spawn_pump(
         let mut master = Some(master);
         let mut closing = false;
         let mut exit_code: Option<Option<u32>> = None;
+        let mut handshake_pending = current_platform() == Platform::Windows;
+        let mut handshake_scan: Vec<u8> = Vec::new();
         loop {
             if closing {
                 // Graceful-first teardown: with the master dropped the slave
@@ -408,6 +414,12 @@ fn spawn_pump(
             tokio::select! {
                 chunk = out_rx.recv() => match chunk {
                     Some(data) => {
+                        if handshake_pending && detect_conpty_handshake(&mut handshake_scan, &data) {
+                            handshake_pending = false;
+                            let reply = conpty_cpr_reply(pty_rows, pty_cols);
+                            let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
+                            let _ = writer.write_all(&reply).and_then(|_| writer.flush());
+                        }
                         publish_local_terminal(&session_id, TerminalStream::Stdout, data, &replay, &emitter).await;
                     }
                     None => closing = true,
@@ -475,6 +487,41 @@ fn spawn_pump(
         );
         sessions.write().await.remove(&session_id);
     });
+}
+
+/// ConPTY's startup cursor-position query, which conhost withholds all
+/// output behind until a CPR reply arrives.
+const CONPTY_CPR_QUERY: &[u8] = b"\x1b[6n";
+
+/// Windows ConPTY opens every session with a handshake: conhost sends the
+/// terminal `CSI 6n` and withholds ALL output until a CPR reply comes back,
+/// which it reads as the terminal's viewport size. The reply normally travels
+/// terminal → PTY input — i.e. through the same workbench binary bridge as
+/// keystrokes — and when that path drops it, every local shell sits alive but
+/// permanently silent: no banner, no prompt, no echo (the terminal looks
+/// dead while the child process runs). So the sidecar answers the FIRST
+/// query itself with the PTY size — exactly the value conhost wants. A real
+/// terminal's own reply is then a duplicate, which conhost tolerates; later
+/// `CSI 6n` queries from applications (PSReadLine, vim) still pass through
+/// untouched for the terminal to answer truthfully.
+fn detect_conpty_handshake(scan: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    scan.extend_from_slice(chunk);
+    if scan
+        .windows(CONPTY_CPR_QUERY.len())
+        .any(|window| window == CONPTY_CPR_QUERY)
+    {
+        return true;
+    }
+    // Retain a short tail so a query split across chunk boundaries still
+    // matches on the next chunk.
+    let keep_from = scan.len().saturating_sub(CONPTY_CPR_QUERY.len() - 1);
+    scan.drain(..keep_from);
+    false
+}
+
+/// The CPR reply ConPTY expects: `CSI rows;cols R` (1-based viewport size).
+fn conpty_cpr_reply(rows: u16, cols: u16) -> Vec<u8> {
+    format!("\x1b[{rows};{cols}R").into_bytes()
 }
 
 fn unix_now_secs() -> u64 {
@@ -980,6 +1027,34 @@ fn prepare_integration(kind: ShellKind, enabled: bool) -> PreparedIntegration {
 mod tests {
     use super::*;
     use crate::model::TerminalFrame;
+
+    #[test]
+    fn conpty_handshake_detected_in_first_chunk() {
+        let mut scan = Vec::new();
+        assert!(detect_conpty_handshake(&mut scan, b"noise\x1b[6n"));
+    }
+
+    #[test]
+    fn conpty_handshake_detected_when_split_across_chunks() {
+        let mut scan = Vec::new();
+        assert!(!detect_conpty_handshake(&mut scan, b"banner\x1b[6"));
+        assert!(detect_conpty_handshake(&mut scan, b"n rest"));
+    }
+
+    #[test]
+    fn conpty_detection_ignores_private_dsr_and_later_queries() {
+        let mut scan = Vec::new();
+        assert!(!detect_conpty_handshake(&mut scan, b"\x1b[?6n\x1b[?25h"));
+        // After a hit the caller stops scanning; the detector itself must not
+        // confuse DECDSR (`CSI ?6n`) with the plain query.
+        assert!(!detect_conpty_handshake(&mut scan, b"\x1b[?6n"));
+    }
+
+    #[test]
+    fn conpty_cpr_reply_carries_viewport_size() {
+        assert_eq!(conpty_cpr_reply(24, 80), b"\x1b[24;80R".to_vec());
+        assert_eq!(conpty_cpr_reply(1, 1), b"\x1b[1;1R".to_vec());
+    }
 
     #[test]
     fn macos_prefers_directory_services_shell_over_env() {
