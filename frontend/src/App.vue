@@ -145,6 +145,7 @@ import { filterQuickCommands, normalizeQuickCommands, QUICK_COMMANDS_LIMIT, quic
 import { batchTargetLabel, deriveBatchCommandName, normalizeBatchTargets, normalizeLocalBatchTargets, quickPickCommandById, selectBatchTargets, summarizeBatchResults, toggleBatchTarget, type BatchSendSummary, type BatchSendTarget } from "./lib/batchSend";
 import { formatLatency, formatAuthMethodLabel, normalizeConnectionPort, normalizeConnectionText, type KnownAuthMethod } from "./lib/connectionInfo";
 import { readPluginMode, readPluginShell, resolveWorkbenchId } from "./lib/pluginContext";
+import { shellTabTitle } from "./lib/shellTabTitle";
 import { clampFontSize } from "./lib/terminalZoom";
 import { pluginStore } from "./lib/pluginStore";
 import { loadTerminalFontOverride, persistTerminalFontFamily, persistTerminalFontSize, resolveTerminalFont, type TerminalFontOverride } from "./lib/terminalFont";
@@ -1066,6 +1067,16 @@ const sessionPillText = computed(() => {
   if (!isLocalMode.value || !localSession.value) return t(`sessionStatus.${sessionStatus.value}`);
   const kind = localSession.value.shell.split(/[\\/]/).pop() || localSession.value.shell;
   return `${t("sessionStatus.local")} · ${kind}`;
+});
+// 连接无关的本地终端 tab 用 shell 类型命名宿主 tab（宿主以 iframe document.title
+// 命名 tab）：起 shell / 接回会话时生效，退出后保留最后一种 shell 名（VS Code 同
+// 款），重开换 shell 随之更新。SSH 连接 tab（含其中打开的本地终端面板）不动标题。
+const localShellTabTitle = computed(() => {
+  if (!localUiMode.value || connectionId.value || !localSession.value) return "";
+  return shellTabTitle(localSession.value.shell);
+});
+watch(localShellTabTitle, (title) => {
+  if (title) document.title = title;
 });
 // 连接卡片四态：用户取消优先于底层 terminalState（在途 open 仍是 connecting）；
 // open 成功后的短暂 success 态优先于 connecting；其余（error/disconnected）
