@@ -4,6 +4,29 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [0.7.1-beta.4] — 2026-09-27
+
+Tabby / NetCatty 五协议对标批（协议处理加固 + 测试面扩容，后端 617 / 前端 646 单测 + 8 个真机 smoke 全绿；对标与决策记录见 `docs/TABBY_PROTOCOL_PARITY.zh-CN.md`、`docs/AUTH_ADVERSARIAL_REVIEW.zh-CN.md`）。
+
+### 新增 / Added
+
+- **Agent 认证预算计划器**：agent 密钥逐个尝试现在受预算约束（默认 5 次——OpenSSH `MaxAuthTries` 默认 6 次含 none 探测），服务器已示意 keyboard-interactive（partial success）时立即转入 MFA 应答而不再烧掉剩余尝试名额；传输层错误首个即停，错误原文直接呈现，预算耗尽时提示改用指定私钥，不再只给笼统的"身份被拒"。
+  **Agent auth budget planner:** identity attempts are now budgeted (5 by default — OpenSSH's `MaxAuthTries` of 6 includes the leading none probe), a partial-success nudge toward keyboard-interactive switches to MFA answering immediately instead of burning remaining attempts, the first transport error stops the loop with its original message, and an exhausted budget suggests pinning a private key instead of a generic rejection.
+
+- **SFTP 文件名不可解码标记**：服务器 locale 非 UTF-8（如 GBK）时文件名里的损坏字符现在会被标记（`sftp/list` 与 sudo 列表恒定输出 `undecodable`），SFTP 面板对这类条目显示警示图标与七语提示，引导修正远端 `LANG`；协议层已在解码时丢弃原始字节，任何客户端编码器都无法还原，因此不做转码器。
+  **Undecodable SFTP name flag:** names damaged by a non-UTF-8 server locale (GBK etc.) are now flagged (`undecodable` on `sftp/list` and sudo listings) with a warning icon and a seven-language hint in the SFTP pane; the wire layer already discards the raw bytes, so no client-side codec could recover them.
+
+- **none 探测广告集门（reconcile）**：none 探测拿到的服务器广告集现在会约束后续密码 / keyboard-interactive 的尝试（两份广告集都放行才尝试、冲突取严；服务器未提供广告集时保持旧行为），密码型连接在被明确拒绝的方法上不再浪费尝试次数。
+  **None-probe advertisement gate:** the method set advertised to the none probe now also constrains later password / keyboard-interactive attempts (both sets must allow a method; the stricter side wins; missing sets keep the old behavior), so password connections stop wasting attempts on explicitly rejected methods.
+
+### 修复 / Fixed
+
+- **trzsz 进度不再回跳与虚报**：乱序/重放的进度事件不再让进度条倒退，会话总量不再被重复的 size 通告或超长尾块虚增，重跑传输不再继承上一轮的总量分母，非数值的 size 通告被忽略。
+  **trzsz progress no longer jumps backwards or overcounts:** out-of-order / replayed progress events can no longer move the bar backwards, session totals are no longer inflated by duplicate size announcements or oversized trailing chunks, re-runs no longer inherit the previous total, and non-numeric sizes are ignored.
+
+- **含 `..` 的上传目标不再落错临时目录**：上传临时件（`.part`/`.backup`)现在与规范化后的最终目标同目录，原子改名前提在所有路径形态下成立；相对路径父目录弹空时显式报错。
+  **Upload targets containing `..` stage in the right directory:** upload temporaries (`.part`/`.backup`) now sit next to the normalized final target, keeping the atomic rename precondition for every path shape; relative paths whose parent collapses away fail with an explicit error.
+
 ## [0.6.0] — 2026-09-22
 
 0.6.0 正式版，收束 0.6.0-beta.1–4 的全部变更。

@@ -184,3 +184,22 @@ React 19 独立桌面 SSH 工作台）为参照的能力借鉴（实施计划
 | 会话录制回放 + GIF 导出 | ✅ 已有（同批新增） | `ssh/recording/*` 五方法：asciicast v2 `.cast` 落盘（会话关闭自动收尾）、`ssh/recording/get` 分页回放（xterm 重放、0.5–4× 倍速、进度条 seek）、GIF 导出（离屏 xterm 逐事件重放 + 500ms 抽帧 + 零依赖 GIF89a 编码器，封顶 120 帧）。iShell 的暂停/快进/水印/帧率质量参数未做 |
 | GPU 监控、大文件扫描、主机巡检报告 | ⏸ 未做（候选） | GPU 依赖远端 nvidia-smi 等工具可用性；大文件扫描与巡检报告维持"另有对标项"候选结论 |
 | 终端 WebGL GPU 加速渲染 | ✅ 已有（2026-09-13 落地） | `@xterm/addon-webgl`（0.18.0，配 xterm 5.5）：主终端默认挂 GPU renderer（localStorage 偏好 `ssh-terminal-webgl`，设置弹窗「终端渲染」开关即时切换）；WebGL 不可用（headless/无 context/驱动限制）构造即回退 DOM 渲染器，context loss（GPU 重置）自动 dispose 回退；回放弹窗与 GIF 导出的离屏终端刻意保持 2d canvas（导出依赖 drawImage 稳定路径、且浏览器 WebGL context 总数有限）。纯逻辑（偏好/挂载/回退/切换）独立模块 `terminalWebgl.ts` + 单测 7 |
+
+## Tabby/NetCatty 五协议对标批（2026-09-27）
+
+以 Tabby（master 4004cc5）、NetCatty（main@8568375）、electerm、tssh、Guacamole
+为参照的五协议（SSH/RDP/串口/VNC/Telnet）处理与测试用例对标；结论与逐条映射见
+`docs/TABBY_PROTOCOL_PARITY.zh-CN.md`，认证域对抗评审终裁见
+`docs/AUTH_ADVERSARIAL_REVIEW.zh-CN.md`。RDP/VNC 在 Tabby/NetCatty/WindTerm/
+Xshell/Termius/SecureCRT 全部不存在，维持不立项；Telnet/Serial 维持宿主承担
+（立项时按对标文档 §4/§5 测试维度清单验收）。本批落地：
+
+| 能力 | 参照位置 | 插件状态 | 说明 |
+| --- | --- | --- | --- |
+| agent 认证预算计划器（MaxAuthTries 防护） | Tabby authMethodSelection / NetCatty identitiesOnly | ✅ 已有（对抗评审 #1 落地） | `plan_agent_identity_attempt` 纯函数 + `AGENT_IDENTITY_MAX_ATTEMPTS=5`（MaxAuthTries 默认 6 − none 探测 1）；partial success 命中即转 keyboard-interactive 不再烧名额；transport 错误首错即停并透出原文（替换笼统 `No SSH Agent identity was accepted`），预算耗尽文案指引指定私钥。`AgentAuthOutcome::Rejected(String)` 携带原因；4 个计划器单测 + koko mock `PasswordRejectedThenMfa` 形状固化"密码全拒仍 seed 第一因子"契约（#7，改严格判定会打爆 PAM smoke，属知情让渡） |
+| none 探测 | NetCatty 认证序列 | ✅ 已有（实证澄清） | 生产认证序列第一步即发 none（ssh.rs:2456-2468），此前对标文档误记"未见"；广告集消费（reconcile）经对抗评审裁为二期，前置条件已满足，待独立 PR |
+| SFTP 文件名不可解码标记 | NetCatty gb18030 解码 | ✅ 已有（最小方案） | russh-sftp wire 层 `from_utf8_lossy` 使 GBK 原始字节不可恢复（encoding_rs 无效，对抗评审裁决不引入）；`sftp/list` 与 sudo 列表条目新增恒定布尔 `undecodable`（文件名含 U+FFFD），前端警示图标 + 七语提示引导修正远端 locale；PROTOCOL 文档已同步 |
+| zmodem/trzsz 传输状态机幂等 | electerm xmodem stale-ACK | ✅ 已有（修复） | trzsz 进度：step 单调钳制（乱序/重放不回跳）、totalTransferred 用钳制后增量、重复 size 事件去重、`num` 分支清残留 totalSize、NaN size 守卫；zmodem：未请求 sz 一律 deny（决策纯函数 `decideZmodemDetection`）、resume offset 越界钳制 |
+| known_hosts TOFU 闭环测试 | electerm host-trust / tssh 鲁棒性 | ✅ 已有（测试资产） | check→learn→check 变 Trusted、learned key 变更拒绝（MITM 护栏）两个闭环用例；写路径 learn 追加语义 + 8192 字符脏行截断既有覆盖不变 |
+| 上传临时件路径边界 | Guacamole 路径矩阵 | ✅ 已有（修复） | `remote_transfer_paths` 段级 `..` 收敛（含 `..` 目标的 `.part`/`.backup` 临时件与 normalize 后目标同目录，原子 rename 前提）；相对父目录弹空显式拒绝 |
+| 认证计划纯函数单测 | Tabby authMethodSelection 7 用例 | ✅ 已有 | `method_offered`/`auth_partial_success` 直接断言（服务器广告驱动、Success/空集 false、partial 三态） |

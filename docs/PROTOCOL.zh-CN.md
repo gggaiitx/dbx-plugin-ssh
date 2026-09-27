@@ -301,7 +301,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 | --- | --- | --- | --- |
 | `path` | string | 是 | 远端目录路径 |
 
-返回 `{ path, entries }`，`entries` 为 `SftpEntry` 数组，结构与 `sftp/list` 完全一致（`name`、`uri`、`kind`、`size`、`modifiedAt`、`permissions`、`contentType`，可选字段缺省时省略），并恒定附带 `owner`/`group` 属主与属组名字（来自 `ls -la` 解析，无额外往返；解析不到时省略）。错误：路径不存在或不是目录；sudo 不可用。
+返回 `{ path, entries }`，`entries` 为 `SftpEntry` 数组，结构与 `sftp/list` 完全一致（含 `undecodable` 标记）（`name`、`uri`、`kind`、`size`、`modifiedAt`、`permissions`、`contentType`，可选字段缺省时省略），并恒定附带 `owner`/`group` 属主与属组名字（来自 `ls -la` 解析，无额外往返；解析不到时省略）。错误：路径不存在或不是目录；sudo 不可用。
 
 ### sudo/readFile
 
@@ -383,7 +383,7 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 | `path` | string | 是 | 远端目录路径 |
 | `includeOwner` | boolean | 否 | 是否附加属主/属组信息，默认 `false` |
 
-返回 `{ entries: SftpEntry[] }`。`SftpEntry` 基础字段：`name`、`uri`、`kind`（`file`/`directory`/`symlink`/`other`）、`size`、`modifiedAt`、`permissions`、`contentType`（可选字段缺省时省略）。
+返回 `{ entries: SftpEntry[] }`。`SftpEntry` 基础字段：`name`、`uri`、`kind`（`file`/`directory`/`symlink`/`other`）、`size`、`modifiedAt`、`permissions`、`contentType`（可选字段缺省时省略）、`undecodable`（布尔，恒定输出；文件名含 U+FFFD 替换字符时为 `true`——russh-sftp 对非 UTF-8 服务器 locale（如 GBK）做 lossy 解码，原始字节已不可恢复，UI 据此显示警示标记并提示修正远端 locale）。
 
 `includeOwner: true` 时，每个条目可携带可选 `owner`、`group` 字符串字段（属主用户、属组）：优先服务器直接提供的名字（SFTPv4+ 属主属性），数字 uid/gid 次之，SFTPv3 服务器（如 OpenSSH）再经一次只读 `ls -l` 往返升级为名字——该次往返失败（无 shell、无 `ls`、超时）时静默保留数字或省略字段，不影响列表本身。字段缺失即"未知"，由 UI 显示 `-`。省略 `includeOwner`（或为 `false`）时不输出这两个字段，与历史响应完全一致。`sudo/listDir` 恒定返回 `owner`/`group`（`ls -la` 解析附带，无额外往返）。
 
