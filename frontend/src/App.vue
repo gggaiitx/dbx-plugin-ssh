@@ -3274,6 +3274,26 @@ function scheduleFit() {
   }, 20);
 }
 
+/** Synchronous fit for spawn-time sizing: returns the real panel cols/rows.
+ * Sessions MUST be spawned at this size — spawning at xterm's 80×24 default
+ * and fitting right after makes ConPTY/PSReadLine repaint the prompt at the
+ * new geometry (a second prompt line with a blank gap), which users read as
+ * broken rendering. fit() throws when the iframe is detached mid-tab-switch;
+ * fall back to the current terminal dims in that case. */
+function fitTerminalDimensions(): { cols: number; rows: number } {
+  if (!terminal || !fitAddon) return { cols: 120, rows: 32 };
+  try {
+    if (!terminalHost.value?.clientWidth || !terminalHost.value.clientHeight) {
+      return { cols: terminal.cols, rows: terminal.rows };
+    }
+    fitAddon.fit();
+    trzszFilter?.setTerminalColumns(terminal.cols);
+  } catch {
+    // The iframe can briefly be detached while DBX switches tabs.
+  }
+  return { cols: terminal.cols, rows: terminal.rows };
+}
+
 function stopCommandMarkerTick() {
   if (commandMarkerTimer) {
     window.clearInterval(commandMarkerTimer);
@@ -4389,8 +4409,8 @@ async function openSession(forceNew = false, bootRestore = false, isRetry = fals
       workbenchId: workbenchId.value,
       requestedSessionId,
       ...sessionTransportOpenParams(transportReuseState),
-      cols: terminal?.cols || 120,
-      rows: terminal?.rows || 32,
+      // spawn 即真实面板尺寸，理由同 local/terminal/start（fitTerminalDimensions）。
+      ...fitTerminalDimensions(),
     }, { timeoutMs: attemptTimeoutMs });
     // 用户取消后在途 open 仍可能成功（invoke 无法中止）：立即关闭这个孤儿
     // 会话并提前返回——不置 connected、不补发 replay，卡片停在已取消态。
@@ -4613,8 +4633,9 @@ async function startLocalTerminal(shellOverride?: string) {
   try {
     const info = await window.dbxPlugin.invoke<{ sessionId: string; shell: string }>("local/terminal/start", {
       workbenchId: workbenchId.value,
-      cols: terminal?.cols || 120,
-      rows: terminal?.rows || 32,
+      // spawn 用 fit 出的真实面板尺寸（不能等 start 之后的 scheduleFit——
+      // 尺寸差会触发 ConPTY/PSReadLine 在新几何下重绘提示符＝双提示符）。
+      ...fitTerminalDimensions(),
       // Shell precedence: explicit dock choice > user preference > auto-detection.
       ...(shellOverride?.trim() ? { shell: shellOverride.trim() } : localShellPref.value ? { shell: localShellPref.value } : {}),
       ...(localShellIntegrationPref.value ? {} : { shellIntegration: false }),
@@ -4736,8 +4757,7 @@ async function startTelnetSession(options: TelnetConnectOptions): Promise<boolea
       runtimePort: runtimeEndpoint.value.port || options.port,
       enterMode: options.enterMode,
       backspaceMode: options.backspaceMode,
-      cols: terminal?.cols || 120,
-      rows: terminal?.rows || 32,
+      ...fitTerminalDimensions(),
       ...(autoLogin ? { autoLogin } : {}),
     });
     if (disposed) {
