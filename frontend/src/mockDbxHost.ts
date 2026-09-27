@@ -39,6 +39,15 @@ const localeListeners = new Set<(locale: string) => void>();
 // 与 DBX globals.css 的 :root（pearl 浅色）和 .dark 规范块保持一致。
 const light = fixtureParams.get("theme") === "light";
 
+// ?noanim=1 关闭全部 CSS 动画/过渡：截图型可视 e2e 在动画被节流的宿主里会
+// 拍到停在半透明入场帧的弹层（reka fade-in 冻结在 opacity 0，弹层呈"鬼影"），
+// 该参数锁定稳定终态帧，让逐弹层截图可复现。
+if (fixtureParams.get("noanim") === "1") {
+  const style = document.createElement("style");
+  style.textContent = "*,*::before,*::after{animation:none!important;transition:none!important}";
+  document.head.appendChild(style);
+}
+
 // ?local=1 simulates a host opening a connectionless local-terminal tab via the command context (plugin.mode="local-terminal");
 // Connectionless local-terminal tab (HOST_PLUGIN_UI_SPEC §4/§7.1 passthrough): no
 // connectionId/connection. workbenchId/restored/surface are injected by the host (mock).

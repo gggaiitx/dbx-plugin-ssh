@@ -353,3 +353,42 @@
 - R5-P2-2（瞬态 notice 换语）按第 5 轮判定维持"边缘豁免，可不修"。
 - **第 6 轮零新发现，扫描收敛。**
 - 复跑资产：脚本留存 `/tmp/uiscan-ssh-r6/verify-r6.mjs`（不入库）；本轮截图 0 张留存（全程无失败）。
+## 8. 第 7 轮（visual.html 可视化 e2e 走查，2026-09-27）
+
+> 背景：side-chat 对 `visual.html?render=dom&locale=zh-CN`（dark/light 双主题，1440×900）做逐弹层截图走查；同一时间主任务正在本 checkout 内实施工具栏"更多工具（⋯）"重组（App.vue/style.css 未提交改动），本轮不与其争用文件，只做并行安全的夹具/i18n 修复。
+
+### 8.1 走查环境
+
+| 项 | 值 |
+| --- | --- |
+| Dev server | vite --port 5299（另见 5199 被宿主 worktree 占用） |
+| 入口 | `visual.html`（= mock 宿主 + 真实 main.ts 的全工作台夹具，非"底部栏页面"） |
+| 场景 | 连接信息 / 终端设置 / 快速命令 / AI-MCP 模式 / 关键词高亮 / 自定义表头 / 传输任务 / SSH 设置（6 tab）/ 端口映射 / Quick Sudo 配置档 / 审计日志 / 服务器指标 / 录制记录 / 运行命令 / SFTP 面板 / light 主题 |
+
+### 8.2 新发现清单
+
+**P2-A 夹具/工具链：弹层入场动画在节流宿主冻结在半透明帧，截图型 e2e 不可复现**
+- 复现：IAB/无头宿主中打开任一 Popover（如连接信息），1s 内截图呈半透明"鬼影"（getComputedStyle(opacity)=0，reka fade-in 未推进）。
+- 修复（本轮落地）：`mockDbxHost.ts` 新增 `?noanim=1`，注入 `animation/transition: none` 全局样式锁定终态帧；此前需在页面里手工注入探针样式才能截到稳定图。
+
+**P2-B i18n（7 语言全缺）：SSH 设置 → MCP 尺寸 →「MCP 执行审批」下拉显示原始 key**
+- 复现：zh-CN 打开设置 MCP tab，SelectValue 显示 `mcpSettings.permissionModeAutonomous`。根因：`i18n.ts` 各语言 `mcpSettings` 只有 permissionMode/ConfirmHint/connectionScope*，缺 `permissionModeAutonomous`/`permissionModeConfirm` 两个 SelectItem 文案。
+- 修复（本轮落地）：7 语言各补两条（en/es/it/ja/pt-BR/zh-CN/zh-TW）。
+
+**P2-C i18n：审计日志结果列把协议枚举原样上屏（zh 界面出现 "approved"）**
+- 复现：审计日志 AI 审批行右侧显示 "approved"（zh-CN 下其余列均为中文，同行的 outcome 却显示 成功/失败）。根因：`auditOutcomeLabel()` 对 `entry.decision` 直接原样返回。
+- 修复（本轮落地）：decision（issued/approved/denied/timeout）经 `auditLog.decision*` 四个新 key 走 i18n，7 语言补齐；未知枚举保持原样回显（容忍 sidecar 先行新增）。`entry.gate`（如 destructive-unconfirmed）为技术门禁 id，mono 样式呈现，维持原样（设计而非缺陷）。
+
+**P2-D 夹具种子缺口（建议，未实施）**：设置 → 安全与密钥 tab 的已知主机/本机密钥恒为空态，mock 宿主可考虑给 `ssh/knownHosts/list`、`keys/discover` 各回 1–2 条种子，便于有数据态的视觉复核。
+
+**P2-E 布局观察（建议，未实施）**：SFTP 文件表默认全 5 列（名称/大小/修改时间/用户/用户组/权限）在半屏宽下必出横向滚动条；可考虑默认列集按面板宽度降级（用户仍可用「自定义表头」召回）。
+
+### 8.3 走查中确认为"设计而非缺陷"的点
+
+- 命令标记条（"退出码 0 · 耗时 0ms /home/demo"）+ 批量发送条同时常驻底部：前者是 shell-integration 状态条、后者是 quick-command bar，语义不同不合并；`visual.html` 首屏即见二者属夹具特性。
+- 「自定义表头」popover 内混排「默认打开 SFTP 面板」：当前均属 SFTP 面板偏好，暂不拆分；若后续偏好项继续增多可独立"面板设置"。
+
+### 8.4 本轮验证
+
+- `pnpm --dir frontend typecheck` / `test` / `build` 本地通过（明细见 PROGRESS 同日记录）。
+- 浏览器复验：`?noanim=1` 下弹层截图稳定不透明；MCP 审批下拉与审计结果列文案按语言正确呈现。
