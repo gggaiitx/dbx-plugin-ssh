@@ -4,7 +4,7 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
-## [Unreleased]
+## [0.7.1-beta.6] — 2026-09-27
 
 - **dock「+」启动选项收敛为单项 + 默认 Shell 可配置**：`local/terminal/launch-options` 只返回一项「本地终端（自动检测）」（接受宿主下发的 `locale`，描述展示解析后的默认 Shell；逐 shell 启动入口保留在工作台 shell 选择器）；设置·终端新增「默认 Shell」选择器（`localShell` 偏好，与工具条 shell 选择器同存储键），dock 新开的本地终端按该配置启动。
   **Dock "+" launch options collapsed to one entry + configurable default shell:** `local/terminal/launch-options` returns a single localized "Local terminal (auto-detect)" entry whose description shows the resolved default shell; Settings · Terminal gains a "Default shell" selector (the `localShell` preference shared with the toolbar shell picker), honored by local terminals opened from the dock.
