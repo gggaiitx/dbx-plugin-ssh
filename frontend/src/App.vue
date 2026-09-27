@@ -3300,6 +3300,47 @@ function fitTerminalDimensions(): { cols: number; rows: number } {
   return { cols: terminal.cols, rows: terminal.rows };
 }
 
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+/** Spawn-size gate for local shells. ConPTY repaints the whole screen buffer
+ * on every changed resize, and one racing the shell's opening output renders
+ * as a duplicated prompt/banner. On a dock "+" fresh tab the webview can
+ * still be settling when the start request fires — zero-size host (fit then
+ * falls back to xterm's default 80×24) or a pending web font swap (changes
+ * cell metrics) — so the spawn size would differ from the panel's steady
+ * state and the later real fit becomes a cross-geometry repaint. Poll frames
+ * until two consecutive fits agree on a laid-out host; after maxWaitMs give
+ * up with the last sample (never blocks boot indefinitely). */
+async function settledTerminalDimensions(maxWaitMs = 1500): Promise<{ cols: number; rows: number }> {
+  const deadline = Date.now() + maxWaitMs;
+  try {
+    // Wait out the font swap with half the budget so the sample loop below
+    // keeps its share; document.fonts can be missing in older webviews.
+    await Promise.race([
+      document.fonts?.ready ?? Promise.resolve(),
+      new Promise((resolve) => window.setTimeout(resolve, maxWaitMs / 2)),
+    ]);
+  } catch {
+    // Font readiness is best-effort; the consecutive-fit samples still guard.
+  }
+  let last: { cols: number; rows: number } | null = null;
+  while (Date.now() < deadline) {
+    await nextAnimationFrame();
+    const host = terminalHost.value;
+    if (!host?.clientWidth || !host.clientHeight) {
+      // Not laid out yet — a fit here would silently measure nothing.
+      last = null;
+      continue;
+    }
+    const dims = fitTerminalDimensions();
+    if (last && dims.cols === last.cols && dims.rows === last.rows) return dims;
+    last = dims;
+  }
+  return last ?? fitTerminalDimensions();
+}
+
 function stopCommandMarkerTick() {
   if (commandMarkerTimer) {
     window.clearInterval(commandMarkerTimer);
@@ -4639,9 +4680,10 @@ async function startLocalTerminal(shellOverride?: string) {
   try {
     const info = await window.dbxPlugin.invoke<{ sessionId: string; shell: string }>("local/terminal/start", {
       workbenchId: workbenchId.value,
-      // spawn 用 fit 出的真实面板尺寸（不能等 start 之后的 scheduleFit——
-      // 尺寸差会触发 ConPTY/PSReadLine 在新几何下重绘提示符＝双提示符）。
-      ...fitTerminalDimensions(),
+      // spawn 尺寸必须等于面板稳定后的尺寸（单靠 fitTerminalDimensions 不够——
+      // dock「+」新 tab 此时可能还没布局完，fit 回落 80×24，稍后的真实 fit 是
+      // 一次跨几何 resize，ConPTY 整屏重绘＝提示符/横幅渲染两遍）。
+      ...(await settledTerminalDimensions()),
       // Shell precedence: explicit dock choice > user preference > auto-detection.
       ...(shellOverride?.trim() ? { shell: shellOverride.trim() } : localShellPref.value ? { shell: localShellPref.value } : {}),
       ...(localShellIntegrationPref.value ? {} : { shellIntegration: false }),
