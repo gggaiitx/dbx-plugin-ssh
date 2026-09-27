@@ -4,8 +4,10 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
-## [Unreleased]
+## [0.7.1-beta.8] — 2026-09-27
 
+- **修复 Windows 本地终端启动 banner 重复渲染**：sidecar 对本地终端的同尺寸 resize 请求直接丢弃（Windows ConPTY 对同尺寸 `ResizePseudoConsole` 也会整屏重绘缓冲区，与 shell 启动横幅输出竞态，产生顶部孤字/底部重复 banner），仅真实几何变化才到达 PTY。
+  **Fix duplicated banner on Windows local terminal start:** same-size resize requests are now dropped before reaching ConPTY — ConPTY re-serializes its whole screen buffer even for same-size resizes, racing the shell banner into a duplicated prompt; only real geometry changes reach the PTY.
 - **dock「+」启动项重构为「本地终端」可折叠分组**：`local/terminal/launch-options` 返回的每一项携带 `group` 本地化标签——首项为默认 Shell 启动项（描述展示解析后的默认 Shell，`localShell` 偏好优先），其余为本机扫描到的 shell 子项（`context` 固定 `shell` 程序）；宿主渲染为单个可折叠「本地终端」分组，与下方连接分组同一交互。
   **Dock "+" launch options reworked into a collapsible "Local terminal" group:** every entry now carries a localized `group` label — the first entry launches with the resolved default shell (shown in its description, `localShell` preference first) followed by one entry per machine-scanned shell; the host renders them as one collapsible section matching the connection groups below.
 
