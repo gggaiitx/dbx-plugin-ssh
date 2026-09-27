@@ -19,6 +19,21 @@ export interface ZmodemSentryHandlers {
 
 const ZMODEM_CHUNK_SIZE = 64 * 1024;
 
+/**
+ * Decision for an incoming ZMODEM detection: only a "send"-role session
+ * (the peer announcing `sz`, i.e. offering files) that matches the locally
+ * pending upload queue may be confirmed. Anything else — an offer we never
+ * asked for, or a session role we cannot handle — is denied so an unrequested
+ * `sz` never silently lands files on this machine.
+ */
+export type ZmodemDetectionDecision = { action: "confirm" } | { action: "deny"; reason: "receiveOffer" | "roleMismatch" };
+
+export function decideZmodemDetection(detection: { get_session_role(): string }, pendingUploadFiles: boolean): ZmodemDetectionDecision {
+  if (pendingUploadFiles && detection.get_session_role() === "send") return { action: "confirm" };
+  if (pendingUploadFiles) return { action: "deny", reason: "roleMismatch" };
+  return { action: "deny", reason: "receiveOffer" };
+}
+
 export function createZmodemSentry(handlers: ZmodemSentryHandlers): Sentry {
   return new Zmodem.Sentry({
     sender(data) {
@@ -74,7 +89,9 @@ export async function sendZmodemFiles(session: Session, files: readonly File[], 
   await session.close();
 }
 
-function validTransferOffset(transfer: Transfer, fileSize: number): number {
+/** Clamps the peer-declared resume offset into [0, fileSize]; non-finite or
+ * out-of-range values restart from zero instead of hanging the chunk loop. */
+export function validTransferOffset(transfer: Transfer, fileSize: number): number {
   const offset = transfer.get_offset();
   return Number.isFinite(offset) && offset >= 0 && offset <= fileSize ? offset : 0;
 }

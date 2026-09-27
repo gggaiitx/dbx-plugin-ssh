@@ -56,7 +56,9 @@ describe("sanitizeSftpEntries", () => {
 
   it("passes a healthy payload through unchanged in shape", () => {
     const row = { name: "hosts", uri: "sftp:/etc/hosts", kind: "file", size: 221, modifiedAt: 1700000000, permissions: "0644" };
-    expect(sanitizeSftpEntries([row])).toEqual([row]);
+    // sanitize 归一化补齐 owner/group（undefined）与 undecodable（false），
+    // 其余字段原样透传。
+    expect(sanitizeSftpEntries([row])).toEqual([{ ...row, undecodable: false }]);
   });
 
   it("keeps owner/group strings and normalizes non-string values to undefined", () => {
@@ -72,6 +74,19 @@ describe("sanitizeSftpEntries", () => {
     expect(entries[1].group).toBeUndefined();
     expect(entries[2].owner).toBeUndefined();
     expect(entries[2].group).toBeUndefined();
+  });
+
+  it("keeps the undecodable flag only for boolean true (gb18030 minimal plan)", () => {
+    // russh-sftp lossy 解码后含 U+FFFD 的条目由 sidecar 标记 undecodable=true；
+    // 缺字段（旧 sidecar）与非布尔值一律归一为 false，避免畸形数据触发警示。
+    const entries = sanitizeSftpEntries([
+      { name: "bad\uFFFDname", uri: "sftp:/x", kind: "file", undecodable: true },
+      { name: "clean", uri: "sftp:/y", kind: "file" },
+      { name: "junk", uri: "sftp:/z", kind: "file", undecodable: "yes" },
+    ]);
+    expect(entries[0].undecodable).toBe(true);
+    expect(entries[1].undecodable).toBe(false);
+    expect(entries[2].undecodable).toBe(false);
   });
 });
 

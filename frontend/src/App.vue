@@ -119,7 +119,7 @@ import {
 } from "./lib/sessionTransportReuse";
 import { createConnectLog } from "./lib/connectLog";
 import { pickModalFocusTarget } from "./lib/modalFocus";
-import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
+import { createZmodemSentry, decideZmodemDetection, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
@@ -257,6 +257,8 @@ interface SftpEntry {
   /** 属主用户/属组（includeOwner 时由 sidecar 返回；缺失显示 "-"）。 */
   owner?: string;
   group?: string;
+  /** russh-sftp lossy 解码后含 U+FFFD 的条目：原始字节已丢失，仅作警示。 */
+  undecodable?: boolean;
 }
 
 interface SftpStatInfo {
@@ -1937,9 +1939,10 @@ function resetZmodemSentry() {
 }
 
 function handleZmodemDetection(detection: ZmodemDetection) {
-  if (!pendingZmodemFiles.length || detection.get_session_role() !== "send") {
+  const decision = decideZmodemDetection(detection, pendingZmodemFiles.length > 0);
+  if (decision.action === "deny") {
     detection.deny();
-    if (pendingZmodemFiles.length) finishZmodemUpload(new Error(t("zmodemUploadOnly")));
+    if (decision.reason === "roleMismatch") finishZmodemUpload(new Error(t("zmodemUploadOnly")));
     return;
   }
   try {
@@ -8784,6 +8787,13 @@ onBeforeUnmount(() => {
                     @blur="commitRename(entry)"
                   />
                   <span v-else>{{ entry.name }}</span>
+                  <!-- gb18030 最小方案：russh-sftp lossy 解码后含 U+FFFD 的条目，
+                       原始字节已不可恢复，仅警示不动名。 -->
+                  <TriangleAlert
+                    v-if="entry.undecodable"
+                    class="sftp-undecodable-icon"
+                    :title="t('sftpUndecodableNameHint')"
+                  />
                 </span>
                 <span v-if="visibleColumns.includes('size')" class="numeric">{{ entry.kind === "file" ? formatBytes(entry.size) : "" }}</span>
                 <span v-if="visibleColumns.includes('modified')">{{ formatModified(entry.modifiedAt) }}</span>

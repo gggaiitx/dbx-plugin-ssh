@@ -21,6 +21,8 @@ export interface SftpSanitizedEntry {
   owner?: string;
   /** 属组；缺省即"未知"（渲染 "-"）。 */
   group?: string;
+  /** russh-sftp lossy 解码后含 U+FFFD 的条目：原始字节已丢失，仅作警示。 */
+  undecodable?: boolean;
 }
 
 const KNOWN_KINDS: readonly SftpEntryKind[] = ["file", "directory", "symlink", "other"];
@@ -98,6 +100,7 @@ export function sanitizeSftpEntries(value: unknown): SftpSanitizedEntry[] {
       permissions: typeof record.permissions === "string" ? record.permissions : undefined,
       owner: optionalString(record.owner),
       group: optionalString(record.group),
+      undecodable: record.undecodable === true,
     });
   }
   return entries;

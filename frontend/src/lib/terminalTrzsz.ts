@@ -110,6 +110,12 @@ export interface TrzszProgressState {
   completedTransferred: number;
   totalTransferred: number;
   totalSize: number;
+  /**
+   * File name whose size was last folded into totalSize: a repeated `size`
+   * callback for the same file (stale ACK re-delivery) must not accumulate
+   * twice. Cleared on every `name`/`num` so the next file declares fresh.
+   */
+  sizeDeclaredFor: string;
   message: string;
 }
 
@@ -125,6 +131,7 @@ export function initialTrzszProgressState(): TrzszProgressState {
     completedTransferred: 0,
     totalTransferred: 0,
     totalSize: 0,
+    sizeDeclaredFor: "",
     message: "",
   };
 }
@@ -139,7 +146,10 @@ export function reduceTrzszProgress(state: TrzszProgressState, event: TrzszProgr
     case "started":
       return { ...initialTrzszProgressState(), phase: "transferring", direction: event.direction };
     case "num":
-      return { ...state, phase: "transferring", fileCount: Math.max(0, event.count), fileIndex: 0, completedTransferred: 0, totalTransferred: 0 };
+      // A fresh `num` re-arms the session counters: without clearing totalSize
+      // a re-run that skips waiting/started keeps the previous session's
+      // declared size and the overall percent divides by the wrong total.
+      return { ...state, phase: "transferring", fileCount: Math.max(0, event.count), fileIndex: 0, completedTransferred: 0, totalTransferred: 0, totalSize: 0, sizeDeclaredFor: "" };
     case "name":
       return {
         ...state,
@@ -147,14 +157,32 @@ export function reduceTrzszProgress(state: TrzszProgressState, event: TrzszProgr
         fileName: event.name,
         fileTransferred: 0,
         fileSize: 0,
+        sizeDeclaredFor: "",
       };
     case "size": {
+      // NaN (hostile/garbled callback) must not poison the totals: treat it as
+      // an absent declaration and keep the previous sizes intact.
+      if (!Number.isFinite(event.size)) return state;
       const size = Math.max(0, event.size);
-      return { ...state, fileSize: size, totalSize: state.totalSize + size };
+      // The same file re-reporting its size (duplicate callback) folds into
+      // totalSize once; only a fresh name re-arms the accumulation.
+      const alreadyCounted = state.sizeDeclaredFor === state.fileName;
+      return { ...state, fileSize: size, totalSize: alreadyCounted ? state.totalSize : state.totalSize + size, sizeDeclaredFor: state.fileName };
     }
     case "step": {
       const step = Math.max(0, event.step);
-      return { ...state, phase: "transferring", fileTransferred: state.fileSize > 0 ? Math.min(step, state.fileSize) : step, totalTransferred: state.completedTransferred + step };
+      // Out-of-order (older) progress callbacks must never drag the bar
+      // backwards: the per-file counter is clamped to fileSize, the running
+      // total is built from the clamped step, and both stay monotonic against
+      // the state they overwrite.
+      const clamped = state.fileSize > 0 ? Math.min(step, state.fileSize) : step;
+      const total = state.completedTransferred + clamped;
+      return {
+        ...state,
+        phase: "transferring",
+        fileTransferred: Math.max(state.fileTransferred, clamped),
+        totalTransferred: Math.max(state.totalTransferred, total),
+      };
     }
     case "file-done":
       return { ...state, completedTransferred: state.completedTransferred + state.fileTransferred, totalTransferred: state.completedTransferred + state.fileTransferred };
