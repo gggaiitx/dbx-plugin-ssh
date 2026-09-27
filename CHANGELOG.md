@@ -4,6 +4,13 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [Unreleased]
+
+- **统一终端文案并本地化工作台标签**：sidecar 错误文案去掉「SSH terminal」式旧称（如 `SSH terminal is closed` → `Terminal is closed`、`Failed to open SSH terminal channel` → `Failed to open terminal channel`）；工作台标签标题改为跟随界面语言（中文环境显示「终端」，此前为静态英文 Terminal）。
+  **Unified terminal copy and localized the workbench tab title:** sidecar error strings drop the legacy "SSH terminal" wording (`SSH terminal is closed` → `Terminal is closed`, `Failed to open SSH terminal channel` → `Failed to open terminal channel`); the workbench tab title now follows the UI locale ("终端" in Chinese instead of a static English "Terminal").
+- **dock「+」启动项标签简化**：启动项标签由「本地终端（自动检测）」简化为「本地终端」，实际使用的 Shell 仍在描述行展示（默认 Shell：…）；仅文案变化，行为不变。
+  **Dock "+" launch entry label simplified:** the entry label drops the "(auto-detect)" suffix and is now just "Local terminal"; the effective shell still shows in the description line. Copy-only change, no behavior change.
+
 ## [0.7.1-beta.6] — 2026-09-27
 
 - **dock「+」启动选项收敛为单项 + 默认 Shell 可配置**：`local/terminal/launch-options` 只返回一项「本地终端（自动检测）」（接受宿主下发的 `locale`，描述展示解析后的默认 Shell；逐 shell 启动入口保留在工作台 shell 选择器）；设置·终端新增「默认 Shell」选择器（`localShell` 偏好，与工具条 shell 选择器同存储键），dock 新开的本地终端按该配置启动。

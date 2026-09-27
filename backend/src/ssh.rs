@@ -1963,7 +1963,7 @@ impl SshRuntime {
                 if reused_transport {
                     format!("The authenticated SSH connection can no longer be reused; use New session to reconnect: {error}")
                 } else {
-                    format!("Failed to open SSH terminal channel: {error}")
+                    format!("Failed to open terminal channel: {error}")
                 }
             })?;
             channel
@@ -3249,7 +3249,7 @@ impl SshRuntime {
             .terminal_tx
             .send(TerminalCommand::Resize { cols, rows })
             .await
-            .map_err(|_| "SSH terminal is closed".to_string())
+            .map_err(|_| "Terminal is closed".to_string())
     }
 
     pub async fn set_directory_tracking(
@@ -3262,7 +3262,7 @@ impl SshRuntime {
             .terminal_tx
             .send(TerminalCommand::DirectoryTracking { enabled })
             .await
-            .map_err(|_| "SSH terminal session is closed".to_string())
+            .map_err(|_| "Terminal session is closed".to_string())
     }
 
     pub fn write_terminal(&self, session_id: &str, data: Vec<u8>) -> Result<(), String> {
@@ -3884,15 +3884,13 @@ impl SshRuntime {
                 if let Ok(mut slot) = session.agent_recorder.lock() {
                     *slot = None;
                 }
-                return Err(format!("SSH terminal is closed: {error}"));
+                return Err(format!("Terminal is closed: {error}"));
             }
             Err(_) => {
                 if let Ok(mut slot) = session.agent_recorder.lock() {
                     *slot = None;
                 }
-                return Err(
-                    "SSH terminal is not accepting input (session unresponsive)".to_string()
-                );
+                return Err("Terminal is not accepting input (session unresponsive)".to_string());
             }
         }
 
@@ -3923,9 +3921,7 @@ impl SshRuntime {
                     "ssh/agent/finish",
                     json!({ "sessionId": session_id, "status": "timeout" }),
                 );
-                return Err(
-                    "SSH terminal session was closed while the command was running".to_string(),
-                );
+                return Err("Terminal session was closed while the command was running".to_string());
             }
             if tokio::time::Instant::now() >= deadline {
                 break true;

@@ -793,19 +793,13 @@ fn shell_display_name(basename: &str) -> String {
 /// prefix) — the caller appends the resolved default shell program.
 fn launch_option_copy(locale: &str) -> (&'static str, &'static str) {
     match locale {
-        "zh-CN" | "zh" => ("本地终端（自动检测）", "默认 Shell："),
-        "zh-TW" => ("本地終端（自動偵測）", "預設 Shell："),
-        "ja" => ("ローカルターミナル（自動検出）", "デフォルトシェル: "),
-        "es" => (
-            "Terminal local (detección automática)",
-            "Shell predeterminado: ",
-        ),
-        "it" => (
-            "Terminale locale (rilevamento automatico)",
-            "Shell predefinita: ",
-        ),
-        "pt-BR" | "pt" => ("Terminal local (detecção automática)", "Shell padrão: "),
-        _ => ("Local terminal (auto-detect)", "Default shell: "),
+        "zh-CN" | "zh" => ("本地终端", "默认 Shell："),
+        "zh-TW" => ("本地終端", "預設 Shell："),
+        "ja" => ("ローカルターミナル", "デフォルトシェル: "),
+        "es" => ("Terminal local", "Shell predeterminado: "),
+        "it" => ("Terminale locale", "Shell predefinita: "),
+        "pt-BR" | "pt" => ("Terminal local", "Shell padrão: "),
+        _ => ("Local terminal", "Default shell: "),
     }
 }
 
@@ -835,7 +829,7 @@ pub fn resolve_default_shell(data_dir: &Path) -> String {
 
 impl LocalTerminalRuntime {
     /// PR-A4 generic launch-options contract (host dock "+"): a single
-    /// "local terminal (auto-detect)" entry carrying the context fragment the
+    /// local-terminal entry carrying the context fragment the
     /// host merges into its host-authored panel context. Per-shell picking
     /// moved into the workbench (shell picker + settings default), so the
     /// picker stays one row; the resolved default shell is shown in the
@@ -1095,7 +1089,7 @@ mod tests {
         // Per-shell picking moved into the workbench (picker + settings
         // default): the dock picker stays a single row.
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["label"], "本地终端（自动检测）");
+        assert_eq!(entries[0]["label"], "本地终端");
         assert_eq!(entries[0]["description"], "默认 Shell：/bin/zsh");
         // The context fragment the host merges stays locale-independent.
         assert_eq!(entries[0]["context"]["plugin"]["mode"], "local-terminal");
@@ -1107,7 +1101,7 @@ mod tests {
         let runtime = LocalTerminalRuntime::new();
         assert_eq!(
             runtime.launch_options("ko", "/bin/bash")["entries"][0]["label"],
-            "Local terminal (auto-detect)"
+            "Local terminal"
         );
         assert_eq!(
             runtime.launch_options("", "/bin/bash")["entries"][0]["description"],

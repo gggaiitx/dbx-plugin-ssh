@@ -1567,21 +1567,21 @@ def main() -> None:
 
         # -- dock「+」launch-options 单项契约 group ------------------------------
         # 宿主侧 options_action 下发 locale；launch-options 只回一项
-        # 「本地终端（自动检测）」，描述带解析后的默认 Shell（localShell 偏好
+        # 「本地终端」，描述带解析后的默认 Shell（localShell 偏好
         # 优先，否则自动探测链）。不走 SSH 连接，任意环境可跑。
         def case_launch_options_single_entry():
-            """launch-options returns exactly one localized auto-detect entry."""
+            """launch-options returns exactly one localized local-terminal entry."""
             options = req("local/terminal/launch-options", {"locale": "zh-CN"})
             entries = options.get("entries") or []
             assert len(entries) == 1, f"expected single entry, got {len(entries)}"
             first = entries[0]
-            assert first.get("label") == "本地终端（自动检测）", first.get("label")
+            assert first.get("label") == "本地终端", first.get("label")
             description = first.get("description") or ""
             assert description.startswith("默认 Shell："), description
             assert len(description) > len("默认 Shell："), "default shell program missing"
             assert first.get("context", {}).get("plugin", {}).get("mode") == "local-terminal"
             legacy = req("local/terminal/launch-options", {})
-            assert (legacy.get("entries") or [{}])[0].get("label") == "Local terminal (auto-detect)"
+            assert (legacy.get("entries") or [{}])[0].get("label") == "Local terminal"
 
         report.run("local/terminal/launch-options single localized entry", "local/terminal/launch-options",
                    case_launch_options_single_entry)

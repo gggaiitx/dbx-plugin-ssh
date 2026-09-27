@@ -2,6 +2,9 @@ export type WorkbenchLocale = "en" | "es" | "it" | "ja" | "pt-BR" | "zh-CN" | "z
 
 export const messages = {
   "en": {
+    // 工作台标签标题取自 iframe document.title（见 App.vue 对 locale 的 watch），
+    // 插件名与 manifest localizations.name 保持一致。
+    pluginName: "Terminal",
     docker: {
       title: "Docker",
       refresh: "Refresh",
@@ -464,6 +467,7 @@ export const messages = {
     },
   },
   "es": {
+    pluginName: "Terminal",
     docker: {
       title: "Docker",
       refresh: "Actualizar",
@@ -919,6 +923,7 @@ export const messages = {
     },
   },
   "it": {
+    pluginName: "Terminal",
     docker: {
       title: "Docker",
       refresh: "Aggiorna",
@@ -1374,6 +1379,7 @@ export const messages = {
     },
   },
   "ja": {
+    pluginName: "Terminal",
     docker: {
       title: "Docker",
       refresh: "更新",
@@ -1829,6 +1835,7 @@ export const messages = {
     },
   },
   "pt-BR": {
+    pluginName: "Terminal",
     docker: {
       title: "Docker",
       refresh: "Atualizar",
@@ -2284,6 +2291,7 @@ export const messages = {
     },
   },
   "zh-CN": {
+    pluginName: "终端",
     docker: {
       title: "Docker",
       refresh: "刷新",
@@ -2746,6 +2754,7 @@ export const messages = {
     },
   },
   "zh-TW": {
+    pluginName: "終端",
     docker: {
       title: "Docker",
       refresh: "重新整理",

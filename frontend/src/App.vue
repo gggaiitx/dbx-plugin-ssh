@@ -1670,6 +1670,9 @@ const serialInputQueue = createTerminalInputQueue({
 
 const locale = ref("zh-CN");
 const t = (key: string, values: Record<string, string | number> = {}) => workbenchMessage(locale.value, key, values);
+// 宿主用 iframe 的 document.title 命名工作台标签：标题跟随 locale，
+// 中文环境显示「终端」而不是静态的英文插件名。
+watch(locale, (value) => { document.title = workbenchMessage(value, "pluginName"); }, { immediate: true });
 const connectionId = computed(() => normalizeConnectionText(hostContext.value.connectionId));
 // Host API 1.1 provides a stable workbenchId in the host context; on 1.0 a
 // locally generated id keeps session scoping per workbench instance (A4 W1

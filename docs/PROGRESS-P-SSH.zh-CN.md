@@ -426,7 +426,7 @@ cargo 170 tests / vitest 68 tests / 容器 smoke_fs 44·smoke_mcp all green。
    loading，不关标签不拆池），`useTauriEvents` 监听 `dbx-plugin-event` 转发通道
    驱动它——PTY 掉线即刻反映到左侧树。
 另修：批准路径误发 `finish{denied}`（前端横幅闪错）；执行中关闭会话现返回
-"SSH terminal session was closed…"而非伪装超时；僵尸会话注入 send 加 5s 上限；
+"Terminal session was closed…"而非伪装超时；僵尸会话注入 send 加 5s 上限；
 `app_bridge::ensure_app_bridge` 先 TCP 探测端口再返回（杀进程后过期端口文件不再
 永久指错），std io 客户端 `McpStdioClient` 入库 sidecar_client.py（select 超时）。
 新 e2e 套件：`scripts/e2e_agent_terminal.py`（26 场景，容器 26/26、vagrant
