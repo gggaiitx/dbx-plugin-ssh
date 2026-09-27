@@ -276,3 +276,40 @@ smoke_fs_test.py +1 用例（PASS **83** / SKIP 0 / FAIL 0）：latin-1 连接�
 - 回归：两新 spec 25/25 过；i18n 护栏 `workbench.spec.ts` + `i18nKeyReferences.spec.ts` **68/68** 过（新增 `terminalOsc.defaultTitle` 七语对齐且被 App.vue 真实引用）；相关既有 spec（`terminalModeQueries` / `terminalOsc` 等）44/44 过。
 - `pnpm vue-tsc --noEmit` 0 错误。
 
+
+## 协议矩阵 Docker 真机层（2026-09-27，telnet/serial/X-Y-ZMODEM）
+
+> 覆盖 nyaterm parity 新协议会话的"真机式"端到端缺口：现有 telnet 冒烟只测
+> start 校验（无网络），串口 PTY 回环在 macOS 上被 serialport-rs ENOTTY 跳过。
+> 本批用 Docker 补位：真实 telnetd 服务器 + Linux 虚拟串口（serialport Linux
+> 后端走真实 termios/baud 路径）。资产：`scripts/smoke_telnet_docker.py`、
+> `scripts/smoke_serial_docker.py`、`scripts/docker/protocol-matrix/`
+> （run_matrix.sh 一键编排，`test.sh` 以 `DBX_PROTOCOL_MATRIX=1` opt-in）。
+
+| 层 | 套件 | 结果 |
+| --- | --- | --- |
+| 宿主机（darwin-arm64 sidecar） | smoke_telnet_docker × busybox telnetd shell 型（IAC 协商/无 0xFF 泄漏/NAWS+二进制键入+inputAck/JSON 兜底/resize/replay/close/list/写后关） | **6/6** PASS（5.2s） |
+| 宿主机（darwin-arm64 sidecar） | smoke_telnet_docker × busybox telnetd login 型（声明式自动登录真实 login 口令流程、成功后 whoami、**密码字节零回显**） | **4/4** PASS（1.7s） |
+| 宿主机（darwin-arm64 sidecar） | smoke_telnet_docker login-fail（错密码 → failureRegex 观测 → 预算耗尽关会话，reason=`auto-login failed: host rejected the login after 2 attempt(s)`） | **1/1** PASS（6.3s） |
+| Linux 容器（linux/arm64 sidecar） | 同 smoke_telnet_docker shell / login 两味道（docker 网络内直连 telnetd 容器） | **6/6 + 4/4** PASS（5.1s + 1.6s） |
+| Linux 容器（linux/arm64 sidecar） | smoke_serial_docker × socat 虚拟空解调线 + 路由器控制台模拟器：枚举语义注记、serial/start（snake_case 线上字段）+ binaryInput 能力、回车重打提示符出帧、二进制键入 show version 回显+应答+inputAck、serial/write JSON 兜底、parity "mark" 严格拒绝、**XMODEM 全传**（'C' 邀约 → CRC 块 → EOT 先 NAK 再 ACK 双确认 → 300B 字节级比对）、**ZMODEM 起传 ZRQINIT + 取消 ZDLE×5+BS×5 → failed(`cancelled by user`)**、replay、list/close/写后关 | **10/10** PASS（3.7s） |
+| Windows | CI `windows-regression`（windows-2022：connection-forms 协议门控矩阵、`cargo test --locked` 原生全量、release 构建、smoke_mcp 对 Windows sidecar exe）+ `Package candidate (windows-x64)` 打包 | run 36262285893 @ 3c1a9275 双 job **success** |
+
+### 过程注记（对后续排障有用）
+
+- **serial/start 线上字段为 snake_case**（`SerialStartRequest` 未启用
+  camelCase rename；响应由 sidecar 手拼 `json!` 为 camelCase）——前端
+  App.vue 已有注释，冒烟按此对齐；`#[serde(default)]` 会把错误键名静默
+  吞成空串再报 "portName is required"，排障时先怀疑键名。
+- **串口会话无 connected 状态事件**：sidecar 只发 `closed`/`error`，前端
+  start 后本地置 running，连通性靠输出帧（banner/提示符）。
+- **serialport Linux 后端不枚举 /dev/pts**（只列 ttyS/ttyUSB/ttyACM），
+  PTY 回环里 `serial/ports/list` 为空属后端语义，非缺陷。
+- **上电 banner 可能早于 sidecar 打开端口而丢失**（PTY 缓冲语义），冒烟
+  用"回车重打提示符"验证读路径出帧。
+- 跳过的部分：inetutils-telnetd（in.telnetd 在 bookworm-slim 容器内
+  execv 后 exit 100，未深究，busybox telnetd 的真实 IAC 协商已覆盖同一
+  断言面）；真 USB 串口 / RFC2217 / GBK 堡垒机维持人工门。
+- Windows 容器不可在 macOS Docker 上运行，Windows 层以 CI 原生 job 为
+  证据；真机 COM 口 + DBX 安装链路验收按仓库约定属人工步骤（install.cmd
+  + 双冒烟）。

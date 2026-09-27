@@ -4309,3 +4309,39 @@ transferable type.`，传输历史全部"已取消"，sidecar 与接口无异常
 - **边界**：`ui/`、`dist/`、`Cargo.lock`、manifest 未动；未 push、未建 PR、未 merge
   到集成分线；认证/协议语义改动（WT-3 信任模型、WT-4 spawnCommand 覆盖优先级）已在
   PROTOCOL 成文，PR 需人工 review。
+
+## 协议矩阵 Docker 真机层（2026-09-27，telnet/serial/X-Y-ZMODEM 真机覆盖）
+
+针对"新协议会话缺真机层覆盖"的补位批次：现有 telnet 冒烟（smoke_telnet_autologin.py）
+只做 start 校验、串口 PTY 回环在 macOS 被 serialport-rs ENOTTY 跳过
+（smoke_serial_upload.py 注记"Linux 串口驱动或许可跑通"）。本批落地
+Docker 真机层并全量跑绿。
+
+- **资产**：`scripts/smoke_telnet_docker.py`（三味道：shell/login/login-fail，
+  未达服务器整跑 SKIP、方法未注册按惯例 SKIP）、`scripts/smoke_serial_docker.py`
+  （Linux 容器内跑：socat 虚拟空解调线 + 路由器控制台模拟器 + X/Y/ZMODEM）、
+  `scripts/docker/protocol-matrix/`（Dockerfile.telnetd = busybox telnetd
+  真实 IAC + login；Dockerfile.linux-test = rust+socat+python3+libudev；
+  run_matrix.sh 编排宿主机/容器两层并汇总退出码；README.zh-CN.md）、
+  `test.sh` 增 `DBX_PROTOCOL_MATRIX=1` opt-in 段（SKIP 不破套件全绿）。
+- **拓扑**：宿主机 sidecar（darwin-arm64）与 Linux 容器 sidecar（linux/arm64，
+  `cargo build --release --locked`，缓存走 dbx-proto-cargo/dbx-proto-target
+  命名卷）分别对真实 telnetd 验证；串口回环只在 Linux 容器（PTY 走真实
+  termios/baud）。
+- **结果（6 套件 31 用例全 PASS）**：宿主机 telnet 6/6 + 4/4 + 1/1；Linux
+  telnet 6/6 + 4/4；Linux serial 10/10（XMODEM 300B 字节级比对 + EOT 双确认；
+  ZMODEM ZRQINIT/取消序列/failed 事件；二进制键入与 JSON 兜底双通道；
+  parity 严格拒绝；replay/close/写后关）。密码字节零回显断言过。
+- **Windows 层**：macOS Docker 跑不了 Windows 容器，以 CI 原生证据覆盖——
+  run 36262285893 @ 3c1a9275（本批被测分支头）`windows-regression`
+  （windows-2022 原生 cargo test + release 构建 + smoke_mcp exe）与
+  `Package candidate (windows-x64)` 双 job success；真机 COM + DBX 安装
+  链路按约定人工门。
+- **契约注记（本次实测固化）**：serial/start 线上字段 snake_case（serde
+  default 会把错误键名吞成空串）；串口无 connected 状态事件（只 closed/
+  error，前端本地置 running）；Linux 后端不枚举 /dev/pts。均已写入
+  TEST_MATRIX 与两冒烟脚本注释。
+- **边界**：不动 backend/frontend/manifest；新脚本不入 CI 强制门（opt-in）；
+  inetutils-telnetd 容器路线放弃（in.telnetd exit 100 未深究，busybox 真实
+  IAC 协商已覆盖同一断言面）；RFC2217/真 USB 串口维持人工门。未提交、未
+  push、未建 PR。

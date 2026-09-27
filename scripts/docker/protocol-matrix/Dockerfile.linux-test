@@ -1,0 +1,14 @@
+# Linux sidecar 构建 + 协议真机冒烟运行时（协议矩阵 Docker 层）。
+#
+# 用途：
+#   1. 在 Linux（arm64/amd64 均可）上构建 sidecar release 二进制——串口
+#      serialport 4 的 Linux 后端需要 libudev + pkg-config；
+#   2. 运行 smoke_serial_docker.py（socat 虚拟串口 + 设备模拟器 +
+#      X/Y/ZMODEM 真口回环）与 smoke_telnet_docker.py（对 telnetd 容器）。
+#
+# 构建缓存走外部卷（dbx-proto-cargo / dbx-proto-target），冷构建一次后
+# 复跑增量。源码以只读方式挂载在 /src。
+FROM rust:1-slim-bookworm
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends socat python3 libudev-dev pkg-config ca-certificates \
+ && rm -rf /var/lib/apt/lists/*

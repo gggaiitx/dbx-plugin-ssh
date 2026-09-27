@@ -94,6 +94,21 @@ else
   echo "SKIP: live smokes + perf baseline (docker or dbx-ssh-test container unavailable)"
 fi
 
+# 协议矩阵真机层（telnet/serial Docker 真机覆盖，scripts/docker/protocol-matrix/）：
+# 对真实 telnetd 跑 IAC/NAWS/自动登录，容器内 Linux sidecar 跑 socat 虚拟串口
+# + X/Y/ZMODEM 回环（macOS 伪终端 ENOTTY 缺口的补位层）。Linux 冷构建较慢，
+# 默认 opt-in（DBX_PROTOCOL_MATRIX=1），SKIP 时套件保持全绿。
+if [ "${DBX_PROTOCOL_MATRIX:-0}" = "1" ]; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "==> protocol matrix (docker telnet/serial real-device layer)"
+    bash scripts/docker/protocol-matrix/run_matrix.sh
+  else
+    echo "SKIP: protocol matrix (docker unavailable)"
+  fi
+else
+  echo "SKIP: protocol matrix (set DBX_PROTOCOL_MATRIX=1 to opt in)"
+fi
+
 # Mock UI walkthrough (COLLECT-FINAL suggestion 1): headless-Chrome anchor
 # assertions + screenshot. Self-gating — SKIPs (exit 0) without playwright-core
 # (/tmp/dbx-ui-mock) or system Chrome; a real failure fails the suite.
