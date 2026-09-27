@@ -1442,6 +1442,35 @@ mod tests {
         );
     }
 
+    /// 引号包裹补充：归档名/目标目录含空格或单引号（远端用户目录常态）
+    /// 时，listing/extract 命令的每个参数都必须被 shell_quote 包裹并转义，
+    /// 否则嵌入的 `;`/反引号会被远端 shell 当作新命令执行（对标 Tabby
+    /// "用户路径永不进入 shell 语法位"的约定）。
+    #[test]
+    fn tar_commands_quote_names_with_spaces_and_quotes() {
+        // 未压缩 .tar 的 listing 走无 z 形态。
+        assert_eq!(
+            build_tar_list_command("/tmp/my archive.tar", false),
+            "tar -tf '/tmp/my archive.tar'"
+        );
+        // 单引号名：'\'' 转义后整条命令仍是单参数语义。
+        assert_eq!(
+            build_tar_list_command("/tmp/it's.tar.gz", true),
+            r"tar -tzf '/tmp/it'\''s.tar.gz'"
+        );
+        assert_eq!(
+            build_extract_command("/tmp/my archive.tar.gz", "/opt/my app", true),
+            "mkdir -p '/opt/my app' && tar -xzf '/tmp/my archive.tar.gz' -C '/opt/my app'"
+        );
+        // 恶意注入段不得逃出引号位。
+        let hostile = build_extract_command("/tmp/evil'; rm -rf / #.tar.gz", "/opt/app", true);
+        assert!(
+            hostile.contains(r"'/tmp/evil'\''; rm -rf / #.tar.gz'"),
+            "{hostile}"
+        );
+        assert!(hostile.starts_with("mkdir -p '/opt/app' && tar -xzf '"));
+    }
+
     #[test]
     fn top_level_entries_reduce_tar_listings() {
         assert_eq!(

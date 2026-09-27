@@ -347,8 +347,9 @@ fn parse_ls_output(directory: &str, ls_output: &str) -> Vec<SftpEntry> {
         .map(|entry| {
             let path = format!("{}/{}", base, entry.name);
             SftpEntry {
-                // sudo 提权的 ls 输出已是文本层；没有原始字节可比对。
-                lossy: false,
+                // sudo 提权的 ls 输出已是文本层；名字仍可能已被上游
+                // lossy 解码，含 U+FFFD 即标记不可忠实还原。
+                lossy: entry.name.contains('\u{FFFD}'),
                 name: entry.name,
                 uri: sftp_uri(&path),
                 kind: entry.kind,

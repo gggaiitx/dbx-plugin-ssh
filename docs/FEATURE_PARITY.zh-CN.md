@@ -613,3 +613,22 @@ GBK 堡垒机行为纳入 WT-2 应答矩阵实测记录）。
 
 > 2026-09-25 清理：认证 Auto 模式、Quick Commands 导入、进程管理句柄/端口（M13）、录制 transcript/自动录制/搜索、SFTP pipeline 深度/兼容模式/文件名编码（M14）、多文件并行 watcher 编辑（M15）已交付，从本表移除（见主矩阵各 ✅ 行）。云同步经决策除名——DBX 宿主基础能力已提供配置同步/上传，插件侧不再立项（含口令加密导出导入降维方案）。
 > 2026-09-26 协议审计清理：「每连接编码选择」行移除——M16 已交付连接级编码覆盖（偏好键 `sftp_name_encoding_overrides`，语义见 PROTOCOL `local/preferences` 行），该行「现无连接级编码覆盖」的陈述已失效。
+
+## Tabby/NetCatty 五协议对标批（2026-09-27）
+
+以 Tabby（master 4004cc5）、NetCatty（main@8568375）、electerm、tssh、Guacamole
+为参照的五协议（SSH/RDP/串口/VNC/Telnet）处理与测试用例对标；结论与逐条映射见
+`docs/TABBY_PROTOCOL_PARITY.zh-CN.md`，认证域对抗评审终裁见
+`docs/AUTH_ADVERSARIAL_REVIEW.zh-CN.md`。RDP/VNC 在 Tabby/NetCatty/WindTerm/
+Xshell/Termius/SecureCRT 全部不存在，维持不立项；Telnet/Serial 维持宿主承担
+（立项时按对标文档 §4/§5 测试维度清单验收）。本批落地：
+
+| 能力 | 参照位置 | 插件状态 | 说明 |
+| --- | --- | --- | --- |
+| agent 认证预算计划器（MaxAuthTries 防护） | Tabby authMethodSelection / NetCatty identitiesOnly | ✅ 已有（对抗评审 #1 落地） | `plan_agent_identity_attempt` 纯函数 + `AGENT_IDENTITY_MAX_ATTEMPTS=5`（MaxAuthTries 默认 6 − none 探测 1）；partial success 命中即转 keyboard-interactive 不再烧名额；transport 错误首错即停并透出原文（替换笼统 `No SSH Agent identity was accepted`），预算耗尽文案指引指定私钥。`AgentAuthOutcome::Rejected(String)` 携带原因；4 个计划器单测 + koko mock `PasswordRejectedThenMfa` 形状固化"密码全拒仍 seed 第一因子"契约（#7，改严格判定会打爆 PAM smoke，属知情让渡） |
+| none 探测 | NetCatty 认证序列 | ✅ 已有（实证澄清） | 生产认证序列第一步即发 none（ssh.rs:2456-2468），此前对标文档误记"未见"；广告集消费（reconcile）经对抗评审裁为二期，前置条件已满足，待独立 PR |
+| SFTP 文件名不可解码标记 | NetCatty gb18030 解码 | ✅ 已有（最小方案） | russh-sftp wire 层 `from_utf8_lossy` 使 GBK 原始字节不可恢复（encoding_rs 无效，对抗评审裁决不引入）；`sftp/list` 与 sudo 列表条目按文件名含 U+FFFD 标记布尔 `lossy`（M14-B 命名，合并 tabby 批时统一），前端警示图标 + 多语提示；PROTOCOL 文档已同步 |
+| zmodem/trzsz 传输状态机幂等 | electerm xmodem stale-ACK | ✅ 已有（修复） | trzsz 进度：step 单调钳制（乱序/重放不回跳）、totalTransferred 用钳制后增量、重复 size 事件去重、`num` 分支清残留 totalSize、NaN size 守卫；zmodem：未请求 sz 一律 deny（决策纯函数 `decideZmodemDetection`）、resume offset 越界钳制 |
+| known_hosts TOFU 闭环测试 | electerm host-trust / tssh 鲁棒性 | ✅ 已有（测试资产） | check→learn→check 变 Trusted、learned key 变更拒绝（MITM 护栏）两个闭环用例；写路径 learn 追加语义 + 8192 字符脏行截断既有覆盖不变 |
+| 上传临时件路径边界 | Guacamole 路径矩阵 | ✅ 已有（修复） | `remote_transfer_paths` 段级 `..` 收敛（含 `..` 目标的 `.part`/`.backup` 临时件与 normalize 后目标同目录，原子 rename 前提）；相对父目录弹空显式拒绝 |
+| 认证计划纯函数单测 | Tabby authMethodSelection 7 用例 | ✅ 已有 | `method_offered`/`auth_partial_success` 直接断言（服务器广告驱动、Success/空集 false、partial 三态） |

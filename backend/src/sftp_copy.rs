@@ -601,6 +601,47 @@ mod tests {
         assert_eq!(target_path("/tmp", "/opt"), "/tmp/opt");
     }
 
+    /// 目标目录形态边界（T2 补充，对标 electerm 传输幂等语义）：
+    /// `parse_request` 先把 toDir 过 `normalize_remote_path`（收敛 `..`、
+    /// 折叠 `//`），所以到达 `target_path` 的 toDir 已是规范化绝对路径；
+    /// 本矩阵单独压 `target_path` 纯函数本身，保证调用方（copy/move 批处理）
+    /// 无论传入什么形态都拿到**单个斜杠分隔**的绝对目标——拼接结果出现
+    /// 空段或双斜杠会让 `cp/mv` 与探测命令语义漂移。
+    #[test]
+    fn target_path_handles_root_and_trailing_slashes() {
+        // to_dir 为根 `/`：trim_end_matches('/') 后是空串，结果以 "/" 开头
+        // 而不是变成相对路径（空串拼接会产出 "name"，copy 会落到远端 CWD）。
+        assert_eq!(target_path("/", "/var/log/app.log"), "/app.log");
+        // 多个尾斜杠：全部收敛，不产生 "tmp//name"。
+        assert_eq!(target_path("/tmp///", "/var/log/app.log"), "/tmp/app.log");
+        // 根带多尾斜杠（normalize 后不会出现，防御纯函数自身）。
+        assert_eq!(target_path("///", "/etc/hosts"), "/hosts");
+    }
+
+    /// `from` 的名字段本身带 `/`（调用方没先取 basename）时，`target_path`
+    /// 取的是**最后一段**名字，绝不会把整条 from 拼进目标——这是天然的
+    /// 路径穿越防线：`/var/log/../etc/passwd` 只会落到 `<toDir>/passwd`，
+    /// 不会逃出 toDir。但反过来说，若上游未做 normalize，`a/b` 这类输入
+    /// 会静默丢前缀，语义是"取名"而不是"拒绝"。
+    ///
+    /// 契约（GAP-2 已登记，行为按设计保留）：`target_path` 依赖上游
+    /// `parse_request` 先对 from/toDir 过 `normalize_remote_path`（`..` 收敛、
+    /// 拒绝根）。本函数自身不拒绝含 `..`/多段的名字输入——它按最后一段取名，
+    /// 非 basename 输入被静默改写而非报错。若未来有新调用方绕过
+    /// `parse_request`，必须先在其入口补 normalize，或在这里加单段断言/
+    /// 显式 Err，二者缺一不可。
+    #[test]
+    fn target_path_takes_only_the_final_name_segment() {
+        // 非 basename 输入：落到 toDir 下最后一个段，前缀被丢而不是拼接。
+        assert_eq!(target_path("/dst", "a/b/c.txt"), "/dst/c.txt");
+        // `..` 段名字：`/var/log/../etc/passwd` 的最后段是 passwd，目标
+        // 仍在 /dst 内，无法穿越出 toDir。
+        assert_eq!(target_path("/dst", "/var/log/../etc/passwd"), "/dst/passwd");
+        assert!(!target_path("/dst", "/var/log/../etc/passwd").contains(".."));
+        // 空名字（from 全是斜杠）：回退为 "copy" 占位名，不产生尾斜杠目标。
+        assert_eq!(target_path("/dst", "///"), "/dst/copy");
+    }
+
     #[test]
     fn same_directory_detects_rename_candidates() {
         assert!(same_directory("/tmp/a.txt", "/tmp"));

@@ -226,6 +226,48 @@ mod tests {
         assert_eq!(sanitize_relative(""), None);
     }
 
+    /// Guacamole sftp/normalize_path parity: the component matrix must hold
+    /// for every hostile shape a server-side listing could carry.
+    #[test]
+    fn sanitize_relative_component_matrix_blocks_hostile_segments() {
+        // Control characters never survive into a local path segment: the
+        // control byte becomes a space and the segment trims clean, so a NUL
+        // cannot smuggle a separator or terminate a C-string path.
+        assert_eq!(sanitize_relative("a/\0b/c").as_deref(), Some("a/b/c"));
+        // A bare "." component falls back to the download name per segment.
+        assert_eq!(sanitize_relative("a/./b").as_deref(), Some("a/download/b"));
+        // Empty segments from "a//b" sanitize into the download fallback
+        // rather than producing an empty path component.
+        assert_eq!(sanitize_relative("a//b").as_deref(), Some("a/download/b"));
+        // A trailing slash is an empty final segment: the layout gains a
+        // "download" leaf (documented quirk — mirrors how ".." collapses),
+        // never an escape.
+        assert_eq!(sanitize_relative("a/b/").as_deref(), Some("a/b/download"));
+        // Whitespace-only segments trim clean like a plain filename.
+        assert_eq!(sanitize_relative("a/ /b").as_deref(), Some("a/download/b"));
+        assert_eq!(sanitize_relative("evil.").as_deref(), Some("evil"));
+        // Dotfile-looking names survive untouched (no false-positive strip).
+        assert_eq!(sanitize_relative(".hidden").as_deref(), Some(".hidden"));
+    }
+
+    #[test]
+    fn safe_tree_path_holds_at_the_depth_boundary() {
+        let root = Path::new("/tmp/dl");
+        // Exactly MAX_TREE_DEPTH segments is legal (the scanner's own limit);
+        // the join must stay under the root at any depth.
+        let deep = (0..crate::sftp_tree::MAX_TREE_DEPTH)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let joined = safe_tree_path(root, &deep).expect("max-depth path stays inside");
+        assert!(joined.starts_with(root));
+        // Components: "/tmp" + "dl" (RootDir+2) plus MAX_TREE_DEPTH segments.
+        assert_eq!(
+            joined.components().count(),
+            3 + crate::sftp_tree::MAX_TREE_DEPTH
+        );
+    }
+
     #[test]
     fn safe_tree_path_stays_under_root() {
         let root = Path::new("/tmp/dl");

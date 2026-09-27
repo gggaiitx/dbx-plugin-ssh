@@ -56,7 +56,9 @@ describe("sanitizeSftpEntries", () => {
 
   it("passes a healthy payload through unchanged in shape", () => {
     const row = { name: "hosts", uri: "sftp:/etc/hosts", kind: "file", size: 221, modifiedAt: 1700000000, permissions: "0644" };
-    expect(sanitizeSftpEntries([row])).toEqual([row]);
+    // sanitize 归一化补齐 owner/group（undefined）与 lossy（缺省即 undefined），
+    // 其余字段原样透传。
+    expect(sanitizeSftpEntries([row])).toEqual([{ ...row, lossy: undefined }]);
   });
 
   it("keeps owner/group strings and normalizes non-string values to undefined", () => {
@@ -72,6 +74,19 @@ describe("sanitizeSftpEntries", () => {
     expect(entries[1].group).toBeUndefined();
     expect(entries[2].owner).toBeUndefined();
     expect(entries[2].group).toBeUndefined();
+  });
+
+  it("keeps the lossy flag only for boolean true (non-UTF-8 names)", () => {
+    // 名称解码后含 U+FFFD 的条目由 sidecar 标记 lossy=true；
+    // 缺字段（旧 sidecar）与非布尔值一律归一为缺省，避免畸形数据触发警示。
+    const entries = sanitizeSftpEntries([
+      { name: "bad\uFFFDname", uri: "sftp:/x", kind: "file", lossy: true },
+      { name: "clean", uri: "sftp:/y", kind: "file" },
+      { name: "junk", uri: "sftp:/z", kind: "file", lossy: "yes" },
+    ]);
+    expect(entries[0].lossy).toBe(true);
+    expect(entries[1].lossy).toBeUndefined();
+    expect(entries[2].lossy).toBeUndefined();
   });
 });
 

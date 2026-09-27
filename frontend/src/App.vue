@@ -125,7 +125,7 @@ import {
 } from "./lib/sessionTransportReuse";
 import { createConnectLog } from "./lib/connectLog";
 import { pickModalFocusTarget } from "./lib/modalFocus";
-import { createZmodemSentry, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
+import { createZmodemSentry, decideZmodemDetection, sendZmodemFiles, type ZmodemUploadProgress } from "./lib/terminalZmodem";
 import { sampleTransferSpeed, type TransferSpeedSample } from "./lib/transferSpeed";
 import { buildPasteConfirmation, type PasteConfirmation } from "./lib/dangerousCommands";
 import { readClipboardText, writeClipboardText, type ClipboardDeps } from "./lib/clipboardBridge";
@@ -3398,9 +3398,10 @@ function resetZmodemSentry() {
 }
 
 function handleZmodemDetection(detection: ZmodemDetection) {
-  if (!pendingZmodemFiles.length || detection.get_session_role() !== "send") {
+  const decision = decideZmodemDetection(detection, pendingZmodemFiles.length > 0);
+  if (decision.action === "deny") {
     detection.deny();
-    if (pendingZmodemFiles.length) finishZmodemUpload(new Error(t("zmodemUploadOnly")));
+    if (decision.reason === "roleMismatch") finishZmodemUpload(new Error(t("zmodemUploadOnly")));
     return;
   }
   try {
@@ -12529,6 +12530,11 @@ onBeforeUnmount(() => {
                     @blur="commitRename(entry)"
                   />
                   <span v-else :title="linkTargetTitle(entry)">{{ entry.name }}</span>
+                  <TriangleAlert
+                                      v-if="entry.lossy"
+                                      class="sftp-lossy-icon"
+                                      :title="t('sftpName.lossyTitle')"
+                                    />
                 </span>
                 <span v-if="visibleColumns.includes('size')" class="numeric">{{ entry.kind === "file" ? formatBytes(entry.size) : "" }}</span>
                 <span v-if="visibleColumns.includes('modified')">{{ formatModified(entry.modifiedAt) }}</span>

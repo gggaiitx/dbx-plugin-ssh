@@ -306,6 +306,7 @@ export const messages = {
     sftpQuickPath: { title: "Quick paths" },
     sftpSide: { tree: "Directory tree", quick: "Quick paths", root: "Root", collapse: "Collapse sidebar", expand: "Expand sidebar", expandNode: "Expand {name}", collapseNode: "Collapse {name}" },
     sftpRename: { overwriteConfirm: "The destination \"{name}\" already exists. Overwrite it?" },
+    sftpUndecodableName: "Name may be corrupted",
     sftpCopy: { copy: "Copy", cut: "Cut", done: "{count} item(s) added to the clipboard", copyPath: "Copy path", copyName: "Copy name", copiedPath: "Path copied", copiedName: "Name copied", copySelected: "Copy selected paths", copiedPaths: "{count} path(s) copied" },
     sftpPaste: {
       action: "Paste",
@@ -766,6 +767,7 @@ export const messages = {
     sftpQuickPath: { title: "Rutas rápidas" },
     sftpSide: { tree: "Árbol de directorios", quick: "Rutas rápidas", root: "Raíz", collapse: "Contraer panel lateral", expand: "Expandir panel lateral", expandNode: "Expandir {name}", collapseNode: "Contraer {name}" },
     sftpRename: { overwriteConfirm: "El destino «{name}» ya existe. ¿Sobrescribirlo?" },
+    sftpUndecodableName: "El nombre podría estar dañado",
     sftpCopy: { copy: "Copiar", cut: "Cortar", done: "{count} elemento(s) añadidos al portapapeles", copyPath: "Copiar ruta", copyName: "Copiar nombre", copiedPath: "Ruta copiada", copiedName: "Nombre copiado", copySelected: "Copiar rutas seleccionadas", copiedPaths: "{count} ruta(s) copiada(s)" },
     sftpPaste: {
       action: "Pegar",
@@ -1219,6 +1221,7 @@ export const messages = {
     sftpQuickPath: { title: "Percorsi rapidi" },
     sftpSide: { tree: "Albero delle cartelle", quick: "Percorsi rapidi", root: "Radice", collapse: "Comprimi pannello laterale", expand: "Espandi pannello laterale", expandNode: "Espandi {name}", collapseNode: "Comprimi {name}" },
     sftpRename: { overwriteConfirm: "La destinazione «{name}» esiste già. Sovrascriverla?" },
+    sftpUndecodableName: "Il nome potrebbe essere danneggiato",
     sftpCopy: { copy: "Copia", cut: "Taglia", done: "{count} elemento(i) aggiunti agli appunti", copyPath: "Copia percorso", copyName: "Copia nome", copiedPath: "Percorso copiato", copiedName: "Nome copiato", copySelected: "Copia percorsi selezionati", copiedPaths: "{count} percorso(i) copiato(i)" },
     sftpPaste: {
       action: "Incolla",
@@ -1672,6 +1675,7 @@ export const messages = {
     sftpQuickPath: { title: "クイックパス" },
     sftpSide: { tree: "ディレクトリツリー", quick: "クイックパス", root: "ルート", collapse: "サイドバーを折りたたむ", expand: "サイドバーを展開", expandNode: "{name} を展開", collapseNode: "{name} を折りたたむ" },
     sftpRename: { overwriteConfirm: "移動先「{name}」は既に存在します。上書きしますか？" },
+    sftpUndecodableName: "名前が壊れている可能性があります",
     sftpCopy: { copy: "コピー", cut: "切り取り", done: "{count} 件をクリップボードに追加しました", copyPath: "パスをコピー", copyName: "名前をコピー", copiedPath: "パスをコピーしました", copiedName: "名前をコピーしました", copySelected: "選択したパスをコピー", copiedPaths: "{count} 件のパスをコピーしました" },
     sftpPaste: {
       action: "貼り付け",
@@ -2125,6 +2129,7 @@ export const messages = {
     sftpQuickPath: { title: "Caminhos rápidos" },
     sftpSide: { tree: "Árvore de diretórios", quick: "Caminhos rápidos", root: "Raiz", collapse: "Recolher painel lateral", expand: "Expandir painel lateral", expandNode: "Expandir {name}", collapseNode: "Recolher {name}" },
     sftpRename: { overwriteConfirm: "O destino \"{name}\" já existe. Sobrescrever?" },
+    sftpUndecodableName: "O nome pode estar corrompido",
     sftpCopy: { copy: "Copiar", cut: "Recortar", done: "{count} item(ns) adicionados à área de transferência", copyPath: "Copiar caminho", copyName: "Copiar nome", copiedPath: "Caminho copiado", copiedName: "Nome copiado", copySelected: "Copiar caminhos selecionados", copiedPaths: "{count} caminho(s) copiado(s)" },
     sftpPaste: {
       action: "Colar",
@@ -2578,6 +2583,7 @@ export const messages = {
     sftpQuickPath: { title: "快捷路径" },
     sftpSide: { tree: "目录树", quick: "快捷路径", root: "根目录", collapse: "收起侧栏", expand: "展开侧栏", expandNode: "展开 {name}", collapseNode: "折叠 {name}" },
     sftpRename: { overwriteConfirm: "目标「{name}」已存在，是否覆盖？" },
+    sftpUndecodableName: "文件名可能已损坏",
     sftpCopy: { copy: "复制", cut: "剪切", done: "已将 {count} 项加入剪贴板", copyPath: "复制路径", copyName: "复制文件名", copiedPath: "已复制路径", copiedName: "已复制文件名", copySelected: "复制所选路径", copiedPaths: "已复制 {count} 条路径" },
     sftpPaste: {
       action: "粘贴",
@@ -3038,6 +3044,7 @@ export const messages = {
     sftpQuickPath: { title: "快速路徑" },
     sftpSide: { tree: "目錄樹", quick: "快速路徑", root: "根目錄", collapse: "收起側欄", expand: "展開側欄", expandNode: "展開 {name}", collapseNode: "摺疊 {name}" },
     sftpRename: { overwriteConfirm: "目標「{name}」已存在，是否覆蓋？" },
+    sftpUndecodableName: "檔名可能已損壞",
     sftpCopy: { copy: "複製", cut: "剪下", done: "已將 {count} 項加入剪貼簿", copyPath: "複製路徑", copyName: "複製檔名", copiedPath: "已複製路徑", copiedName: "已複製檔名", copySelected: "複製所選路徑", copiedPaths: "已複製 {count} 條路徑" },
     sftpPaste: {
       action: "貼上",

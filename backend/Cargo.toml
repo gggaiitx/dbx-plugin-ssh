@@ -1,6 +1,6 @@
 [package]
 name = "dbx-plugin-ssh"
-version = "0.7.1-beta.3"
+version = "0.7.1-beta.4"
 edition = "2021"
 license = "MIT"
 authors = ["jinpy"]
@@ -124,3 +124,8 @@ sspi = { path = "vendor/sspi" }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Test-only: key generation for the known_hosts TOFU loop tests. rand 0.10
+# already rides the dependency tree via russh; this adds no runtime weight.
+[dev-dependencies.rand]
+version = "0.10"

@@ -482,6 +482,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .file-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-name { gap: 7px; }
 .file-name > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* gb18030 最小方案：不可解码文件名警示标记（U+FFFD 条目），不占格子只贴名后。 */
+.sftp-lossy-icon { flex: none; width: 13px; height: 13px; color: var(--destructive, #d93025); }
 .folder-icon { color: var(--warning); fill: color-mix(in srgb, var(--warning) 16%, transparent); }
 .rename-input { width: 100%; min-width: 60px; height: 22px; border: 1px solid var(--primary); border-radius: var(--radius); padding: 1px 5px; background: var(--background); color: var(--foreground); }
 .file-footer { height: 26px; min-height: 26px; justify-content: space-between; gap: 16px; border-top: 1px solid var(--border); padding: 0 8px; color: var(--muted-foreground); font-size: 11px; }
