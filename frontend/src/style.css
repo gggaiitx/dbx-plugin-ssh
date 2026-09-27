@@ -116,6 +116,27 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
   opacity: 0.6;
   font-size: 10px;
 }
+/* 工具栏 ⋯「更多工具」菜单项：图标 + 文案的整宽行，形态对齐 shell-surface-item。
+   popover 作用域没有 .modal button 的扁平化兜底，需自带去边框/去背景。 */
+.more-tools-popover { min-width: 200px; }
+.more-tools-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.more-tools-item svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.more-tools-item:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 8%, transparent);
+}
+.more-tools-item:disabled { opacity: 0.45; }
 .identity { min-width: 0; overflow: hidden; gap: 6px; }
 /* 空间不足时 Info 按钮也可折叠（先缩主机名，再缩它到 0），不再硬顶
    右侧按钮组造成叠印。 */

@@ -806,7 +806,7 @@ describe("App.vue popover/modal wiring structural guard", () => {
   it("extracts a non-empty template inventory (guards against vacuous regex passes)", () => {
     // 提取逻辑本身失效（模板改写导致 regex 不再匹配）时先在这里暴露，
     // 避免后续断言因空集合而静默通过。
-    for (const ref of ["quickMenuOpen", "connectionInfoOpen", "agentModeOpen", "highlightMenuOpen", "bookmarkSaveOpen", "columnsOpen", "transferPanelOpen", "batchTargetsOpen", "pathHistoryOpen"]) {
+    for (const ref of ["quickMenuOpen", "connectionInfoOpen", "agentModeOpen", "highlightMenuOpen", "bookmarkSaveOpen", "columnsOpen", "transferPanelOpen", "batchTargetsOpen", "pathHistoryOpen", "moreMenuOpen"]) {
       expect(popoverRefs, `popover 提取丢失 ${ref}`).toContain(ref);
     }
     // settingsDialog 抽出独立组件后，settingsOpen/profilesOpen 的 Dialog 模板
@@ -831,7 +831,7 @@ describe("App.vue popover/modal wiring structural guard", () => {
   });
 
   it("routes every toolbar popover toggle through closeToolbarPopovers", () => {
-    for (const name of ["toggleQuickMenu", "toggleConnectionInfo", "toggleAgentModeMenu", "toggleHighlightMenu", "toggleBookmarkSave", "toggleColumnsMenu", "toggleTransferPanel", "togglePathHistoryMenu"]) {
+    for (const name of ["toggleQuickMenu", "toggleConnectionInfo", "toggleAgentModeMenu", "toggleHighlightMenu", "toggleBookmarkSave", "toggleColumnsMenu", "toggleTransferPanel", "togglePathHistoryMenu", "toggleMoreMenu"]) {
       const start = appScript.indexOf(`function ${name}(`);
       expect(start, `缺少 toggle 函数 ${name}()`).toBeGreaterThanOrEqual(0);
       const body = appScript.slice(start, appScript.indexOf("\n}", start));
