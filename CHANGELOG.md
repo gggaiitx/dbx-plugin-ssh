@@ -4,8 +4,10 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
-## [Unreleased]
+## [0.7.1-beta.9] — 2026-09-27
 
+- **修复 Windows 本地终端提示符渲染两遍（PowerShell 等无 banner shell）**：本地 shell 现在等终端面板布局稳定后再 spawn——dock「+」新开 tab 时 webview 可能尚未布局完成（宿主 0 尺寸回落 80×24、web 字体换装改变单元格度量），shell 按临时尺寸启动后，布局到位的真实 fit 是一次跨几何 resize，ConPTY 整屏重绘＝提示符/横幅画两遍；现在逐帧采样至连续两次 fit 一致（限时 1.5s 兜底）才以最终尺寸启动。
+  **Fix duplicated prompt on Windows local terminal start (PowerShell and other banner-less shells):** the local shell now spawns only after the terminal panel's layout has settled — on a dock "+" fresh tab the webview may still be laying out (zero-size host falls back to 80×24, web font swap changes cell metrics), so the shell started at a temporary size and the later real fit became a cross-geometry ConPTY repaint, drawing the prompt twice; spawn now waits for two consecutive identical fits (bounded at 1.5s).
 - **dock「+」默认 Shell 启动项提为顶层首位，shell 分组更名「本地SHELL」并默认折叠**：默认 Shell 启动项不再带 `group`（宿主将其平铺在弹窗首位，单击即开），本机扫描到的 shell 子项收进可折叠分组，组标签改为「本地SHELL」（随界面语言），宿主默认折叠该分组。
   **Dock "+" default-shell entry promoted to the top; shell group renamed "Local shell", collapsed by default:** the default-shell launcher no longer carries a `group` (the host pins it as the picker's first row — one click to open); the machine-scanned shell entries move into the collapsible group (localized label, e.g. "本地SHELL"), which the host renders collapsed by default.
 
