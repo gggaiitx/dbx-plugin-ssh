@@ -21,9 +21,9 @@ use std::ffi::c_void;
 use std::sync::Once;
 
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JobObjectExtendedLimitInformation, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -76,7 +76,10 @@ fn create_and_assign() -> Result<(), String> {
 
         // Intentional leak: kill-on-close fires when this handle closes at
         // process exit. Closing it here would kill the tree immediately.
-        eprintln!("{LOG_PREFIX} kill-on-close job active (pid={})", std::process::id());
+        eprintln!(
+            "{LOG_PREFIX} kill-on-close job active (pid={})",
+            std::process::id()
+        );
         Ok(())
     }
 }
