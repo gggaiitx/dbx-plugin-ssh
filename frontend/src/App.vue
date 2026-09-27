@@ -4620,7 +4620,9 @@ async function startLocalTerminal(shellOverride?: string) {
       ...(localShellIntegrationPref.value ? {} : { shellIntegration: false }),
       // 重开继承上次 cwd（目录可能已被删，sidecar 会回落家目录）。
       ...(localLastCwd.value ? { cwd: localLastCwd.value } : {}),
-    });
+      // spawn 是快路径，但宿主桥丢响应时 promise 永久 pending＝纯黑屏；
+      // 与同文件其他交互调用一致地给超时，失败落入 catch 走 showError。
+    }, { timeoutMs: 10_000 });
     if (disposed) {
       void window.dbxPlugin.invoke("local/session/close", { sessionId: info.sessionId }).catch(() => undefined);
       return;
@@ -11913,6 +11915,15 @@ onBeforeUnmount(() => {
             @connect="startConnect"
             @toggle-logs="connectLogsOpen = !connectLogsOpen"
           />
+        </div>
+        <!-- 本地终端启动中覆盖层：spawn 正常在数百毫秒内返回；卡在 starting
+             （宿主桥丢响应、慢盘冷启动）必须有可见反馈，否则就是零信息黑屏。
+             超时/失败由 startLocalTerminal 的 catch 接管转 exited + showError。 -->
+        <div v-if="(isLocalMode || localShellRestored) && localState === 'starting'" class="terminal-overlay">
+          <div class="local-exit-card" role="status">
+            <Loader2 class="local-exit-icon spinning" />
+            <strong>{{ t("localTerminal.starting") }}</strong>
+          </div>
         </div>
         <!-- 本地终端退出态覆盖层（含 A4 恢复外壳：restored tab 未起 shell 时
              也由它承担外壳态，spec §8.4）：显示退出码（sidecar 未上报时不显

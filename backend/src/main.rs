@@ -10,6 +10,8 @@ mod file_watch;
 mod forward;
 mod highlight_rules;
 mod host_key;
+#[cfg(windows)]
+mod job_object;
 mod keys;
 mod local_downloads;
 mod local_fs;
@@ -2413,6 +2415,12 @@ fn main() -> std::io::Result<()> {
     if std::env::args().any(|arg| arg == "--mcp") {
         return mcp::run_mcp_stdio(plugin_data_dir());
     }
+    // Kernel teardown net: every child (local-terminal ConPTY conhost + shell
+    // trees included) dies with the process, so a crashed/killed sidecar can
+    // no longer orphan shells that burn a core in their headless conhosts.
+    // No-op outside Windows; best-effort by design (never blocks startup).
+    #[cfg(windows)]
+    job_object::setup_process_job();
     log_sidecar_exit("serve-start".to_string());
     spawn_terminal_input_counter();
     let plugin = Plugin::new().map_err(std::io::Error::other)?;

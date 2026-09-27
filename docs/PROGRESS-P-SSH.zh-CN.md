@@ -4345,3 +4345,63 @@ Docker 真机层并全量跑绿。
   inetutils-telnetd 容器路线放弃（in.telnetd exit 100 未深究，busybox 真实
   IAC 协商已覆盖同一断言面）；RFC2217/真 USB 串口维持人工门。未提交、未
   push、未建 PR。
+
+## Windows 本地终端孤儿回收 + 启动静默兜底（2026-09-27）
+
+背景：Windows 真机排障发现系统堆积 28 个 conhost（17 个孤儿），其中 4 个
+headless conhost 各烧满 1 核近 10 小时——sidecar 死亡（崩溃/更新/宿主退出）
+后 `local/terminal/start` 产生的 ConPTY conhost + shell 全树无人回收；同机
+"一打开本地终端就卡死且无错误输出"实为旧包（`ssh-v0.7.1-beta.3` tag 于
+2026-09-26 08:57 打出，早于握手修复 `ad701f3` 的 04:30，谱系核实不含）——
+不回 ConPTY `CSI 6n` 握手则 conhost 扣留输出，start 正常返回、UI 落 running
+但终端永久黑屏。
+
+### 修复 A：进程级 Job Object（backend/src/job_object.rs，新增）
+
+- sidecar `main()` 起始（Windows 分支）`CreateJobObjectW` +
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + `AssignProcessToJobObject(GetCurrentProcess())`，
+  句柄故意不 close：进程任何方式退出 → 句柄关闭 → 内核杀全树（VS Code /
+  Windows Terminal 同款）。选进程级而非 per-child：headless conhost 是
+  `CreatePseudoConsole` 内部 spawn（先于 shell、非 shell 子进程，per-child
+  挂 job 覆盖不到），且 portable-pty `Child` 只暴露 `process_id()` 无裸句柄；
+  sidecar 其余 spawn 点（keys/local_fs/triggers）全为短命同步子进程，无
+  breakaway 顾虑。挂载失败（宿主 job 不允许 breakaway 等）只记 stderr 不阻断。
+- 依赖：`windows-sys 0.59`（`Win32_Foundation/Security/System_JobObjects/
+  System_Threading`；`CreateJobObjectW` 被 `Win32_Security` feature 门控，
+  0.59 实测，勿裁）。
+- **端到端验证（本机 Windows 11 真跑）**：单测 2 用例（创建/挂载成功 + 幂等）；
+  专用 e2e（挂 job → 拉 `cmd /C ping` → 父进程不 wait 直接 exit → 外部
+  tasklist 断言子进程回收）PASS；sidecar 真进程强杀（模拟崩溃）→ 它 spawn
+  的 bash + conhost 3 秒内全部回收、无新孤儿。全量 `cargo test` 1021/1021。
+
+### 修复 B：前端启动静默兜底（frontend/src/App.vue + src/lib/i18n.ts）
+
+- `local/terminal/start` invoke 补 `{ timeoutMs: 10_000 }`（全文件其余交互
+  调用均已带超时，此处是唯一遗漏；桥丢响应 promise 永久 pending → 10s 后
+  落 catch `showError`）。
+- `starting` 态新增可见覆盖层（`Loader2.spinning` + `localTerminal.starting`
+  文案；此前该态零 UI＝纯黑屏）。七语（en/es/it/ja/pt-BR/zh-CN/zh-TW）补
+  `localTerminal.starting`，`i18nLocalTerminal.spec` key 集合守卫通过。
+- `vue-tsc --noEmit` exit 0；vitest 121 文件 1203/1203。
+
+### 顺带修复：scripts/sidecar_client.py Windows 兼容（此前 POSIX-only）
+
+- `_read_frame` 的 `select()` 在 Windows 管道句柄上必然 `WinError 10038`
+  （PROGRESS 曾记录"Windows 侧 smoke 从未在族内跑过"的根因之一）。新增
+  `_wait_readable`（nt 分支用守护线程 1 字节读探活，预读字节存 `self._peeked`
+  并由 `_read_bytes` 归还，帧严格字节对齐；POSIX 分支 select 原样）。
+- `SidecarClient.start` 增加后台 stderr 排空线程：Windows 管道缓冲小，
+  sidecar 的 eprintln（job-object 横幅、sidecar-exit 日志）无人读时塞满
+  缓冲会把子进程整个卡死。
+- **结果**：`smoke_local_terminal.py` 在 Windows 真机全绿（shell 发现 4 个、
+  bash 启动 + integration 注入、echo 回环 OSC 133 D;0、resize/list、60 帧
+  突发、退出事件 5 阶段全 PASS）——该 smoke 首次在 Windows 跑通。
+
+### 边界与剩余风险
+
+- 未动 host/；未提交未 push。manifest 版本号未 bump（随下一发版统一）。
+- **真机人工门（合同约定 agent 不代做）**：Windows 机需安装 ≥ ad701f3 的
+  新构建（本次 job object + 前端兜底亦在其内）并重启 DBX；复验脚本＝开
+  本地终端 → 杀 sidecar → 任务管理器确认 cmd/conhost 零残留无 CPU 空转。
+- 旧包黑屏问题的完整修复链以 ad701f3（ConPTY CPR 握手应答）为主，本次
+  A/B 为纵深：孤儿从根上不可能产生 + 卡死必有时限与可见反馈。
