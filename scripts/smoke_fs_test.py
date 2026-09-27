@@ -1566,12 +1566,12 @@ def main() -> None:
                    case_recording_flow)
 
         # -- dock「+」launch-options 本地终端分组 group -------------------------
-        # 宿主侧 options_action 下发 locale；launch-options 返回「本地终端」
-        # 分组：默认项（描述带解析后的默认 Shell，localShell 偏好优先，否则自
-        # 动探测链）+ 扫描到的 shell 子项，所有项共享同一 group 标签。不走
-        # SSH 连接，任意环境可跑。
+        # 宿主侧 options_action 下发 locale；launch-options 首项为默认 Shell
+        # 启动项（描述带解析后的默认 Shell，localShell 偏好优先，否则自动探
+        # 测链；不带 group，宿主顶层首位平铺），其余为扫描到的 shell 子项
+        # （共享「本地终端」group）。不走 SSH 连接，任意环境可跑。
         def case_launch_options_local_terminal_group():
-            """launch-options returns a localized local-terminal group."""
+            """launch-options returns the default entry + a shell group."""
             options = req("local/terminal/launch-options", {"locale": "zh-CN"})
             entries = options.get("entries") or []
             assert len(entries) >= 1, "expected at least the default entry"
@@ -1581,11 +1581,10 @@ def main() -> None:
             assert description.startswith("默认 Shell："), description
             assert len(description) > len("默认 Shell："), "default shell program missing"
             assert first.get("context", {}).get("plugin", {}).get("mode") == "local-terminal"
-            # 所有项共享同一分组标签，宿主渲染为单个可折叠「本地终端」组。
-            for entry in entries:
-                assert entry.get("group") == "本地终端", entry.get("group")
-            # shell 子项在 context 里固定 shell 程序。
+            # 默认项不带 group（宿主顶层首位）；shell 子项共享「本地SHELL」分组。
+            assert not first.get("group"), first.get("group")
             for entry in entries[1:]:
+                assert entry.get("group") == "本地SHELL", entry.get("group")
                 assert (entry.get("context", {}).get("plugin", {}) or {}).get("shell"), entry
             legacy = req("local/terminal/launch-options", {})
             assert (legacy.get("entries") or [{}])[0].get("label") == "Local terminal"

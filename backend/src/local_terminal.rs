@@ -820,25 +820,18 @@ fn shell_display_name(basename: &str) -> String {
 /// table mirrors the workbench locale set (frontend/src/lib/i18n.ts); unknown
 /// or missing locales fall back to English. Returns (default entry label,
 /// group label, description prefix) — the caller appends the resolved default
-/// shell program. Every entry (default + discovered shells) carries the same
-/// `group` so the host renders one collapsible "local terminal" section.
+/// shell program. Discovered shells carry the `group` label so the host
+/// renders them as one collapsible "local shell" section; the default
+/// entry stays top-level.
 fn launch_option_copy(locale: &str) -> (&'static str, &'static str, &'static str) {
     match locale {
-        "zh-CN" | "zh" => ("本地终端", "本地终端", "默认 Shell："),
-        "zh-TW" => ("本地終端", "本地終端", "預設 Shell："),
-        "ja" => (
-            "ローカルターミナル",
-            "ローカルターミナル",
-            "デフォルトシェル: ",
-        ),
-        "es" => ("Terminal local", "Terminal local", "Shell predeterminado: "),
-        "it" => (
-            "Terminale locale",
-            "Terminale locale",
-            "Shell predefinita: ",
-        ),
-        "pt-BR" | "pt" => ("Terminal local", "Terminal local", "Shell padrão: "),
-        _ => ("Local terminal", "Local terminal", "Default shell: "),
+        "zh-CN" | "zh" => ("本地终端", "本地SHELL", "默认 Shell："),
+        "zh-TW" => ("本地終端", "本地SHELL", "預設 Shell："),
+        "ja" => ("ローカルターミナル", "ローカルシェル", "デフォルトシェル: "),
+        "es" => ("Terminal local", "Shell local", "Shell predeterminado: "),
+        "it" => ("Terminale locale", "Shell locale", "Shell predefinita: "),
+        "pt-BR" | "pt" => ("Terminal local", "Shell local", "Shell padrão: "),
+        _ => ("Local terminal", "Local shell", "Default shell: "),
     }
 }
 
@@ -867,24 +860,24 @@ pub fn resolve_default_shell(data_dir: &Path) -> String {
 }
 
 impl LocalTerminalRuntime {
-    /// PR-A4 generic launch-options contract (host dock "+"): one "local
-    /// terminal" entry using the resolved default shell plus one entry per
-    /// discovered shell, all sharing a `group` label so the host renders a
-    /// single collapsible section. The default entry opens with the
-    /// configured `localShell` preference (auto-detect chain as fallback) —
-    /// resolved by `resolve_default_shell` on the host call path — while the
-    /// per-shell entries pin an explicit shell via their context fragment.
-    /// Business meaning stays on the plugin side; the host renders labels and
-    /// never interprets the contexts. `locale` is the host UI language (the
-    /// host-side `options_action` contract); older hosts omit it and get
-    /// English.
+    /// PR-A4 generic launch-options contract (host dock "+"): the default
+    /// "local terminal" entry first — carried WITHOUT a `group` so the host
+    /// pins it top-level as the quickest action — followed by one entry per
+    /// discovered shell sharing the localized `group` label, which the host
+    /// renders as one collapsible section right below. The default entry
+    /// opens with the configured `localShell` preference (auto-detect chain
+    /// as fallback) — resolved by `resolve_default_shell` on the host call
+    /// path — while the per-shell entries pin an explicit shell via their
+    /// context fragment. Business meaning stays on the plugin side; the host
+    /// renders labels and never interprets the contexts. `locale` is the host
+    /// UI language (the host-side `options_action` contract); older hosts
+    /// omit it and get English.
     pub fn launch_options(&self, locale: &str, default_shell: &str) -> Value {
         let (label, group, description_prefix) = launch_option_copy(locale);
         let mut entries = vec![json!({
             "label": label,
             "description": format!("{description_prefix}{default_shell}"),
             "context": { "plugin": { "mode": "local-terminal" } },
-            "group": group,
         })];
         for shell in discover_shells(current_platform()) {
             if shell.program.is_empty() {
@@ -1156,23 +1149,21 @@ mod tests {
     }
 
     #[test]
-    fn launch_options_group_local_terminal_with_discovered_shells() {
+    fn launch_options_default_first_then_local_terminal_shell_group() {
         let runtime = LocalTerminalRuntime::new();
         let options = runtime.launch_options("zh-CN", "/bin/zsh");
         let entries = options["entries"].as_array().unwrap();
-        // First entry: the default-shell launcher (configured localShell or
-        // the auto-detect chain, resolved by the caller).
+        // First entry: the default-shell launcher, carried without a `group`
+        // so the host pins it top-level as the quickest action.
         assert_eq!(entries[0]["label"], "本地终端");
         assert_eq!(entries[0]["description"], "默认 Shell：/bin/zsh");
-        // Every entry — default plus discovered shells — shares the localized
-        // group label so the host renders one collapsible section.
-        for entry in entries {
-            assert_eq!(entry["group"], "本地终端");
-            assert_eq!(entry["context"]["plugin"]["mode"], "local-terminal");
-        }
-        // Per-shell entries (when discovery found any) pin the shell program
-        // in their context; shell names stay verbatim.
+        assert_eq!(entries[0]["context"]["plugin"]["mode"], "local-terminal");
+        assert!(entries[0]["group"].is_null());
+        // Discovered shells share the localized group label — the host renders
+        // them as one collapsible "本地SHELL" section right below the default.
         for entry in entries.iter().skip(1) {
+            assert_eq!(entry["group"], "本地SHELL");
+            assert_eq!(entry["context"]["plugin"]["mode"], "local-terminal");
             assert!(entry["context"]["plugin"]["shell"].as_str().is_some());
             assert!(!entry["label"].as_str().expect("label string").is_empty());
         }
@@ -1184,7 +1175,7 @@ mod tests {
         let runtime = LocalTerminalRuntime::new();
         let english = runtime.launch_options("ko", "/bin/bash");
         assert_eq!(english["entries"][0]["label"], "Local terminal");
-        assert_eq!(english["entries"][0]["group"], "Local terminal");
+        assert!(english["entries"][0]["group"].is_null());
         assert_eq!(
             runtime.launch_options("", "/bin/bash")["entries"][0]["description"],
             "Default shell: /bin/bash"

@@ -4,6 +4,11 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [Unreleased]
+
+- **dock「+」默认 Shell 启动项提为顶层首位，shell 分组更名「本地SHELL」并默认折叠**：默认 Shell 启动项不再带 `group`（宿主将其平铺在弹窗首位，单击即开），本机扫描到的 shell 子项收进可折叠分组，组标签改为「本地SHELL」（随界面语言），宿主默认折叠该分组。
+  **Dock "+" default-shell entry promoted to the top; shell group renamed "Local shell", collapsed by default:** the default-shell launcher no longer carries a `group` (the host pins it as the picker's first row — one click to open); the machine-scanned shell entries move into the collapsible group (localized label, e.g. "本地SHELL"), which the host renders collapsed by default.
+
 ## [0.7.1-beta.8] — 2026-09-27
 
 - **修复 Windows 本地终端启动 banner 重复渲染**：sidecar 对本地终端的同尺寸 resize 请求直接丢弃（Windows ConPTY 对同尺寸 `ResizePseudoConsole` 也会整屏重绘缓冲区，与 shell 启动横幅输出竞态，产生顶部孤字/底部重复 banner），仅真实几何变化才到达 PTY。
