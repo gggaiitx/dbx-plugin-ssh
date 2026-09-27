@@ -116,10 +116,11 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
   opacity: 0.6;
   font-size: 10px;
 }
-/* 工具栏 ⋯「更多工具」菜单项：图标 + 文案的整宽行，形态对齐 shell-surface-item。
-   popover 作用域没有 .modal button 的扁平化兜底，需自带去边框/去背景。 */
-.more-tools-popover { min-width: 200px; }
-.more-tools-item {
+/* 工具条「会话」下拉（新建/复制/命令会话/本地终端/Shell 选项）：图标 + 文案的
+   整宽行菜单项，形态对齐 shell-surface-item。popover 作用域没有 .modal button
+   的扁平化兜底，需自带去边框/去背景。 */
+.session-menu-popover { min-width: 210px; }
+.session-menu-item {
   display: flex;
   width: 100%;
   align-items: center;
@@ -132,11 +133,14 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); o
   text-align: left;
   cursor: pointer;
 }
-.more-tools-item svg { width: 14px; height: 14px; flex: 0 0 14px; }
-.more-tools-item:hover:not(:disabled) {
+.session-menu-item svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.session-menu-item:hover:not(:disabled) {
   background: color-mix(in srgb, currentColor 8%, transparent);
 }
-.more-tools-item:disabled { opacity: 0.45; }
+.session-menu-item:disabled { opacity: 0.45; }
+.session-menu-separator { margin: 4px 0; border: 0; border-top: 1px solid var(--border); }
+.session-shell-head { display: flex; align-items: center; gap: 6px; }
+.session-shell-head h3 { margin: 0; font-size: 12px; font-weight: 600; }
 .identity { min-width: 0; overflow: hidden; gap: 6px; }
 /* 空间不足时 Info 按钮也可折叠（先缩主机名，再缩它到 0），不再硬顶
    右侧按钮组造成叠印。 */
@@ -844,6 +848,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 .local-exit-card .local-exit-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .local-shell-chevron { margin-left: -6px; }
 .local-shell-popover { min-width: 300px; }
+/* shell 选项视图并入会话下拉后沿用原 local-shell-popover 的行布局。 */
+.session-menu-popover.session-menu-shell { min-width: 300px; }
+.session-menu-shell .local-shell-hint { margin: 0 0 8px; font-size: 11px; }
+.session-menu-shell .local-shell-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.session-menu-shell .local-shell-program { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; opacity: 0.75; }
+.session-menu-shell .local-shell-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 9px; color: var(--muted-foreground); }
+.session-menu-shell .local-shell-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
 .local-shell-popover .local-shell-hint { margin: 0 0 8px; font-size: 11px; }
 .local-shell-popover .local-shell-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .local-shell-popover .local-shell-program { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; opacity: 0.75; }

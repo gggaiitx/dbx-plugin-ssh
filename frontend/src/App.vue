@@ -1542,8 +1542,11 @@ const localUiMode = computed(() => isLocalMode.value || localShellRestored.value
 // shell 空串 = 跟随自动探测；integration 缺省开。
 const localShellPref = ref("");
 const localShellIntegrationPref = ref(true);
-// shell 选择器菜单：打开时拉一次 local/shells/list。
-const localMenuOpen = ref(false);
+// shell 选择器菜单：打开 shell 选项视图时拉一次 local/shells/list。
+// 会话下拉（新建/复制/命令会话/本地终端/Shell 选项）单入口状态；shell 视图
+// 为同弹层内的视图切换（非独立 popover，Esc/外点由 reka 随弹层整体收口）。
+const sessionMenuOpen = ref(false);
+const sessionMenuShellOpen = ref(false);
 const localShells = ref<Array<{ program: string; name: string; isDefault: boolean; isUserShell: boolean; injectable?: boolean }>>([]);
 const localShellsLoading = ref(false);
 // 上次本地会话跟踪到的 cwd：重开时继承（VS Code 新终端继承工作区目录惯例）。
@@ -4645,7 +4648,8 @@ async function closeLocalTerminal() {
   localState.value = "exited";
   localPendingFrames.clear();
   localOpenConfirmOpen.value = false;
-  localMenuOpen.value = false;
+  sessionMenuOpen.value = false;
+  sessionMenuShellOpen.value = false;
   if (!sessionId) return;
   await window.dbxPlugin.invoke("local/session/close", { sessionId }).catch(() => undefined);
   terminal?.focus();
@@ -5232,8 +5236,7 @@ async function confirmLocalTerminal() {
 }
 
 // —— shell 选择器：多平台 shell 发现 + 偏好（VS Code terminal profiles 简化版）——
-async function openLocalMenu() {
-  localMenuOpen.value = true;
+async function openLocalShellPrefs() {
   if (localShellsLoading.value || localShells.value.length) return;
   localShellsLoading.value = true;
   try {
@@ -9824,6 +9827,20 @@ function toggleQuickMenu() {
   }
 }
 
+// 会话下拉：与其它 popover 同款互斥收口；打开时回到动作列表视图。
+function toggleSessionMenu() {
+  const next = !sessionMenuOpen.value;
+  closeToolbarPopovers();
+  sessionMenuOpen.value = next;
+  if (next) sessionMenuShellOpen.value = false;
+}
+
+// 下拉内切到 shell 选项视图：同弹层视图切换，菜单不关，顺带懒加载 shell 列表。
+function openSessionShellPrefs() {
+  sessionMenuShellOpen.value = true;
+  void openLocalShellPrefs();
+}
+
 function toggleConnectionInfo() {
   const next = !connectionInfoOpen.value;
   closeToolbarPopovers();
@@ -10819,7 +10836,8 @@ function closeToolbarPopovers() {
   agentModeOpen.value = false;
   bookmarkSaveOpen.value = false;
   batchTargetsOpen.value = false;
-  localMenuOpen.value = false;
+  sessionMenuOpen.value = false;
+  sessionMenuShellOpen.value = false;
   localShellSurfaceOpen.value = false;
 }
 
@@ -11490,83 +11508,93 @@ onBeforeUnmount(() => {
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
         <!-- 工具条语义分组：视图 / 会话 / 运维 / 命令 / 记录与设置 / SFTP 工具（分隔线避开 local 模式两侧皆隐藏的位置） -->
         <span class="toolbar-separator" aria-hidden="true" />
-        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
-        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('copySessionTab')" :disabled="!connectionId || !connected" @click="openCopiedSessionTab"><Copy /></button>
-        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('spawnSessionTab')" :disabled="!connectionId || !connected" @click="openCommandSessionTab"><TerminalIcon /></button>
-        <!-- Telnet/VNC/RDP/串口不再从工具条直开（M32-A）：连接记录统一走宿主
-             连接管理 → openSession 路由（B2），表单兜底仍走各 ConnectDialog。 -->
-        <!-- 串口文件上传入口（NyaTerm 对齐 P0-3）：仅串口模式可用；传输中禁发。 -->
-        <button v-if="isSerialMode" class="icon-button icon-emerald" :title="t('serial.upload.open')" :disabled="serialUploadBusy" @click="serialUploadDialogOpen = true"><FileUp /></button>
-        <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
-             已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。 -->
-        <button class="icon-button icon-violet" :class="{ 'is-active': localUiMode }" :title="isRdpMode ? t('rdp.disconnect') : isVncMode ? t('vnc.disconnect') : isSerialMode ? t('serial.disconnect') : isTelnetMode ? t('telnet.disconnect') : localUiMode && !localShellRestored ? t('localTerminal.close') : t('localTerminal.open')" @click="toggleLocalTerminal"><TerminalIcon /></button>
-        <div v-if="!isTelnetMode && !isSerialMode && !isVncMode && !isRdpMode">
-          <!-- 本地终端设置：多平台 shell 选择（local/shells/list 发现）+ 注入开关，
-               记入 sidecar 偏好（iframe 沙箱无 localStorage）。 -->
-          <Popover :open="localMenuOpen" @update:open="(open) => { if (!open) localMenuOpen = false; }">
+        <!-- 会话下拉：新建 / 复制 / 命令会话 / 本地终端 / Shell 选项收敛为单入口，
+             工具条不再平铺五个会话类按钮（视觉走查）。Shell 选项为同弹层视图切换
+             （数据与 local/shells/list 懒加载逻辑不变）。 -->
+        <div>
+          <Popover :open="sessionMenuOpen" @update:open="(open) => { if (!open) sessionMenuOpen = false; }">
             <PopoverAnchor as-child>
-              <button class="icon-button icon-violet local-shell-chevron" :class="{ 'is-active': localMenuOpen }" :title="t('localTerminal.settings')" @click.stop="openLocalMenu"><ChevronDown /></button>
+              <button class="icon-button icon-emerald" :class="{ 'is-active': sessionMenuOpen }" :title="t('sessionMenu.title')" :aria-expanded="sessionMenuOpen" @click.stop="toggleSessionMenu"><SquarePlus /></button>
             </PopoverAnchor>
-            <PopoverContent class="popover local-shell-popover" align="start" :side-offset="5">
-              <h3>{{ t("localTerminal.settings") }}</h3>
-              <p class="muted local-shell-hint">{{ t("localTerminal.settingsHint") }}</p>
-              <div v-if="localShellsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
-              <template v-else-if="localShells.length">
-                <label v-for="entry in localShells" :key="entry.program" class="agent-mode-option">
-                  <input type="radio" name="local-shell" :checked="localShellPref ? localShellPref === entry.program : entry.isDefault" @change="setLocalShellPref(entry.program)" />
-                  <span class="local-shell-row">
-                    <strong>{{ entry.name }}</strong>
-                    <span class="mono local-shell-program">{{ entry.program }}</span>
-                    <span v-if="entry.isDefault" class="local-shell-badge">{{ t("localTerminal.defaultBadge") }}</span>
-                    <span v-if="entry.isUserShell" class="local-shell-badge">{{ t("localTerminal.userShellBadge") }}</span>
-                  </span>
-                </label>
+            <PopoverContent class="popover session-menu-popover" :class="{ 'session-menu-shell': sessionMenuShellOpen }" align="start" :side-offset="5">
+              <template v-if="!sessionMenuShellOpen">
+                <h3>{{ t("sessionMenu.title") }}</h3>
+                <button v-if="!localUiMode" class="session-menu-item" :disabled="!connectionId" @click="sessionMenuOpen = false; openNewSessionTab();"><SquarePlus />{{ t("newSessionTab") }}</button>
+                <button v-if="!localUiMode" class="session-menu-item" :disabled="!connectionId || !connected" @click="sessionMenuOpen = false; openCopiedSessionTab();"><Copy />{{ t("copySessionTab") }}</button>
+                <button v-if="!localUiMode" class="session-menu-item" :disabled="!connectionId || !connected" @click="sessionMenuOpen = false; openCommandSessionTab();"><TerminalIcon />{{ t("spawnSessionTab") }}</button>
+                <template v-if="!localUiMode"><hr class="session-menu-separator" /></template>
+                <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
+                     已连接时经确认先关 SSH；退出态由终端覆盖层提供重开出口。
+                     Telnet/VNC/RDP/串口模式下为对应的断开动作。 -->
+                <button class="session-menu-item" @click="sessionMenuOpen = false; toggleLocalTerminal();"><TerminalIcon />{{ isRdpMode ? t("rdp.disconnect") : isVncMode ? t("vnc.disconnect") : isSerialMode ? t("serial.disconnect") : isTelnetMode ? t("telnet.disconnect") : localUiMode && !localShellRestored ? t("localTerminal.close") : t("localTerminal.open") }}</button>
+                <button v-if="!isTelnetMode && !isSerialMode && !isVncMode && !isRdpMode" class="session-menu-item" @click="openSessionShellPrefs"><ChevronDown />{{ t("localTerminal.settings") }}</button>
               </template>
-              <p v-else class="muted local-shell-hint">{{ t("localTerminal.shellsUnavailable") }}</p>
-              <label class="agent-mode-option" :title="selectedShellInjectable === false ? t('localTerminal.injectionUnavailable') : ''">
-                <input type="checkbox" name="local-shell-integration" :checked="localShellIntegrationPref" :disabled="selectedShellInjectable === false" @change="setLocalShellIntegrationPref(($event.target as HTMLInputElement).checked)" />
-                <span>{{ t("localTerminal.injection") }}</span>
-              </label>
-              <footer class="local-shell-footer">
-                <!-- 本地模式中按钮保持可用：restart 语义（关当前 → 按新偏好重开）。
-                     仅 starting 期间禁用防双击。 -->
-                <button
-                  v-if="canOpenLocalTab"
-                  class="local-tab-button"
-                  :title="t('localTerminal.openInNewTab')"
-                  @click="openLocalTerminalTab"
-                ><SquarePlus /></button>
-                <Popover :open="localShellSurfaceOpen" @update:open="(open) => (localShellSurfaceOpen = open)">
-                  <PopoverAnchor as-child>
-                    <button
-                      v-if="canOpenLocalTab"
-                      class="local-tab-button"
-                      :title="t('localTerminal.openShellSurface')"
-                      @click="openLocalShellSurfaceMenu"
-                    ><ListPlus /></button>
-                  </PopoverAnchor>
-                  <PopoverContent class="popover" align="end" :side-offset="5">
-                    <button class="shell-surface-item" @click="openLocalShellSurface()">
-                      <TerminalIcon class="h-3.5 w-3.5" />{{ t("localTerminal.autoShell") }}
-                    </button>
-                    <button v-for="entry in localShells" :key="entry.program" class="shell-surface-item" @click="openLocalShellSurface(entry.program)">
-                      <TerminalIcon class="h-3.5 w-3.5" />{{ entry.name }}<span class="mono local-shell-program">{{ entry.program }}</span>
-                    </button>
-                    <template v-if="dockConnections.length">
-                      <p class="shell-surface-header">{{ t("localTerminal.connectionTerminals") }}</p>
-                      <button v-for="connection in dockConnections" :key="`conn-${connection.id}`" class="shell-surface-item" @click="openConnectionSurface(connection)">
-                        <TerminalIcon class="h-3.5 w-3.5" />{{ connection.name }}
+              <template v-else>
+                <header class="session-shell-head">
+                  <button class="icon-button compact" :title="t('cancel')" @click="sessionMenuShellOpen = false"><ArrowLeft /></button>
+                  <h3>{{ t("localTerminal.settings") }}</h3>
+                </header>
+                <p class="muted local-shell-hint">{{ t("localTerminal.settingsHint") }}</p>
+                <div v-if="localShellsLoading" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+                <template v-else-if="localShells.length">
+                  <label v-for="entry in localShells" :key="entry.program" class="agent-mode-option">
+                    <input type="radio" name="local-shell" :checked="localShellPref ? localShellPref === entry.program : entry.isDefault" @change="setLocalShellPref(entry.program)" />
+                    <span class="local-shell-row">
+                      <strong>{{ entry.name }}</strong>
+                      <span class="mono local-shell-program">{{ entry.program }}</span>
+                      <span v-if="entry.isDefault" class="local-shell-badge">{{ t("localTerminal.defaultBadge") }}</span>
+                      <span v-if="entry.isUserShell" class="local-shell-badge">{{ t("localTerminal.userShellBadge") }}</span>
+                    </span>
+                  </label>
+                </template>
+                <p v-else class="muted local-shell-hint">{{ t("localTerminal.shellsUnavailable") }}</p>
+                <label class="agent-mode-option" :title="selectedShellInjectable === false ? t('localTerminal.injectionUnavailable') : ''">
+                  <input type="checkbox" name="local-shell-integration" :checked="localShellIntegrationPref" :disabled="selectedShellInjectable === false" @change="setLocalShellIntegrationPref(($event.target as HTMLInputElement).checked)" />
+                  <span>{{ t("localTerminal.injection") }}</span>
+                </label>
+                <footer class="local-shell-footer">
+                  <!-- 本地模式中按钮保持可用：restart 语义（关当前 → 按新偏好重开）。
+                       仅 starting 期间禁用防双击。 -->
+                  <button
+                    v-if="canOpenLocalTab"
+                    class="local-tab-button"
+                    :title="t('localTerminal.openInNewTab')"
+                    @click="openLocalTerminalTab"
+                  ><SquarePlus /></button>
+                  <Popover :open="localShellSurfaceOpen" @update:open="(open) => (localShellSurfaceOpen = open)">
+                    <PopoverAnchor as-child>
+                      <button
+                        v-if="canOpenLocalTab"
+                        class="local-tab-button"
+                        :title="t('localTerminal.openShellSurface')"
+                        @click="openLocalShellSurfaceMenu"
+                      ><ListPlus /></button>
+                    </PopoverAnchor>
+                    <PopoverContent class="popover" align="end" :side-offset="5">
+                      <button class="shell-surface-item" @click="openLocalShellSurface()">
+                        <TerminalIcon class="h-3.5 w-3.5" />{{ t("localTerminal.autoShell") }}
                       </button>
-                    </template>
-                  </PopoverContent>
-                </Popover>
-                <button class="primary-button" :disabled="localState === 'starting'" @click="localMenuOpen = false; localShellRestored || isLocalMode ? restartLocalTerminal() : requestLocalTerminal()">
-                  {{ localUiMode ? t("localTerminal.restart") : t("localTerminal.open") }}
-                </button>
-              </footer>
+                      <button v-for="entry in localShells" :key="entry.program" class="shell-surface-item" @click="openLocalShellSurface(entry.program)">
+                        <TerminalIcon class="h-3.5 w-3.5" />{{ entry.name }}<span class="mono local-shell-program">{{ entry.program }}</span>
+                      </button>
+                      <template v-if="dockConnections.length">
+                        <p class="shell-surface-header">{{ t("localTerminal.connectionTerminals") }}</p>
+                        <button v-for="connection in dockConnections" :key="`conn-${connection.id}`" class="shell-surface-item" @click="openConnectionSurface(connection)">
+                          <TerminalIcon class="h-3.5 w-3.5" />{{ connection.name }}
+                        </button>
+                      </template>
+                    </PopoverContent>
+                  </Popover>
+                  <button class="primary-button" :disabled="localState === 'starting'" @click="sessionMenuOpen = false; sessionMenuShellOpen = false; localShellRestored || isLocalMode ? restartLocalTerminal() : requestLocalTerminal()">
+                    {{ localUiMode ? t("localTerminal.restart") : t("localTerminal.open") }}
+                  </button>
+                </footer>
+              </template>
             </PopoverContent>
           </Popover>
         </div>
+        <!-- 串口文件上传入口（NyaTerm 对齐 P0-3）：仅串口模式可用；传输中禁发。 -->
+        <button v-if="isSerialMode" class="icon-button icon-emerald" :title="t('serial.upload.open')" :disabled="serialUploadBusy" @click="serialUploadDialogOpen = true"><FileUp /></button>
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
         <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
              是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->

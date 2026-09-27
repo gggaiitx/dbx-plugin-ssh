@@ -182,7 +182,7 @@ try {
   // 管理路径：设置 → 终端 → 快速命令 → 新建（数据面 RPC 不变，全局共享）。
   await page.evaluate(() => document.querySelector('button svg[class*="lucide-settings"]').closest("button").click());
   await page.locator(".settings-nav-item").first().waitFor({ state: "visible", timeout: 15_000 });
-  await page.getByRole("tab", { name: "Terminal", exact: true }).click();
+  await page.getByRole("tab", { name: "Quick commands", exact: true }).click();
   await page.locator(".quick-manage-actions .link-button", { hasText: "New snippet" }).click();
   await page.fill(".quick-command-editor input", "ui-mock cmd");
   await page.fill(".quick-command-editor textarea", "echo ui-mock-batch");
@@ -259,7 +259,7 @@ try {
   // M32-A3：删除动作随管理视图在设置·终端（工具条卡片只剩执行）。
   await page.evaluate(() => document.querySelector('button svg[class*="lucide-settings"]').closest("button").click());
   await page.locator(".settings-nav-item").first().waitFor({ state: "visible", timeout: 15_000 });
-  await page.getByRole("tab", { name: "Terminal", exact: true }).click();
+  await page.getByRole("tab", { name: "Quick commands", exact: true }).click();
   // 删除有 window.confirm 确认（不可逆操作），自动接受。
   page.once("dialog", (dialog) => void dialog.accept());
   await page.click('.quick-manage-list li button[title="Delete"]');
