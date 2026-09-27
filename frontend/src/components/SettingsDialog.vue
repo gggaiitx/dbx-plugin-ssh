@@ -57,6 +57,7 @@ const t = props.t;
 
 const SETTINGS_CATEGORIES = [
   { id: "sudo", labelKey: "settingsNav.sudo" },
+  { id: "profiles", labelKey: "settingsNav.profiles" },
   { id: "agent", labelKey: "agentTerminalSection" },
   { id: "transfer", labelKey: "downloadSettings.title" },
   { id: "terminal", labelKey: "settingsNav.terminal" },
@@ -91,12 +92,11 @@ const settingsDraft = reactive({
 const downloadDirDraft = ref("");
 const downloadUseDefaultDraft = ref(props.downloadPrefs.loadUseDefault());
 const downloadConflictDraft = ref<DownloadConflictPolicy>("rename");
-// 全局 quick sudo 配置：列表与编辑表单状态（密钥只在提交时发送）。设置弹窗
-// 内联 section 与独立 profiles 弹窗共存复用同一份状态。
+// 全局 quick sudo 配置：列表与编辑表单状态（密钥只在提交时发送）。配置档管理
+// 有独立 tab（settingsNav.profiles）；工具栏 KeyRound 仍可开独立弹窗，共用同一份状态。
 const sudoProfiles = ref<SudoProfileView[]>([]);
 const sudoProfilesLoading = ref(false);
 const sudoProfilesError = ref("");
-const profilesInlineOpen = ref(false);
 const profileEditing = ref(false);
 const profileSaving = ref(false);
 const profileDraftHadPassword = ref(false);
@@ -210,9 +210,8 @@ async function reloadSettings() {
   settingsLoading.value = true;
   settingsLoadFailed.value = false;
   settingsMeta.value = undefined;
-  // 每次打开都回到收起态，并丢弃上次遗留的内联编辑草稿：
+  // 每次打开都回到收起态，并丢弃上次遗留的编辑草稿：
   // 主「保存」会串行提交未保存的 profile 编辑，不能把陈旧草稿静默入库。
-  profilesInlineOpen.value = false;
   cancelProfileEdit();
   void loadKnownHosts();
   void loadLocalKeys();
@@ -523,15 +522,11 @@ async function clearStoredSecrets() {
   }
 }
 
-/// Esc 分层退出：先关编辑表单，再收起配置档 section；返回 false 表示已到
-/// 最底层，调用方（App Esc 链）应关闭整个弹窗。
+/// Esc 分层退出：先关编辑表单；返回 false 表示已到底层，调用方（App Esc 链）
+/// 应关闭整个弹窗。
 function consumeInlineEsc(): boolean {
-  if (profilesInlineOpen.value && profileEditing.value) {
+  if (profileEditing.value) {
     cancelProfileEdit();
-    return true;
-  }
-  if (profilesInlineOpen.value) {
-    profilesInlineOpen.value = false;
     return true;
   }
   return false;
@@ -589,77 +584,11 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
                     <SelectItem v-for="profile in sudoProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}</SelectItem>
                   </SelectContent>
                 </Select>
-                <!-- 内联管理入口：展开/收起下方配置档 section，不再跳独立弹窗（工具栏 KeyRound 仍保留独立弹窗）。 -->
-                <button class="link-button" :aria-expanded="profilesInlineOpen" @click="profilesInlineOpen = !profilesInlineOpen">{{ t("profilesManage") }}</button>
+                <!-- 管理入口：跳到独立的 Sudo 配置档 tab（复杂配置抽出子页，Quick Sudo 页只留来源与开关）。 -->
+                <button class="link-button" @click="settingsCategory = 'profiles'">{{ t("profilesManage") }}</button>
               </span>
             </label>
             <p v-if="boundProfile" class="muted settings-note">{{ t("profilesBoundSummary", { name: boundProfile.name }) }} · {{ profileSummary(boundProfile) }}</p>
-            <!-- 内联 quick sudo 配置档管理：列表 + 新增/编辑同表单状态
-                 （sudoProfiles/profileDraft/... 与独立 profiles 弹窗共用），主「保存」串行提交。 -->
-            <section v-if="profilesInlineOpen" class="profiles-inline">
-              <h3 class="settings-section-title">{{ t("profilesTitle") }}</h3>
-              <p class="muted">{{ t("profilesHint") }}</p>
-              <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
-              <div v-else-if="!sudoProfiles.length" class="empty compact">{{ t("profilesEmpty") }}</div>
-              <ul v-else class="settings-list">
-                <li v-for="profile in sudoProfiles" :key="profile.id">
-                  <div class="settings-list-main">
-                    <strong>{{ profile.name }}</strong>
-                    <span class="muted">{{ profileSummary(profile) }}</span>
-                  </div>
-                  <span class="settings-list-actions">
-                    <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
-                    <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
-                  </span>
-                </li>
-              </ul>
-              <p class="muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</p>
-              <button v-if="!profileEditing" class="link-button" @click="startProfileCreate">{{ t("profilesAdd") }}</button>
-              <template v-if="profileEditing">
-                <h4 class="settings-section-title">{{ profileDraft.id ? t("profilesEdit") : t("profilesAdd") }}</h4>
-                <label class="settings-field">
-                  <span>{{ t("profilesName") }}</span>
-                  <input v-model="profileDraft.name" spellcheck="false" :placeholder="t('profilesNamePlaceholder')" />
-                </label>
-                <label class="settings-field">
-                  <span>{{ t("profilesPassword") }}</span>
-                  <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
-                </label>
-                <label class="settings-field">
-                  <span>{{ t("settingsTotp") }}</span>
-                  <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
-                </label>
-                <label class="settings-field">
-                  <span>{{ t("settingsFlowMode") }}</span>
-                  <Select :model-value="profileDraft.authFlowMode" @update:model-value="(v) => (profileDraft.authFlowMode = String(v))">
-                    <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="off">{{ t("flowOff") }}</SelectItem>
-                      <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
-                      <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
-                      <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </label>
-                <label class="settings-field">
-                  <span>{{ t("settingsPasswordHint") }}</span>
-                  <input v-model="profileDraft.passwordPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
-                </label>
-                <label class="settings-field">
-                  <span>{{ t("settingsTotpHint") }}</span>
-                  <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
-                </label>
-                <label class="quick-sudo-control">
-                  <Switch v-model="profileDraft.sudoUsePty" size="sm" />
-                  <span>{{ t("settingsUsePty") }}</span>
-                </label>
-                <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
-                <footer class="profiles-form-actions">
-                  <button @click="cancelProfileEdit">{{ t("cancel") }}</button>
-                  <button class="primary-button" :disabled="profileSaving || !profileDraft.name.trim()" @click="saveProfileDraft"><Loader2 v-if="profileSaving" class="spinning" />{{ t("save") }}</button>
-                </footer>
-              </template>
-            </section>
             <label class="quick-sudo-control">
               <Switch v-model="settingsDraft.quickSudo" size="sm" />
               <span>{{ t("settingsQuickSudo") }}</span>
@@ -701,6 +630,73 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
             </template>
             <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }} <button class="link-button" @click="loadSudoProfiles">{{ t("refresh") }}</button></p>
             <p class="muted settings-note">{{ t("settingsNote") }}</p>
+            </div>
+
+            <!-- Sudo 配置档独立页：从 Quick Sudo 页抽出的全局配置档管理
+                 （列表 + 新增/编辑表单），与独立 profiles 弹窗共用草稿状态。 -->
+            <div v-show="settingsCategory === 'profiles'" class="settings-pane">
+            <h3 class="settings-section-title">{{ t("profilesTitle") }}</h3>
+            <p class="muted">{{ t("profilesHint") }}</p>
+            <div v-if="sudoProfilesLoading && !sudoProfiles.length" class="empty compact"><Loader2 class="spinning" />{{ t("loading") }}</div>
+            <div v-else-if="!sudoProfiles.length" class="empty compact">{{ t("profilesEmpty") }}</div>
+            <ul v-else class="settings-list">
+              <li v-for="profile in sudoProfiles" :key="profile.id">
+                <div class="settings-list-main">
+                  <strong>{{ profile.name }}</strong>
+                  <span class="muted">{{ profileSummary(profile) }}</span>
+                </div>
+                <span class="settings-list-actions">
+                  <button class="icon-button" :title="t('profilesEdit')" @click="startProfileEdit(profile)"><Pencil /></button>
+                  <button class="icon-button" :title="t('profilesDelete')" @click="removeProfile(profile)"><Trash2 /></button>
+                </span>
+              </li>
+            </ul>
+            <p class="muted">{{ t("profilesLimit", { count: sudoProfiles.length, limit: 20 }) }}</p>
+            <button v-if="!profileEditing" class="link-button" @click="startProfileCreate">{{ t("profilesAdd") }}</button>
+            <template v-if="profileEditing">
+              <h4 class="settings-section-title">{{ profileDraft.id ? t("profilesEdit") : t("profilesAdd") }}</h4>
+              <label class="settings-field">
+                <span>{{ t("profilesName") }}</span>
+                <input v-model="profileDraft.name" spellcheck="false" :placeholder="t('profilesNamePlaceholder')" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("profilesPassword") }}</span>
+                <input v-model="profileDraft.sudoPassword" type="password" autocomplete="off" :placeholder="profileDraftHadPassword ? t('profilesPasswordKeep') : t('settingsSudoPasswordPlaceholder')" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("settingsTotp") }}</span>
+                <textarea v-model="profileDraft.totpSecret" rows="2" spellcheck="false" :placeholder="profileDraftHadTotp ? t('settingsConfigured') : t('settingsTotpPlaceholder')" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("settingsFlowMode") }}</span>
+                <Select :model-value="profileDraft.authFlowMode" @update:model-value="(v) => (profileDraft.authFlowMode = String(v))">
+                  <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="off">{{ t("flowOff") }}</SelectItem>
+                    <SelectItem value="password_then_otp">{{ t("flowThenOtp") }}</SelectItem>
+                    <SelectItem value="password_plus_otp">{{ t("flowPlusOtp") }}</SelectItem>
+                    <SelectItem value="password_only">{{ t("flowOnly") }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              <label class="settings-field">
+                <span>{{ t("settingsPasswordHint") }}</span>
+                <input v-model="profileDraft.passwordPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+              </label>
+              <label class="settings-field">
+                <span>{{ t("settingsTotpHint") }}</span>
+                <input v-model="profileDraft.totpPromptHint" spellcheck="false" :placeholder="t('settingsHintPlaceholder')" />
+              </label>
+              <label class="quick-sudo-control">
+                <Switch v-model="profileDraft.sudoUsePty" size="sm" />
+                <span>{{ t("settingsUsePty") }}</span>
+              </label>
+              <p v-if="sudoProfilesError" class="task-error">{{ sudoProfilesError }}</p>
+              <footer class="profiles-form-actions">
+                <button @click="cancelProfileEdit">{{ t("cancel") }}</button>
+                <button class="primary-button" :disabled="profileSaving || !profileDraft.name.trim()" @click="saveProfileDraft"><Loader2 v-if="profileSaving" class="spinning" />{{ t("save") }}</button>
+              </footer>
+            </template>
             </div>
 
             <div v-show="settingsCategory === 'agent'" class="settings-pane">

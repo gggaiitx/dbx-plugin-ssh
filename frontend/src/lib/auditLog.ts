@@ -112,12 +112,23 @@ export function sanitizeAuditEntries(raw: unknown, limit = 200): AuditEntry[] {
 /**
  * 结果列文案决策：outcome 优先（ok/error），agent.challenge 的 decision
  * （issued/approved/denied/timeout）次之，auto-sudo 的 kind2（password/otp）
- * 兜底；都缺返回空串（列隐藏）。
+ * 兜底；都缺返回空串（列隐藏）。decision 是协议枚举，走 i18n 上屏；
+ * 未知枚举原样回显，容忍 sidecar 先行新增值。
  */
+const DECISION_LABEL_KEYS: Record<string, string> = {
+  issued: "auditLog.decisionIssued",
+  approved: "auditLog.decisionApproved",
+  denied: "auditLog.decisionDenied",
+  timeout: "auditLog.decisionTimeout",
+};
+
 export function auditOutcomeLabel(entry: AuditEntry, t: (key: string) => string): string {
   if (entry.outcome === "ok") return t("auditLog.outcomeOk");
   if (entry.outcome === "error") return t("auditLog.outcomeError");
-  if (entry.decision) return entry.decision;
+  if (entry.decision) {
+    const key = DECISION_LABEL_KEYS[entry.decision];
+    return key ? t(key) : entry.decision;
+  }
   if (entry.kind2) return entry.kind2;
   return "";
 }

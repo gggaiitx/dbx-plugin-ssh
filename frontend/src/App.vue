@@ -28,6 +28,7 @@ import {
   Columns3,
   Copy,
   Download,
+  Ellipsis,
   Eraser,
   File as FileIcon,
   FilePlus,
@@ -565,6 +566,9 @@ const resumableLoading = ref(false);
 const resumeInput = ref<HTMLInputElement | null>(null);
 const resumeTargetTaskId = ref("");
 const columnsOpen = ref(false);
+// 更多工具菜单（⋯）：低频配置/诊断入口（告警排查、Quick Sudo 配置档、端口转发、
+// 审计日志）统一收进溢出菜单，工具栏只保留高频动作（视觉走查 P1：27 个控件平铺难扫读）。
+const moreMenuOpen = ref(false);
 const transferSpeeds = reactive<Record<string, number>>({});
 const previewOpen = ref(false);
 const previewTitle = ref("");
@@ -1301,6 +1305,9 @@ function scheduleTooltip(target: HTMLElement) {
   if (title !== null) {
     target.setAttribute("data-tooltip", title);
     target.removeAttribute("title");
+    // title 挪走后可访问名称会丢（ VoiceOver/NVDA 读不出按钮）：回填 aria-label
+    // 兜底；已有 aria-label 的元素以它为准，不覆盖。
+    if (!target.hasAttribute("aria-label")) target.setAttribute("aria-label", title);
   }
   const text = target.getAttribute("data-tooltip")?.trim();
   if (!text) return;
@@ -6459,6 +6466,13 @@ function toggleQuickMenu() {
   }
 }
 
+// 更多工具菜单：与其它 popover 同款互斥收口。
+function toggleMoreMenu() {
+  const next = !moreMenuOpen.value;
+  closeToolbarPopovers();
+  moreMenuOpen.value = next;
+}
+
 function toggleConnectionInfo() {
   const next = !connectionInfoOpen.value;
   closeToolbarPopovers();
@@ -6594,6 +6608,8 @@ function toggleMetrics() {
     closeMetrics();
     return;
   }
+  // 指标/录制浮层同锚右上角，互相排斥打开，避免叠压遮挡（视觉走查发现）。
+  recordingsOpen.value = false;
   metricsOpen.value = true;
   void backfillMetricsHistory();
   void refreshMetrics();
@@ -6770,11 +6786,14 @@ async function loadRecordings() {
 }
 
 function toggleRecordings() {
-  recordingsOpen.value = !recordingsOpen.value;
-  if (recordingsOpen.value) {
+  const next = !recordingsOpen.value;
+  if (next) {
+    // 与指标浮层同锚右上角：打开录制列表时收起指标，防止叠压。
+    closeMetrics();
     void probeLocalCapabilities();
     void loadRecordings();
   }
+  recordingsOpen.value = next;
 }
 
 // 打开录制文件所在目录：仅在桌面端（sidecar 在本机）有意义，
@@ -7293,6 +7312,7 @@ function closeToolbarPopovers() {
   connectionInfoOpen.value = false;
   agentModeOpen.value = false;
   highlightMenuOpen.value = false;
+  moreMenuOpen.value = false;
   bookmarkSaveOpen.value = false;
   batchTargetsOpen.value = false;
   localMenuOpen.value = false;
@@ -7535,12 +7555,13 @@ function onDocumentKeydown(event: KeyboardEvent) {
     settingsOpen.value = false;
     return;
   }
-  // 右键菜单与九个工具栏 popover 均已迁移 reka（ContextMenu/Popover）：Esc 与外点
+  // 右键菜单与工具栏 popover 均已迁移 reka（ContextMenu/Popover）：Esc 与外点
   // 由 reka 自行消费（见上方 content 守卫），不再占 Esc 链一层。本层只剩
-  // 指标浮层（.metrics-float 非 reka）与批量保存态（带草稿清理）。
-  if (metricsOpen.value || batchSaveMode.value) {
+  // 指标/录制浮层（.metrics-float 非 reka）与批量保存态（带草稿清理）。
+  if (metricsOpen.value || recordingsOpen.value || batchSaveMode.value) {
     if (batchSaveMode.value) cancelBatchBarSave();
     if (metricsOpen.value) closeMetrics();
+    if (recordingsOpen.value) recordingsOpen.value = false;
   }
 }
 
@@ -7883,6 +7904,7 @@ onBeforeUnmount(() => {
         <button v-if="!localUiMode" class="icon-button icon-cyan" :class="{ 'is-active': sftpPaneOpen }" :title="sftpPaneOpen ? t('sftpPane.close') : t('sftpPane.open')" :aria-pressed="sftpPaneOpen" :disabled="panelSurface" @click="toggleSftpPane"><FolderOpen v-if="!sftpPaneOpen" /><PanelRightClose v-else /></button>
         <button class="icon-button" :title="t('terminalFontDecrease')" @click="adjustTerminalZoom(-1)"><span class="font-step-label" aria-hidden="true">A−</span></button>
         <button class="icon-button" :title="t('terminalFontIncrease')" @click="adjustTerminalZoom(1)"><span class="font-step-label" aria-hidden="true">A+</span></button>
+        <span class="toolbar-separator" aria-hidden="true" />
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('newSessionTab')" :disabled="!connectionId" @click="openNewSessionTab"><SquarePlus /></button>
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('copySessionTab')" :disabled="!connectionId || !connected" @click="openCopiedSessionTab"><Copy /></button>
         <!-- 本地终端：sidecar 所在机器的登录 shell。与 SSH 会话互斥展示，
@@ -7956,13 +7978,10 @@ onBeforeUnmount(() => {
           </Popover>
         </div>
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('reconnect')" :disabled="terminalState === 'connecting' && !reconnectPending" @click="reconnectNow"><PlugZap /></button>
+        <span class="toolbar-separator" aria-hidden="true" />
         <!-- 一键 sudo -v：向当前 PTY 写入命令刷新 sudo 凭据缓存；quick sudo 自动应答
              是否启用由连接设置决定（设置弹窗），工作台不再提供开关。 -->
         <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('sudoRefresh.title')" :disabled="!connected" @click="sendSudoRefresh"><ShieldCheck /></button>
-        <button v-if="!localUiMode" class="icon-button icon-emerald" :title="t('profilesTitle')" @click="openProfilesManager"><KeyRound /></button>
-        <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
-        <!-- main 新增的端口转发入口同属 SSH 专属：沿用 A4 惯例在本地模式整体隐藏。 -->
-        <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('forwards.title')" :disabled="!session" @click="forwardsOpen = true"><Network /></button>
         <label v-if="!localUiMode" class="follow-directory-control" :title="t('followTerminal')">
           <Switch size="sm" :model-value="followDirectory" :disabled="!connected || panelSurface" @update:model-value="setDirectoryTracking" />
           <span>{{ t("followTerminal") }}</span>
@@ -8090,11 +8109,11 @@ onBeforeUnmount(() => {
             </PopoverContent>
           </Popover>
         </div>
+        <span class="toolbar-separator" aria-hidden="true" />
         <button class="icon-button icon-emerald" :class="{ 'is-active': metricsOpen }" :title="t('metrics')" :aria-pressed="metricsOpen" :disabled="!connected" @click="toggleMetrics"><Gauge /></button>
         <button class="icon-button" :class="{ 'is-recording': recordingActive }" :title="recordingActive ? t('recordingStop') : t('recordingTitle')" :disabled="!connected" @click="toggleRecording"><Disc /></button>
         <button class="icon-button" :class="{ 'is-active': recordingsOpen }" :title="t('recordingsTitle')" :aria-pressed="recordingsOpen" @click="toggleRecordings"><Film /></button>
-        <button class="icon-button icon-violet" :title="t('settings')" :disabled="!connected" @click="openSettings"><Settings /></button>
-        <button class="icon-button icon-amber" :title="t('auditLog.title')" @click="openAuditLog"><FileText /></button>
+        <span class="toolbar-separator" aria-hidden="true" />
         <div>
           <Popover :open="columnsOpen" @update:open="(open) => { if (!open) columnsOpen = false; }">
             <PopoverAnchor as-child>
@@ -8177,6 +8196,23 @@ onBeforeUnmount(() => {
             </PopoverContent>
           </Popover>
         </div>
+        <!-- 更多工具（⋯）：告警排查 / Quick Sudo 配置档 / 端口转发 / 审计日志。
+             均为低频入口，收进溢出菜单让高频动作留在工具栏（SSH 专属整体隐藏）。 -->
+        <div v-if="!localUiMode">
+          <Popover :open="moreMenuOpen" @update:open="(open) => { if (!open) moreMenuOpen = false; }">
+            <PopoverAnchor as-child>
+              <button class="icon-button icon-neutral" :class="{ 'is-active': moreMenuOpen }" :title="t('moreTools')" :aria-expanded="moreMenuOpen" @click.stop="toggleMoreMenu"><Ellipsis /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover more-tools-popover" align="end" :side-offset="5">
+              <h3>{{ t("moreTools") }}</h3>
+              <button class="more-tools-item" @click="openAlertTriage(); moreMenuOpen = false;"><Siren />{{ t("alertTriage.title") }}</button>
+              <button class="more-tools-item" @click="openProfilesManager(); moreMenuOpen = false;"><KeyRound />{{ t("profilesTitle") }}</button>
+              <button class="more-tools-item" :disabled="!session" @click="forwardsOpen = true; moreMenuOpen = false;"><Network />{{ t("forwards.title") }}</button>
+              <button class="more-tools-item" @click="openAuditLog(); moreMenuOpen = false;"><FileText />{{ t("auditLog.title") }}</button>
+            </PopoverContent>
+          </Popover>
+        </div>
+        <button class="icon-button icon-violet" :title="t('settings')" :disabled="!connected" @click="openSettings"><Settings /></button>
       </div>
     </header>
 
@@ -8617,7 +8653,9 @@ onBeforeUnmount(() => {
             />
             <nav v-show="!pathBarEditing" class="path-crumbs" tabindex="0" @click="beginPathBarEdit" @keydown.enter.self.prevent="beginPathBarEdit">
               <template v-for="(crumb, index) in pathCrumbs" :key="crumb.path">
-                <span v-if="index" class="path-crumb-sep" aria-hidden="true">/</span>
+                <!-- 根段本身渲染为 "/"（name="/"），其后再补分隔符会显示成 "//"；
+                     分隔符从第二段（index > 1）才开始插入。 -->
+                <span v-if="index > 1" class="path-crumb-sep" aria-hidden="true">/</span>
                 <button v-if="index < pathCrumbs.length - 1" class="path-crumb mono" :title="crumb.path" @click.stop="goToPath(crumb.path)">{{ crumb.name }}</button>
                 <span v-else class="path-crumb current mono" :title="crumb.path" aria-current="location">{{ crumb.name }}</span>
               </template>

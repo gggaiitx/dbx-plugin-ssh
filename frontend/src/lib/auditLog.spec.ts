@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { auditKindLabel, auditKindOptions, auditOutcomeLabel, sanitizeAuditEntries, AUDIT_KIND_TO_I18N } from "./auditLog";
 
-const translate = (key: string) => ({ "auditLog.kind.mcpTool": "MCP tool", "auditLog.kind.exec": "Exec", "auditLog.outcomeOk": "ok", "auditLog.outcomeError": "error" })[key] || key;
+const translate = (key: string) => ({ "auditLog.kind.mcpTool": "MCP tool", "auditLog.kind.exec": "Exec", "auditLog.outcomeOk": "ok", "auditLog.outcomeError": "error", "auditLog.decisionTimeout": "timed out" })[key] || key;
 
 describe("audit log kinds", () => {
   it("maps known kinds to i18n and shows unknown kinds verbatim", () => {
@@ -113,7 +113,9 @@ describe("audit outcome label", () => {
   it("prefers outcome, then decision, then the auto-sudo answer type", () => {
     expect(auditOutcomeLabel({ ts: 1, kind: "exec", outcome: "ok" }, translate)).toBe("ok");
     expect(auditOutcomeLabel({ ts: 1, kind: "exec", outcome: "error" }, translate)).toBe("error");
-    expect(auditOutcomeLabel({ ts: 1, kind: "agent.challenge", decision: "timeout" }, translate)).toBe("timeout");
+    expect(auditOutcomeLabel({ ts: 1, kind: "agent.challenge", decision: "timeout" }, translate)).toBe("timed out");
+    // 未知 decision 枚举原样回显（容忍 sidecar 先行新增值）。
+    expect(auditOutcomeLabel({ ts: 1, kind: "agent.challenge", decision: "future" }, translate)).toBe("future");
     expect(auditOutcomeLabel({ ts: 1, kind: "terminal.auto_sudo", kind2: "otp" }, translate)).toBe("otp");
     expect(auditOutcomeLabel({ ts: 1, kind: "mcp.gate", gate: "scope" }, translate)).toBe("");
   });
