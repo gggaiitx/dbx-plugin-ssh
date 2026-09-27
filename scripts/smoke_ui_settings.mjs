@@ -194,12 +194,22 @@ try {
   console.log("==> settings: category order");
   await openSettings();
   const navTexts = (await page.locator(".settings-nav-item").allTextContents()).map((t) => t.trim());
-  check("nine settings categories", navTexts.length === 9, JSON.stringify(navTexts));
+  check("eleven settings categories", navTexts.length === 11, JSON.stringify(navTexts));
   check(
     "terminal categories come first, in Tabby order",
-    navTexts[0] === "Appearance" && navTexts[1] === "Color scheme" && navTexts[3] === "Hotkeys",
-    JSON.stringify(navTexts.slice(0, 4)),
+    navTexts[0] === "Appearance" && navTexts[1] === "Color scheme" && navTexts[3] === "Keyword highlighting" && navTexts[4] === "Quick commands" && navTexts[5] === "Hotkeys",
+    JSON.stringify(navTexts.slice(0, 6)),
   );
+
+  console.log("==> 关键词高亮 pane（从 Terminal 拆出的规则管理器）");
+  await openCategory(3);
+  check("highlight pane renders the rules editor", (await page.locator(".settings-pane:visible .highlight-rule-list, .settings-pane:visible .highlight-editor").count()) > 0);
+  await page.screenshot({ path: join(SHOT_DIR, "02b-keyword-highlighting.png") });
+
+  console.log("==> 快速命令 pane（从 Terminal 拆出的片段管理器）");
+  await openCategory(4);
+  check("quick-commands pane renders the manager", (await page.locator(".settings-pane:visible .quick-commands-section").count()) === 1);
+  await page.screenshot({ path: join(SHOT_DIR, "02c-quick-commands.png") });
 
   console.log("==> 外观 pane (typography only)");
   await openCategory(0);
@@ -252,7 +262,7 @@ try {
   await page.screenshot({ path: join(SHOT_DIR, "03-terminal.png") });
 
   console.log("==> 快捷键 pane: editor surface");
-  await openCategory(3);
+  await openCategory(5);
   const hotkeyRows = page.locator(".settings-pane:visible .hotkey-row");
   check("eleven bindable actions (incl. quick-select since WT-1)", (await hotkeyRows.count()) === 11, String(await hotkeyRows.count()));
   const groupTitles = await page.locator(".settings-pane:visible .hotkey-group .settings-section-title").allTextContents();
@@ -344,7 +354,7 @@ try {
   const MOD = APPLE ? "Meta" : "Control";
   const DEFAULT_SEARCH_CHORD = APPLE ? `${MOD}+f` : `${MOD}+Shift+f`;
 
-  await openCategory(3);
+  await openCategory(5);
   const searchRowAgain = page.locator(".settings-pane:visible .hotkey-row", { hasText: "Find in terminal" });
   const searchChipsBefore = (await searchRowAgain.locator(".hotkey-chip").allTextContents()).map((t) => t.trim());
   await searchRowAgain.locator(".hotkey-chip").first().click();
@@ -399,7 +409,7 @@ try {
   // The dispatch group above closed the dialog to focus the terminal, so the
   // settings surface has to be reopened before touching the category nav again.
   await openSettings();
-  await openCategory(8);
+  await openCategory(10);
   const approvalField = page.locator(".settings-pane:visible label.settings-field", { hasText: "MCP execution approval" });
   check("MCP execution-approval field rendered", (await approvalField.count()) === 1);
   if (await approvalField.count()) {
@@ -438,7 +448,7 @@ try {
   const zhNav = (await zhPage.locator(".settings-nav-item").allTextContents()).map((t) => t.trim());
   check(
     "zh-CN nav translates the new categories",
-    zhNav[0] === "外观" && zhNav[1] === "配色方案" && zhNav[3] === "快捷键",
+    zhNav[0] === "外观" && zhNav[1] === "配色方案" && zhNav[3] === "关键词高亮" && zhNav[5] === "快捷键",
     JSON.stringify(zhNav.slice(0, 4)),
   );
   await zhPage.close();

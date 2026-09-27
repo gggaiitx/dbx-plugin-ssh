@@ -451,6 +451,10 @@ const SETTINGS_CATEGORIES = [
   { id: "appearance", labelKey: "settingsNav.appearance" },
   { id: "scheme", labelKey: "settingsNav.scheme" },
   { id: "terminal", labelKey: "settingsNav.terminal" },
+  // 从 Terminal 分栏拆出（内容过大且与终端行为关联性弱）：高亮规则是规则
+  // 管理器、快速命令是片段管理器，各自独立成栏，导航标签复用现有键。
+  { id: "highlight", labelKey: "highlightRules.title" },
+  { id: "commands", labelKey: "quickCommands" },
   { id: "hotkeys", labelKey: "settingsNav.hotkeys" },
   { id: "sudo", labelKey: "settingsNav.sudo" },
   { id: "agent", labelKey: "agentTerminalSection" },
@@ -1996,10 +2000,12 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <span>{{ t("terminalGhost.label") }}</span>
             </label>
             <p class="muted settings-note">{{ t("terminalGhost.hint") }}</p>
+            </div>
 
-            <!-- 关键词高亮规则（M32-A2）：从工具条弹层迁入，规则增删改/启停在此管理，
-                 终端渲染效果实时生效（数据面 RPC 与权威态在 App）。 -->
-            <h3 class="settings-section-title">{{ t("highlightRules.title") }}</h3>
+            <!-- 关键词高亮独立分栏：从 Terminal 分栏拆出（规则管理器与终端行为
+                 设置关联性弱），规则增删改/启停在此管理，终端渲染效果实时生效
+                 （数据面 RPC 与权威态在 App）。 -->
+            <div v-show="settingsCategory === 'highlight'" class="settings-pane">
             <HighlightRulesSection
               :rules="highlightRules"
               :saving="highlightSaving"
@@ -2009,9 +2015,11 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               @delete="(id) => emit('delete-highlight-rule', id)"
               @toggle="(item) => emit('toggle-highlight-rule', item)"
             />
+            </div>
 
-            <!-- 快速命令（M32-A3）：执行留在工具条弹层（高频），新建/编辑/导入在此管理。 -->
-            <h3 class="settings-section-title">{{ t("quickCommands") }}</h3>
+            <!-- 快速命令独立分栏：从 Terminal 分栏拆出（片段管理器）。执行仍留在
+                 工具条弹层（高频），新建/编辑/导入在此管理。 -->
+            <div v-show="settingsCategory === 'commands'" class="settings-pane">
             <QuickCommandsSection
               :commands="quickCommands"
               :saving="quickSaving"
