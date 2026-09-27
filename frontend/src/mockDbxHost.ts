@@ -12,6 +12,9 @@ const fixtureParams = new URLSearchParams(location.search);
 // 种子必须走 pluginStore（写缓存 + 写穿持久档）：App 经 store 首读，直写
 // localStorage 会被水合时序吃掉（宿主档水合发生在种子写入之后也读不到）。
 if (fixtureParams.get("render") === "dom") {
+  // 快速输入诊断（#33/#71）：默认强制 DOM 渲染器。要复刻真实工作台的
+  // WebGL 渲染路径时，把下行改为 pluginStore.setItem("ssh-terminal-webgl", "1")
+  //（注意：Safari 的 vite fixture 下 WebGL 终端渲染为空白，仅 Chromium 可用）。
   pluginStore.setItem("ssh-terminal-webgl", "0");
 }
 // ?rw=1 模拟可写连接（默认只读），供拖放上传等写路径 UI 验证。
@@ -56,6 +59,54 @@ const localOnlyContext = fixtureParams.get("local") === "1";
 // requires restore-without-replay — no automatic shell, just the exit shell until the user explicitly starts one.
 const restoredFixture = fixtureParams.get("restored") === "1";
 
+// ?rdpCert=1 让 rdp/start 在拨号早期发出 connection/challenge（kind=
+// rdp-certificate），供证书确认弹窗（指纹/knownHostStatus/120s 倒计时）的
+// 浏览器走查；rdp/certificate/resolve(accept) 后才继续推桌面帧。
+const rdpCertChallenge = fixtureParams.get("rdpCert") === "1";
+// ?rdpErr=authfail 模拟 NLA 认证失败（errorKind=authentication，永不自动重试，
+// 直接终态）；?rdpErr=transport 模拟传输类失败的重连退避梯子（reconnecting
+// attempt 1..2 → 终态 error），供退出覆盖层与重连状态条的走查。
+const rdpErrKind = fixtureParams.get("rdpErr");
+
+// ?auth=auto 模拟 Auto 认证链（M13-A，M18 mock 补齐）：ssh/session/open 按后端
+// AUTO_AUTH_ORDER（password → private-key → keyboard-interactive → agent，见
+// backend/src/ssh.rs）逐方式发 ssh/auth/auto 进度事件后拨号成功（agent 兜底
+// 成功，成功方式不发事件——与真实 sidecar「只报非成功阶段」一致）；
+// ?auth=autofail 四个方式全败并抛聚合错误串（auto_auth_failure_message 同构）。
+// 缺省不发任何认证进度事件（显式方式无回退叙事）。
+const authFixture = fixtureParams.get("auth") || "";
+const autoAuthActive = authFixture === "auto" || authFixture === "autofail";
+interface MockAutoAuthAttempt {
+  method: string;
+  status: "skipped" | "failed";
+  detail: string;
+}
+// 剧本：password 失败 → private-key 跳过（本地无私钥）→ keyboard-interactive
+// 失败 → agent 分歧点（auto 成功 / autofail 失败）。覆盖 skipped/failed 两种
+// 状态，事件形状镜像 backend/src/ssh.rs authenticate_auto 的 emitter.event。
+const AUTO_AUTH_BASE_ATTEMPTS: MockAutoAuthAttempt[] = [
+  { method: "password", status: "failed", detail: "password rejected by server" },
+  { method: "private-key", status: "skipped", detail: "no private key configured for this connection" },
+  { method: "keyboard-interactive", status: "failed", detail: "keyboard-interactive authentication timed out" },
+];
+const AUTO_AUTH_AGENT_FAILURE: MockAutoAuthAttempt = { method: "agent", status: "failed", detail: "no agent socket available" };
+// 聚合失败信息（auto_auth_failure_message 同构）：skipped 带前缀、failed 只带原因。
+function autoAuthFailureMessage(attempts: MockAutoAuthAttempt[]): string {
+  const summary = attempts
+    .map((attempt) => (attempt.status === "skipped" ? `${attempt.method} (skipped: ${attempt.detail})` : `${attempt.method} (${attempt.detail})`))
+    .join("; ");
+  return `SSH authentication failed in Auto mode, tried in order — ${summary}`;
+}
+function emitAutoAuthProgress(includeAgentFailure: boolean): void {
+  const attempts = includeAgentFailure ? [...AUTO_AUTH_BASE_ATTEMPTS, AUTO_AUTH_AGENT_FAILURE] : AUTO_AUTH_BASE_ATTEMPTS;
+  for (const attempt of attempts) {
+    for (const listener of eventListeners) listener({
+      method: "ssh/auth/auto",
+      params: { operationId: "visual-auth-auto", connectionId: context.connectionId, method: attempt.method, status: attempt.status, detail: attempt.detail },
+    });
+  }
+}
+
 const context = localOnlyContext
   ? {
       plugin: { mode: "local-terminal" },
@@ -68,7 +119,7 @@ const context = localOnlyContext
   workbenchId: "visual-workbench",
   restored: false,
   workbenchState: { sftpPath: "/home/demo", splitRatio: 58, paneOrder: "terminal-left", visibleColumns: ["size", "modified", "owner", "group", "permissions"] },
-  connection: { name: "Production SSH", host: "192.168.1.64", port: 22, username: "user", color: "#3b82f6", readOnly: !writable },
+  connection: { name: "Production SSH", host: "192.168.1.64", port: 22, username: "user", color: "#3b82f6", readOnly: !writable, ...(autoAuthActive ? { authentication: "auto" } : {}) },
 };
 
 const appearance: DbxPluginAppearance = {
@@ -132,6 +183,224 @@ function localCommandMarks(command: string) {
 }
 function localDoneMarks(code: number) {
   return `\u001b]633;D;${code}\u0007\u001b]133;D;${code}\u0007`;
+}
+
+// ---- RDP 远程桌面夹具（nyaterm-parity P3-4）：rdp/* 全链路 ----------------
+// 帧补丁与 vnc/frame 同一 44 字节头（LE）+ RGBA；start 后推 connected →
+// 桌面帧序列 → rdp/pointer 光标形状；?rdpCert=1 先走证书挑战、
+// ?rdpErr=authfail|transport 走失败分支（见顶部参数说明）。
+//
+// 已知偏差（mock vs 真实 sidecar，rdp-security-review【mock 偏差】清单）：
+// 已对齐 1（rdp/start 参数校验）、2/3（证书 resolve 校验 challengeId +
+// 一次性 + 120s fail-closed 超时）、7（帧序号跨重连单调）。仍保留的偏差：
+// - 偏差 4：mock 永不发 graceful closed 终态；transport 夹具以 error 收尾
+//   后不再补发 closed（真实 rdp_session.rs 终态 error 后会补 closed）。
+// - 偏差 5：rdp/list 固定 username "demo"/hasPassword true，不反映实际输入。
+// - 偏差 6：rdp/clipboard 无 CF_UNICODETEXT/16 MiB/分片语义，固定 900ms 推
+//   一条小文本。
+// - 偏差 8：rdp/reconnect 无 generation/重新 prompt 语义（直接重拨）。
+const RDP_DESKTOP_W = 320;
+const RDP_DESKTOP_H = 200;
+
+let rdpSessionId = "";
+// 帧序号全局单调（mock 偏差 7）：真实 sidecar 的 frame_sequence 跨代单调，
+// 前端按 `sequence <= lastSequence` 丢弃乱序补丁——mock 重连后归零会让画面
+// 假死并污染走查结论。新会话有新 sessionId，单调计数跨会话无副作用。
+let rdpSequence = 0;
+let rdpFrameTimer = 0;
+let rdpFrameCount = 0;
+// 证书挑战闸门：resolve(accept=true) 后放行桌面帧（fail-closed：不 accept 不放行）。
+let rdpCertGate: (() => void) | null = null;
+// 一次性 challengeId（mock 偏差 2/3）：resolve 必须携带当前 id，已决/未知 id
+// 报错；120s 未决 fail-closed 超时。
+let rdpCertChallengeId = "";
+let rdpCertTimeoutTimer = 0;
+
+function emitRdpState(state: string, extra: Record<string, unknown> = {}) {
+  if (!rdpSessionId) return;
+  for (const listener of eventListeners) listener({ method: "rdp/session/state", params: { sessionId: rdpSessionId, workbenchId: context.workbenchId, state, ...extra } });
+}
+
+/** 编码一个 44 字节 patch 头（LE）+ RGBA 负载的帧补丁（与 sidecar vnc 同构封装）。 */
+function rdpFramePatch(sequence: number, x: number, y: number, width: number, height: number, payload: Uint8Array): Uint8Array {
+  const frame = new Uint8Array(44 + payload.length);
+  const view = new DataView(frame.buffer);
+  view.setBigUint64(0, BigInt(sequence), true);
+  view.setUint32(8, RDP_DESKTOP_W, true);
+  view.setUint32(12, RDP_DESKTOP_H, true);
+  view.setUint32(16, x, true);
+  view.setUint32(20, y, true);
+  view.setUint32(24, width, true);
+  view.setUint32(28, height, true);
+  view.setUint32(32, width * 4, true);
+  view.setUint32(36, 2, true); // RGBA8888
+  view.setUint32(40, payload.length, true);
+  frame.set(payload, 44);
+  return frame;
+}
+
+function emitRdpFrame() {
+  if (!rdpSessionId) return;
+  rdpSequence += 1;
+  rdpFrameCount += 1;
+  // 桌面底色一次整帧 + 之后一个移动色块补丁（验证增量 patch 绘制路径）。
+  const tick = rdpFrameCount;
+  if (tick === 1) {
+    const payload = new Uint8Array(RDP_DESKTOP_W * RDP_DESKTOP_H * 4);
+    for (let row = 0; row < RDP_DESKTOP_H; row += 1) {
+      for (let col = 0; col < RDP_DESKTOP_W; col += 1) {
+        const offset = (row * RDP_DESKTOP_W + col) * 4;
+        payload[offset] = (col * 3) % 256;
+        payload[offset + 1] = (row * 3) % 256;
+        payload[offset + 2] = 96;
+        payload[offset + 3] = 255;
+      }
+    }
+    for (const listener of binaryListeners) listener({ channel: `rdp/frame/${rdpSessionId}`, data: rdpFramePatch(rdpSequence, 0, 0, RDP_DESKTOP_W, RDP_DESKTOP_H, payload) });
+    return;
+  }
+  const patchW = 48;
+  const patchH = 32;
+  const payload = new Uint8Array(patchW * patchH * 4);
+  for (let row = 0; row < patchH; row += 1) {
+    for (let col = 0; col < patchW; col += 1) {
+      const offset = (row * patchW + col) * 4;
+      payload[offset] = 250;
+      payload[offset + 1] = (col * 5) % 256;
+      payload[offset + 2] = (row * 7 + tick * 5) % 256;
+      payload[offset + 3] = 255;
+    }
+  }
+  const x = 24 + ((tick * 13) % (RDP_DESKTOP_W - patchW - 48));
+  const y = 24 + ((tick * 29) % (RDP_DESKTOP_H - patchH - 48));
+  for (const listener of binaryListeners) listener({ channel: `rdp/frame/${rdpSessionId}`, data: rdpFramePatch(rdpSequence, x, y, patchW, patchH, payload) });
+}
+
+/** 16x16 白色箭头位图光标（RGBA + base64）：演示 rdp/pointer bitmap → CSS cursor。 */
+function rdpBitmapCursor(): string {
+  const size = 16;
+  const rgba = new Uint8Array(size * size * 4);
+  const inside = (x: number, y: number) => x <= y && y - x <= 11 && x <= 11;
+  const outline = (x: number, y: number) => inside(x, y) && (!inside(x - 1, y) || !inside(x, y - 1) || !inside(x + 1, y) || !inside(x, y + 1));
+  for (let row = 0; row < size; row += 1) {
+    for (let col = 0; col < size; col += 1) {
+      const offset = (row * size + col) * 4;
+      if (outline(col, row)) {
+        rgba[offset] = 16; rgba[offset + 1] = 16; rgba[offset + 2] = 18; rgba[offset + 3] = 255;
+      } else if (inside(col, row)) {
+        rgba[offset] = 255; rgba[offset + 1] = 255; rgba[offset + 2] = 255; rgba[offset + 3] = 255;
+      }
+    }
+  }
+  return base64(rgba);
+}
+
+function stopRdpFrames() {
+  if (rdpFrameTimer) {
+    window.clearInterval(rdpFrameTimer);
+    rdpFrameTimer = 0;
+  }
+}
+
+/** 拨号成功后的桌面流：connected → 底帧+补丁 → 指针/位图光标。 */
+function rdpStartDesktop(sessionId: string) {
+  if (rdpSessionId !== sessionId) return;
+  // rdpSequence 不归零（mock 偏差 7）：跨重连单调，对齐真实 frame_sequence。
+  rdpFrameCount = 0;
+  emitRdpState("connected");
+  setTimeout(() => {
+    if (rdpSessionId !== sessionId) return;
+    emitRdpFrame();
+    rdpFrameTimer = window.setInterval(() => {
+      if (rdpFrameCount >= 12) {
+        stopRdpFrames();
+        return;
+      }
+      emitRdpFrame();
+    }, 120);
+    for (const listener of eventListeners) listener({ method: "rdp/pointer", params: { sessionId, type: "position", x: 160, y: 100 } });
+    setTimeout(() => {
+      if (rdpSessionId !== sessionId) return;
+      for (const listener of eventListeners) listener({ method: "rdp/pointer", params: { sessionId, type: "bitmap", width: 16, height: 16, hotspotX: 0, hotspotY: 0, rgbaBase64: rdpBitmapCursor() } });
+    }, 1600);
+    setTimeout(() => {
+      if (rdpSessionId !== sessionId) return;
+      for (const listener of eventListeners) listener({ method: "rdp/clipboard", params: { sessionId, text: "hello from rdp fixture" } });
+    }, 900);
+  }, 120);
+}
+
+function rdpDial(sessionId: string) {
+  emitRdpState("connecting");
+  if (rdpCertChallenge) {
+    rdpCertGate = () => {
+      rdpCertGate = null;
+      rdpStartDesktop(sessionId);
+    };
+    // 一次性 challengeId + 120s fail-closed 超时（mock 偏差 2/3）：与真实
+    // 一次性注册表 + CERTIFICATE_PROMPT_TIMEOUT 对齐，超时未决 = 拒绝。
+    rdpCertChallengeId = `rdp-cert-visual-${Math.random().toString(36).slice(2, 8)}`;
+    if (rdpCertTimeoutTimer) window.clearTimeout(rdpCertTimeoutTimer);
+    rdpCertTimeoutTimer = window.setTimeout(() => {
+      rdpCertTimeoutTimer = 0;
+      if (rdpSessionId !== sessionId || !rdpCertGate) return;
+      rdpCertGate = null;
+      rdpCertChallengeId = "";
+      emitRdpState("error", { errorKind: "certificate", error: "certificate rejected" });
+    }, 120000);
+    setTimeout(() => {
+      if (rdpSessionId !== sessionId) return;
+      for (const listener of eventListeners) listener({
+        method: "connection/challenge",
+        params: {
+          challengeId: rdpCertChallengeId,
+          kind: "rdp-certificate",
+          sessionId,
+          host: "rdp.demo.internal",
+          port: 3389,
+          fingerprint: "SHA256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          knownHostStatus: "unknown",
+        },
+      });
+    }, 80);
+    return;
+  }
+  if (rdpErrKind === "authfail") {
+    // 认证失败：永不自动重试，直接终态（文案统一 "RDP authentication failed"）。
+    setTimeout(() => {
+      if (rdpSessionId !== sessionId) return;
+      emitRdpState("error", { errorKind: "authentication", error: "RDP authentication failed" });
+    }, 400);
+    return;
+  }
+  rdpStartDesktop(sessionId);
+  if (rdpErrKind === "transport") {
+    // 传输类失败：先跑一段桌面流，再走 reconnecting 退避梯子（1/2）→ 终态。
+    setTimeout(() => {
+      if (rdpSessionId !== sessionId) return;
+      stopRdpFrames();
+      emitRdpState("reconnecting", { attempt: 1, maxAttempts: 2 });
+      setTimeout(() => {
+        if (rdpSessionId !== sessionId) return;
+        emitRdpState("reconnecting", { attempt: 2, maxAttempts: 2 });
+        setTimeout(() => {
+          if (rdpSessionId !== sessionId) return;
+          emitRdpState("error", { errorKind: "transport", error: "connection reset by peer" });
+        }, 1500);
+      }, 1500);
+    }, 2200);
+  }
+}
+
+function closeRdpFixture() {
+  stopRdpFrames();
+  if (rdpCertTimeoutTimer) {
+    window.clearTimeout(rdpCertTimeoutTimer);
+    rdpCertTimeoutTimer = 0;
+  }
+  rdpCertChallengeId = "";
+  rdpCertGate = null;
+  rdpSessionId = "";
 }
 
 // ---- 内存 fixture 树：路径感知的 sftp/list 与写操作（无条件生效，无开关参数）----
@@ -288,7 +557,20 @@ const highlightRuleViews = () => [...highlightRulesState].sort((a, b) => a.creat
 // 权限档与连接作用域，镜像持久化 + 校验语义。
 const mcpSettingsState = { execPermissionMode: "autonomous", connectionScope: [] as string[] };
 // 插件级 UI 偏好（local/preferences/get|set）：镜像 sidecar preferences.json 的合并语义。
-const localPrefsState = { downloadDir: "", downloadUseDefaultDir: true, downloadConflictPolicy: "rename", localShell: "", localShellIntegration: true };
+const localPrefsState = {
+  downloadDir: "",
+  downloadUseDefaultDir: true,
+  downloadConflictPolicy: "rename",
+  localShell: "",
+  localShellIntegration: true,
+  auto_record: false,
+  // M14-B 三键镜像（缺省与 sidecar 一致：深度 3 / 兼容关 / 编码 auto）。
+  transfer_max_active: 3,
+  sftp_compat_mode: false,
+  sftp_name_encoding: "auto",
+  // M16 连接级覆盖桶（值域 auto/latin-1，与 sidecar 白名单一致；空=全部跟随全局）。
+  sftp_name_encoding_overrides: {} as Record<string, string>,
+};
 // 镜像并行批次 ssh/audit/list 的真实形状（AuditEntry：tsMs/tool/connectionId/
 // gate/approval/outcome/exitCode/durationMs/mode/command/output/error，
 // 0.4.77 起带 command/output 尾部）；末条保留计划 §1.1 旧形状（ts 秒 + kind +
@@ -386,6 +668,10 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   if (method === "ssh/session/open") {
     if (slowSessionOpenMs) await new Promise((resolve) => setTimeout(resolve, slowSessionOpenMs));
     if (failSessionOpen) throw new Error("SSH password authentication failed: password rejected by server");
+    // ?auth=auto|autofail：先按 AUTO_AUTH_ORDER 发逐方式进度事件（真实
+    // sidecar 在认证过程中发、响应前送达），autofail 再抛聚合错误终态。
+    if (autoAuthActive) emitAutoAuthProgress(authFixture === "autofail");
+    if (authFixture === "autofail") throw new Error(autoAuthFailureMessage([...AUTO_AUTH_BASE_ATTEMPTS, AUTO_AUTH_AGENT_FAILURE]));
     // A fresh session restarts sequence numbering at 1 (real sidecar
     // semantics): after an auto-reconnect the client resets its cursor to 0,
     // so continuing the global counter here would leave a permanent hole at
@@ -395,7 +681,7 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     scheduleDisconnect();
     result = { sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, connected: true, sequence: 0, chunkSize: 262144, directoryTrackingSupported: true };
   } else if (method === "ssh/terminal/replay") result = { frameCount: 0, firstAvailableSequence: 1, tailSequence: sequence, complete: true };
-  else if (method === "ssh/sessions/list") result = { sessions: failSessionOpen || freshSessionOpen ? [] : [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: "private-key", host: "server.demo.internal", port: 22, username: "demo" }] };
+  else if (method === "ssh/sessions/list") result = { sessions: failSessionOpen || freshSessionOpen ? [] : [{ sessionId: "visual-session", connectionId: context.connectionId, workbenchId: context.workbenchId, readOnly: !writable, connected: true, sudoKeepalive: true, createdAt: Math.floor(Date.now() / 1000), authMethod: authFixture === "auto" ? "auto" : "private-key", host: "server.demo.internal", port: 22, username: "demo" }] };
   else if (method === "ssh/session/attach") {
     const input = params as Record<string, unknown>;
     // 默认启动走 sessions/list → reattach；?slow=N 同样延迟 attach，否则
@@ -520,6 +806,23 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     const events = RECORDING_FIXTURE_EVENTS.slice(offset, offset + limit);
     result = { events, total: RECORDING_FIXTURE_EVENTS.length, hasMore: offset + events.length < RECORDING_FIXTURE_EVENTS.length };
   }
+  else if (method === "ssh/recording/search") {
+    // M14：镜像真实契约——无持久索引、即时扫描；名称命中（host/recordingId
+    // 包含查询词，大小写不敏感）或内容命中（展平文本包含查询词），回命中摘录。
+    const query = String((params as Record<string, unknown>)?.query || "").trim().toLowerCase();
+    const matches: Array<Record<string, unknown>> = [];
+    if (query) {
+      const summary = RECORDING_FIXTURE_SUMMARY;
+      const nameMatch = summary.host.toLowerCase().includes(query) || summary.recordingId.toLowerCase().includes(query);
+      const stripAnsi = (raw: string) => raw.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trim();
+      const hits = RECORDING_FIXTURE_EVENTS
+        .filter((event) => stripAnsi(event.data).toLowerCase().includes(query))
+        .slice(0, 5)
+        .map((event) => ({ time: event.time, excerpt: stripAnsi(event.data) }));
+      if (nameMatch || hits.length) matches.push({ ...summary, nameMatch, hits });
+    }
+    result = { recordings: matches };
+  }
   else if (method === "ssh/recording/delete") result = { success: true };
   else if (method === "ssh/recording/clear") result = { success: true, deleted: 1 };
   else if (method === "ssh/recording/reveal") result = { success: true };
@@ -602,6 +905,19 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     if (typeof input.downloadDir === "string") localPrefsState.downloadDir = input.downloadDir.trim();
     if (typeof input.downloadUseDefaultDir === "boolean") localPrefsState.downloadUseDefaultDir = input.downloadUseDefaultDir;
     if (typeof input.downloadConflictPolicy === "string" && ["rename", "ask", "overwrite"].includes(input.downloadConflictPolicy)) localPrefsState.downloadConflictPolicy = input.downloadConflictPolicy;
+    if (typeof input.auto_record === "boolean") localPrefsState.auto_record = input.auto_record;
+    if (input.transfer_max_active !== undefined) localPrefsState.transfer_max_active = Math.min(8, Math.max(1, Math.floor(Number(input.transfer_max_active) || 3)));
+    if (typeof input.sftp_compat_mode === "boolean") localPrefsState.sftp_compat_mode = input.sftp_compat_mode;
+    if (input.sftp_name_encoding === "auto" || input.sftp_name_encoding === "latin-1") localPrefsState.sftp_name_encoding = input.sftp_name_encoding;
+    // M16 连接级覆盖：整表替换，镜像 sidecar 清洗（非对象忽略、非法值丢弃）。
+    if (input.sftp_name_encoding_overrides && typeof input.sftp_name_encoding_overrides === "object" && !Array.isArray(input.sftp_name_encoding_overrides)) {
+      const store: Record<string, string> = {};
+      for (const [id, value] of Object.entries(input.sftp_name_encoding_overrides as Record<string, unknown>)) {
+        if (id.trim().length === 0) continue;
+        if (value === "auto" || value === "latin-1") store[id] = value;
+      }
+      localPrefsState.sftp_name_encoding_overrides = store;
+    }
     result = { ...localPrefsState };
   }
   else if (method === "sftp/upload/start") result = { taskId: `visual-upload-${++fixtureUploadCount.value}`, chunkSize: 262144 };
@@ -707,6 +1023,22 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, sessionId: "visual-session", direction: "download", fileName: task.fileName, transferred: task.size, size: task.size, status: "completed" } });
     fixtureDownloads.delete(taskId);
     result = { success: true };
+  } else if (method === "sudo/download/start") {
+    // M14-C DownloadSudo mock：参数名 path（sudo 族），分块/finish 复用
+    // fixtureDownloads，与 sftp/download/next、finish 完全同构。
+    const remotePath = normalizeMockPath(String((params as Record<string, unknown>)?.path || "root.bin"));
+    const node = findMockNode(remotePath);
+    const taskId = `sudo-download-${fixtureDownloads.size + 1}`;
+    const fileName = node?.kind === "file" ? node.name : remotePath.split("/").pop() || "root.bin";
+    const size = node?.kind === "file" ? node.size : 32;
+    fixtureDownloads.set(taskId, { fileName, size, offset: 0 });
+    for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, sessionId: "visual-session", direction: "download", fileName, transferred: 0, size, status: "queued" } });
+    result = { taskId, fileName, size, chunkSize: 262144, sudo: true };
+  } else if (method === "sudo/download/cancel") {
+    const taskId = String((params as Record<string, unknown>)?.taskId || "");
+    fixtureDownloads.delete(taskId);
+    for (const listener of eventListeners) listener({ method: "sftp/transfer/progress", params: { taskId, sessionId: "visual-session", direction: "download", transferred: 0, size: 0, status: "cancelled" } });
+    result = { success: true };
   } else if (method === "ssh/exec") {
     const input = params as Record<string, unknown>;
     const command = String(input.command || "");
@@ -755,7 +1087,66 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
         { pid: 812, user: "www-data", cpuPercent: 12.6, memPercent: 3.1, command: "nginx: worker process" },
         { pid: 1042, user: "demo", cpuPercent: 2.4, memPercent: 1.2, command: "htop" },
       ],
+      // GPU / Ascend NPU 视觉夹具（IMPL_PLAN Task P1-4）：字段与 metrics_gpu.rs
+      // 的 JSON 输出一致，供监控卡片渲染、警戒色与空进程态可被视觉验证。
+      gpu: {
+        available: true,
+        gpus: [
+          {
+            index: 0, uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d301", name: "NVIDIA A100-SXM4-40GB",
+            driver: "550.54.15", temperature: 67, utilization: 93, memUtil: 81,
+            totalMem: 42_949_672_960, usedMem: 35_433_601_024, freeMem: 7_516_071_936,
+            powerDraw: 298, powerLimit: 400, fan: 62, pstate: "P0",
+            processes: [
+              { uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d301", pid: 2211, mem: 31_221_622_784, name: "python train_llm.py" },
+              { uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d301", pid: 2212, mem: 3_921_678_336, name: "python eval.py" },
+            ],
+          },
+          {
+            index: 1, uuid: "GPU-7f3a2c11-9b04-e8d2-aa51-6c0f5b19d302", name: "NVIDIA A100-SXM4-40GB",
+            driver: "550.54.15", temperature: 41, utilization: 0, memUtil: 0,
+            totalMem: 42_949_672_960, usedMem: 1_073_741_824, freeMem: 41_875_931_136,
+            powerDraw: 68, powerLimit: 400, fan: 22, pstate: "P8",
+            processes: [],
+          },
+        ],
+      },
+      npu: {
+        available: true,
+        cann: "8.0.RC3.beta1",
+        devices: [
+          {
+            deviceKey: "ascend:0:0", npuIndex: 0, chipId: 0, name: "910B4", health: "OK",
+            power: 212.4, temperature: 58, aicore: 76, memoryLabel: "hbm",
+            usedMem: 22_158_430_208, totalMem: 31_675_758_592,
+            processes: [{ pid: 3310, name: "mindspore-train", npuIndex: 0, mem: 21_474_836_480 }],
+          },
+          {
+            deviceKey: "ascend:1:0", npuIndex: 1, chipId: 0, name: "310P3", health: "OK",
+            power: 45.1, temperature: 39, aicore: 0, memoryLabel: "memory",
+            usedMem: 1_073_741_824, totalMem: 16_856_718_131,
+            processes: [],
+          },
+        ],
+      },
     };
+  }
+  else if (method === "ssh/processes/list") {
+    // 进程管理表 mock（M13-B）：与 ssh/metrics 的 top-8 行同源，补齐管理表
+    // 全字段，并镜像后端 best-effort 的 fdCount / listenPorts 两列——
+    // pid 812 展示双端口（可视觉验证排序/去重），pid 1042 两列留空展示占位符。
+    result = {
+      processes: [
+        { pid: 1, ppid: 0, user: "root", cpuPercent: 0.1, memPercent: 0.4, etime: "30-04:12:33", state: "S", command: "/sbin/init splash", fdCount: 148, listenPorts: [] },
+        { pid: 812, ppid: 811, user: "www-data", cpuPercent: 12.6, memPercent: 3.1, etime: "12-21:05:09", state: "S", command: "nginx: worker process", fdCount: 64, listenPorts: [80, 443] },
+        { pid: 1042, ppid: 1040, user: "demo", cpuPercent: 2.4, memPercent: 1.2, etime: "01:23", state: "R", command: "htop", fdCount: null, listenPorts: [] },
+        { pid: 2211, ppid: 2209, user: "demo", cpuPercent: 1.8, memPercent: 8.6, etime: "3-02:44:51", state: "S", command: "python train_llm.py --epochs 8", fdCount: 32, listenPorts: [6006, 29500, 29501, 29502, 29503] },
+      ],
+    };
+  }
+  else if (method === "ssh/processes/kill") {
+    // 只记录信号目标，模拟成功路径（不真正改表，刷新仍返回同一份 mock）。
+    result = {};
   }
   else if (method === "sftp/diskUsage") {
     result = { filesystem: "/dev/sda1", mount: "/", totalBytes: 52_723_200_512, usedBytes: 24_023_981_056, availableBytes: 26_005_927_936, percentUsed: 48 };
@@ -937,6 +1328,81 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     }
     result = { maxReadBytes: 8 * 1024 * 1024, maxUploadBytes: 64 * 1024 * 1024, maxDownloadBytes: 256 * 1024 * 1024, execPermissionMode: mcpSettingsState.execPermissionMode, connectionScope: [...mcpSettingsState.connectionScope] };
   }
+  else if (method === "rdp/start") {
+    const input = params as Record<string, unknown>;
+    // mock 偏差 1 对齐：与真实 sidecar 同款参数校验（rdp_session.rs
+    // validate：host/username 非空、port 1..65535、桌面尺寸门限、policy 白名单）。
+    const host = String(input.host ?? "").trim();
+    if (!host) throw new Error("rdp/start: host is required");
+    if (!String(input.username ?? "").trim()) throw new Error("rdp/start: username is required");
+    const port = Number(input.port) || 3389;
+    if (port <= 0 || port > 65535) throw new Error("rdp/start: port must be between 1 and 65535");
+    const width = Number(input.width) || 1280;
+    const height = Number(input.height) || 800;
+    if (width < 640 || width > 3840 || height < 480 || height > 2160) {
+      throw new Error("RDP desktop size must be within 640x480 .. 3840x2160");
+    }
+    const certificatePolicy = String(input.certificatePolicy || "prompt");
+    if (!["prompt", "strict", "accept-temporarily"].includes(certificatePolicy)) {
+      throw new Error("rdp/start: certificatePolicy must be prompt, strict or accept-temporarily");
+    }
+    closeRdpFixture();
+    rdpSessionId = `visual-rdp-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionId = rdpSessionId;
+    rdpDial(sessionId);
+    result = {
+      sessionId,
+      host,
+      port,
+      useNla: input.useNla !== false,
+      certificatePolicy,
+      clipboard: input.clipboard !== false,
+      reconnectAttempts: Number(input.reconnectAttempts) || 5,
+    };
+  }
+  else if (method === "rdp/input" || method === "rdp/resize" || method === "rdp/set-clipboard") result = { success: true };
+  else if (method === "rdp/reconnect") {
+    const sessionId = String((params as Record<string, unknown>)?.sessionId || "");
+    if (!sessionId || sessionId !== rdpSessionId) throw new Error("RDP session was not found");
+    stopRdpFrames();
+    rdpDial(sessionId);
+    result = { sessionId, success: true };
+  }
+  else if (method === "rdp/close") {
+    closeRdpFixture();
+    result = { success: true };
+  }
+  else if (method === "rdp/list") {
+    result = {
+      sessions: rdpSessionId
+        ? [{ sessionId: rdpSessionId, workbenchId: context.workbenchId, host: "rdp.demo.internal", port: 3389, username: "demo", hasPassword: true, useNla: true, certificatePolicy: "prompt", clipboard: true, createdAt: Math.floor(Date.now() / 1000) }]
+        : [],
+    };
+  }
+  else if (method === "rdp/certificate/resolve") {
+    const input = params as Record<string, unknown>;
+    // mock 偏差 2/3 对齐：一次性注册表语义——resolve 必须携带当前签发的
+    // challengeId；未知/已决 id 报错（走查前端 showError 分支可达）。
+    const challengeId = String(input.challengeId ?? "");
+    if (!rdpCertChallengeId || challengeId !== rdpCertChallengeId) {
+      throw new Error("RDP certificate challenge was not found or already resolved");
+    }
+    rdpCertChallengeId = "";
+    if (rdpCertTimeoutTimer) {
+      window.clearTimeout(rdpCertTimeoutTimer);
+      rdpCertTimeoutTimer = 0;
+    }
+    const accepted = input.accept === true;
+    if (accepted && rdpCertGate) {
+      const gate = rdpCertGate;
+      rdpCertGate = null;
+      gate();
+    } else if (!accepted) {
+      // 拒绝 = fail-closed 终态（对齐真实 verify 失败路径）。
+      emitRdpState("error", { errorKind: "certificate", error: "certificate rejected" });
+    }
+    result = { success: true };
+  }
   else result = { success: true };
   return result as T;
 };
@@ -994,6 +1460,12 @@ window.dbxPlugin = {
     const bytes = typeof data === "string" ? Uint8Array.from(atob(data), (value) => value.charCodeAt(0)) : data instanceof Uint8Array ? data : new Uint8Array(data);
     const inputSequence = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, false));
     for (const listener of eventListeners) listener({ method: "ssh/terminal/inputAck", params: { sequence: inputSequence } });
+    // 快速输入诊断（#33/#71）：回显键入内容，闭合 fixture 内的输入→显示环，
+    // 让 WKWebView/Chromium 的按键投递差异可以在无宿主环境下复现。
+    if (bytes.byteLength > 8) {
+      const echoed = new TextDecoder().decode(bytes.subarray(8));
+      setTimeout(() => emitTerminal(echoed), 12);
+    }
   },
   onEvent: (listener) => { eventListeners.add(listener); return () => eventListeners.delete(listener); },
   onBinary: (listener) => { binaryListeners.add(listener); return () => binaryListeners.delete(listener); },

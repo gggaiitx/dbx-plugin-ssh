@@ -148,6 +148,10 @@ def main() -> None:
     # sidecar 启动前注入（sidecar 启动时读取一次环境变量）。
     download_dir = Path(tempfile.mkdtemp(prefix="dbx-ssh-smoke-downloads-"))
     os.environ["DBX_SSH_DOWNLOAD_DIR"] = str(download_dir)
+    # watcher 组的 watch/start 有 desktop gate（can_save_local 探测）。CI
+    # runner 是 headless 环境，探针会误判为非桌面并拒绝注册——显式声明
+    # 桌面落盘语义（sidecar 子进程继承本环境，生产语义不受影响）。
+    os.environ["DBX_SSH_LOCAL_SAVE"] = "1"
     client = SidecarClient.start(timeout=30)
     try:
         step("plugin/initialize")
@@ -441,6 +445,33 @@ def main() -> None:
             print(f"    mode after chmod 0700: {mode}")
             if not mode_is_0700(mode):
                 raise AssertionError(f"mode={mode!r}, want 0700")
+
+        def case_sudo_download():
+            # M14-C DownloadSudo: start -> sftp/download/next 循环 -> finish，
+            # 随后 sudo/listDir 确认同目录没有 .dbx-sudo-dl- 临时件残留。
+            stat = req("sudo/stat", {"sessionId": session_id, "path": sudo_file_renamed})
+            size = int(stat.get("size") or 0)
+            info = req("sudo/download/start", {"sessionId": session_id, "path": sudo_file_renamed})
+            task_id = str(info.get("taskId") or "")
+            if not task_id or info.get("size") != size:
+                raise AssertionError(f"sudo/download/start shape: {json.dumps(info)[:160]}")
+            if info.get("fileName") != sudo_file_renamed.rsplit("/", 1)[-1]:
+                raise AssertionError(f"fileName should be the source name: {info.get('fileName')!r}")
+            drained = 0
+            while drained < size:
+                chunk = req("sftp/download/next", {"taskId": task_id, "offset": drained})
+                drained += int(chunk.get("length") or 0)
+                if chunk.get("eof"):
+                    break
+            if drained != size:
+                raise AssertionError(f"drained {drained} of {size} bytes")
+            req("sftp/download/finish", {"taskId": task_id})
+            listing = req("sudo/listDir", {"sessionId": session_id, "path": sudo_dir})
+            leftovers = [str(e.get("name")) for e in listing.get("entries", [])
+                         if str(e.get("name")).startswith(".dbx-sudo-dl-")]
+            if leftovers:
+                raise AssertionError(f"staging temp leftovers in {sudo_dir}: {leftovers}")
+            print(f"    sudo download of {sudo_file_renamed} ({size} bytes) finished, no temp leftovers")
 
         def case_sudo_remove_all():
             req("sudo/removeAll", {"sessionId": session_id, "path": sudo_dir})
@@ -1202,6 +1233,8 @@ def main() -> None:
                    needs="sudo/touch inner file")
         report.run("sudo/chmod 0700 + verify mode", "sudo/chmod", case_sudo_chmod,
                    needs="sudo/rename inner file")
+        report.run("sudo/download + temp cleanup", "sudo/download/start", case_sudo_download,
+                   needs="sudo/chmod 0700 + verify mode")
         report.run("sudo/removeAll .sudo-test", "sudo/removeAll", case_sudo_remove_all,
                    needs="sudo/mkdir .sudo-test")
 
@@ -1532,6 +1565,418 @@ def main() -> None:
         report.run("ssh/recording start/stop/list/get/delete", "ssh/recording/start",
                    case_recording_flow)
 
+        # -- M14-M17 编码 / 管线偏好 / MCP 工具面 group ---------------------------
+        # 补批次欠账：latin-1 编码族真容器链路（M14/M16/M17）、每连接编码覆盖
+        # （M16）、SFTP 管线偏好（M14-B）、MCP 工具面 SFTP 往返（M17-B）。
+        # local/preferences 是插件级持久档：进组前先快照原值，组内自建自清理、
+        # 末尾 cleanup 再兜底还原，保证整组幂等。latin-1 文件名一律以 \uXXXX /
+        # %XX 转义书写，避免源码编码歧义。
+        enc_dir = f"{home}/.dbx-enc-smoke"
+        # 显示文本（latin-1 域内：U+00E9 按 latin1_encode_display 映回 0xE9 字节）。
+        enc_name_display = "caf\u00e9.txt"
+        enc_name_renamed = "caf\u00e9-renamed.txt"
+        # M19 增量②：符号链接三命令的 0xE9 字节链接名（显示形式 + wire 形式）。
+        enc_link_display = "caf\u00e9-link"
+        enc_link_wire = "caf%E9-link"
+        # 列表回传的 wire 形式（escape_wire 的 %XX 转义）。
+        enc_name_wire = "caf%E9.txt"
+        enc_name_renamed_wire = "caf%E9-renamed.txt"
+        enc_payload = b"latin-1 smoke payload\n"
+        # M20：watcher 外部编辑链路（watch/start -> 外部保存 -> file-modified
+        # 事件 -> watch/upload 回写远端）。localPath 必须落在 sidecar 的下载
+        # 根内（validate_remote_edit_path），所以每个文件的本地副本来自
+        # saveToLocal 单文件下载（finish.localPath）。
+        watch_dir = f"{home}/.dbx-watch-smoke"
+        watch_state = {}
+        watch_lat_dir = f"{home}/.dbx-watch-latin1"
+        enc_tree_local = Path(tempfile.mkdtemp(prefix="dbx-ssh-smoke-enc-tree-"))
+        prefs_snapshot = req("local/preferences/get", {})
+        mcp_stamp = int(time.time())
+        mcp_dir = f"{home}/.dbx-mcp-smoke-{mcp_stamp}"
+        mcp_dir_renamed = f"{home}/.dbx-mcp-smoke-renamed-{mcp_stamp}"
+
+        def prefs_get(key):
+            return req("local/preferences/get", {}).get(key)
+
+        def case_prefs_pipeline_preferences():
+            # M14-B：transfer_max_active 越界钳制（1..=8）读回 + sftp_compat_mode
+            # 开关读回；非布尔值拒绝写入。只验证偏好读写链，不要求真机并发行为。
+            try:
+                for raw, want in ((99, 8), (0, 1), (5, 5)):
+                    req("local/preferences/set", {"transfer_max_active": raw})
+                    got = prefs_get("transfer_max_active")
+                    if got != want:
+                        raise AssertionError(f"transfer_max_active {raw} -> {got!r}, want {want}")
+                for enabled in (True, False):
+                    req("local/preferences/set", {"sftp_compat_mode": enabled})
+                    got = prefs_get("sftp_compat_mode")
+                    if got is not enabled:
+                        raise AssertionError(f"sftp_compat_mode={got!r}, want {enabled}")
+                try:
+                    req("local/preferences/set", {"sftp_compat_mode": "yes"})
+                except SidecarError as error:
+                    if "must be a boolean" not in str(error):
+                        raise AssertionError(f"unexpected compat error: {error}")
+                else:
+                    raise AssertionError("non-bool sftp_compat_mode accepted")
+            finally:
+                req("local/preferences/set", {
+                    "transfer_max_active": prefs_snapshot.get("transfer_max_active", 3),
+                    "sftp_compat_mode": bool(prefs_snapshot.get("sftp_compat_mode")),
+                })
+            print("    clamped 99->8 / 0->1 / 5->5; compat toggle read back")
+
+        def case_latin1_pref_set():
+            # M16 全局偏好：latin-1 写入并读回；原值由 cleanup 还原。
+            req("local/preferences/set", {"sftp_name_encoding": "latin-1"})
+            got = prefs_get("sftp_name_encoding")
+            if got != "latin-1":
+                raise AssertionError(f"sftp_name_encoding={got!r}, want 'latin-1'")
+
+        def case_latin1_create_and_list():
+            # M16 真容器链路①：touch（目录 wire 前缀 + 末段显示文本）落 0xE9
+            # 字节名，列表走裸包 READDIR latin-1 解码回忠实显示名 + %E9 wire uri。
+            req("sftp/createDirectory", {"sessionId": session_id, "path": enc_dir})
+            req("sftp/touch", {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}"})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            entry = next((e for e in listing.get("entries", []) if e.get("name") == enc_name_display), None)
+            if entry is None:
+                raise AssertionError(f"{enc_name_display!r} missing from latin-1 listing: "
+                                     f"{[e.get('name') for e in listing.get('entries', [])]}")
+            if "%E9" not in str(entry.get("uri", "")):
+                raise AssertionError(f"uri missing %E9 wire escape: {entry.get('uri')!r}")
+            if entry.get("lossy"):
+                raise AssertionError(f"latin-1 decode must be faithful (lossy=true): {entry!r}")
+            print(f"    listed {entry.get('name')!r} uri={entry.get('uri')!r}")
+
+        def case_latin1_write_read_exists():
+            # M16/M17 增量①：wire 路径写读往返；exists 双形态（form:"wire" 整条
+            # %XX 还原 / 缺省目录 wire + 末段显示文本）+ 交叉反例（显示文本按
+            # UTF-8 还原 0xC3A9 ≠ 0xE9，wire 形态必须探不到）。
+            wire_path = f"{enc_dir}/{enc_name_wire}"
+            req("sftp/write", {"sessionId": session_id, "remotePath": wire_path,
+                               "dataBase64": base64.b64encode(enc_payload).decode()})
+            read_back = req("sftp/read", {"sessionId": session_id, "path": wire_path, "maxBytes": 4096})
+            if base64.b64decode(read_back.get("dataBase64", "")) != enc_payload:
+                raise AssertionError(f"wire-path read-back mismatch: {read_back!r}")
+            present = req("sftp/exists", {"sessionId": session_id, "path": wire_path, "form": "wire"})
+            if present.get("exists") is not True:
+                raise AssertionError(f"exists(form=wire) -> {present!r}, want true")
+            present_default = req("sftp/exists",
+                                  {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}"})
+            if present_default.get("exists") is not True:
+                raise AssertionError(f"exists(default form) -> {present_default!r}, want true")
+            crossed = req("sftp/exists",
+                          {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}", "form": "wire"})
+            if crossed.get("exists") is not False:
+                raise AssertionError(f"exists(form=wire, display text) -> {crossed!r}, want false")
+            print("    wire write/read ok; exists wire/default/crossed = true/true/false")
+
+        def case_latin1_tree_download():
+            # M16/M17：latin-1 整树下载——远端裸包 READDIR 遍历字节保真，本地
+            # 根名/文件名按显示名落盘、内容逐字节一致，空子目录骨架保留。
+            req("sftp/createDirectory", {"sessionId": session_id, "path": f"{enc_dir}/sub"})
+            try:
+                info = req("sftp/download/tree/start",
+                           {"sessionId": session_id, "remotePath": enc_dir,
+                            "downloadDir": str(enc_tree_local)})
+                task_id = str(info.get("taskId") or "")
+                if not task_id:
+                    raise AssertionError(f"tree/start shape: {json.dumps(info)[:160]}")
+                drained = 0
+                while True:  # 与前端分块等待器同构：跑到 eof，而非字节总量
+                    chunk = req("sftp/download/next", {"taskId": task_id, "offset": drained})
+                    drained += int(chunk.get("length") or 0)
+                    if chunk.get("eof"):
+                        break
+                finish = req("sftp/download/finish", {"taskId": task_id})
+                local_root = finish.get("localPath")
+                if not local_root:
+                    raise AssertionError(f"tree finish returned no localPath: {json.dumps(finish)[:160]}")
+                local_file = Path(local_root) / enc_name_display
+                if not local_file.is_file():
+                    raise AssertionError(f"latin-1 named file missing under {local_root}: "
+                                         f"{sorted(p.name for p in Path(local_root).rglob('*'))}")
+                if local_file.read_bytes() != enc_payload:
+                    raise AssertionError(f"tree download content mismatch: {local_file.read_bytes()!r}")
+                if not (Path(local_root) / "sub").is_dir():
+                    raise AssertionError(f"empty subdir 'sub' not mirrored under {local_root}")
+                print(f"    tree downloaded to {local_root} ({drained} bytes)")
+            finally:
+                req("sftp/delete", {"sessionId": session_id, "path": f"{enc_dir}/sub", "recursive": True})
+
+        def case_latin1_rename_delete():
+            # M17 增量③：raw RENAME（源 wire / 目标末段显示文本）+ wire 删除 +
+            # exists 收口。删完目录清空，交给每连接覆盖组复用。
+            req("sftp/rename", {"sessionId": session_id, "sourcePath": f"{enc_dir}/{enc_name_wire}",
+                                "targetPath": f"{enc_dir}/{enc_name_renamed}"})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            names = [e.get("name") for e in listing.get("entries", [])]
+            if enc_name_renamed not in names:
+                raise AssertionError(f"renamed file missing from latin-1 listing: {names}")
+            req("sftp/delete", {"sessionId": session_id,
+                                "path": f"{enc_dir}/{enc_name_renamed_wire}"})
+            gone = req("sftp/exists", {"sessionId": session_id,
+                                       "path": f"{enc_dir}/{enc_name_renamed_wire}", "form": "wire"})
+            if gone.get("exists") is not False:
+                raise AssertionError(f"deleted file still exists: {gone!r}")
+            print(f"    renamed to {enc_name_renamed!r}, deleted via wire path")
+
+        def case_latin1_symlink_roundtrip():
+            # M19 增量②：latin-1 组补符号链接三命令。symlink-create 的链接
+            # 名是 0xE9 字节名（wire 目录前缀 + 用户新输入显示末段的落盘分
+            # 工）；symlink-read 传整条 wire 路径，指向文本 latin-1 显示解
+            # 码；symlink-update 用显示形式的新指向再编码回字节——读↔写在
+            # latin-1 域内精确闭环。链接自清理，交还空目录给每连接覆盖组。
+            link_wire = f"{enc_dir}/{enc_link_wire}"
+            anchor = f"{enc_dir}/anchor.txt"
+            repointed = "caf\u00e9-target"
+            try:
+                req("sftp/touch", {"sessionId": session_id, "path": anchor})
+                req("sftp/symlink-create", {"sessionId": session_id, "target": "anchor.txt",
+                                            "linkPath": f"{enc_dir}/{enc_link_display}"})
+                listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+                entry = next((e for e in listing.get("entries", [])
+                              if e.get("name") == enc_link_display), None)
+                if entry is None or entry.get("kind") != "symlink":
+                    raise AssertionError(f"latin-1 named symlink missing from listing: "
+                                         f"{[e.get('name') for e in listing.get('entries', [])]}")
+                read_back = req("sftp/symlink-read", {"sessionId": session_id, "linkPath": link_wire})
+                if read_back.get("target") != "anchor.txt":
+                    raise AssertionError(f"symlink-read target mismatch: {read_back!r}")
+                req("sftp/symlink-update", {"sessionId": session_id, "linkPath": link_wire,
+                                            "target": repointed})
+                read_new = req("sftp/symlink-read", {"sessionId": session_id, "linkPath": link_wire})
+                if read_new.get("target") != repointed:
+                    raise AssertionError(f"symlink-update latin-1 round-trip mismatch: {read_new!r}")
+                print(f"    link {enc_link_display!r} create/read/update -> {repointed!r}")
+            finally:
+                for path in (link_wire, anchor):
+                    try:
+                        req("sftp/delete", {"sessionId": session_id, "path": path})
+                    except SidecarError:
+                        pass
+
+        def case_encoding_override_active():
+            # M16 连接级覆盖：全局 auto + {connectionId: latin-1} 时本连接列表
+            # 仍走原始字节路径（显示名忠实、无 lossy 标记）。
+            req("local/preferences/set", {"sftp_name_encoding": "auto",
+                                          "sftp_name_encoding_overrides": {connection_id: "latin-1"}})
+            req("sftp/touch", {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}"})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            entry = next((e for e in listing.get("entries", [])
+                          if str(e.get("name", "")).endswith(".txt")), None)
+            if entry is None:
+                raise AssertionError(f"no .txt entry under {enc_dir}: {listing.get('entries')}")
+            if entry.get("name") != enc_name_display or entry.get("lossy"):
+                raise AssertionError(f"connection override not applied: {entry!r}")
+            print(f"    override latin-1 active for {connection_id}: {entry.get('name')!r}")
+
+        def case_encoding_override_fallback():
+            # M16 回退语义：删除覆盖后回全局 auto，0xE9 字节名经高层客户端
+            # lossy 解码（U+FFFD + lossy 标记）。auto 下高层客户端按字面量发
+            # UTF-8 删不掉 0xE9 字节名——先临时恢复覆盖整目录递归删，再还原
+            # 全局 auto + 空覆盖桶（与进组前状态一致）。
+            req("local/preferences/set", {"sftp_name_encoding_overrides": {}})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            entry = next((e for e in listing.get("entries", [])
+                          if str(e.get("name", "")).endswith(".txt")), None)
+            if entry is None:
+                raise AssertionError(f"no .txt entry under {enc_dir}: {listing.get('entries')}")
+            if "\ufffd" not in str(entry.get("name", "")) or entry.get("lossy") is not True:
+                raise AssertionError(f"expected lossy auto decode after override removal: {entry!r}")
+            print(f"    fallback to global auto: {entry.get('name')!r} (lossy=true)")
+            req("local/preferences/set", {"sftp_name_encoding_overrides": {connection_id: "latin-1"}})
+            req("sftp/delete", {"sessionId": session_id, "path": enc_dir, "recursive": True})
+            req("local/preferences/set", {"sftp_name_encoding": "auto",
+                                          "sftp_name_encoding_overrides": {}})
+
+        def watch_download_local(remote_path):
+            # saveToLocal 单文件下载。工作台 openInExternalEditor 把落点指定为
+            # <下载目录>/remote-edit/<stamp>/ —— watch/start 对 localPath 的
+            # 白名单域就是该 remote-edit 子目录，smoke 沿同一分工。
+            stamp = time.strftime("%Y%m%d%H%M%S")
+            edit_dir = str(Path(download_dir) / "remote-edit" / f"smoke-{stamp}-{len(watch_state)}")
+            info = req("sftp/download/start", {"sessionId": session_id,
+                                               "remotePath": remote_path,
+                                               "saveToLocal": True,
+                                               "downloadDir": edit_dir,
+                                               "conflict": "overwrite"})
+            task_id, size = str(info["taskId"]), int(info["size"])
+            offset = 0
+            while True:
+                chunk = req("sftp/download/next", {"taskId": task_id, "offset": offset})
+                offset += int(chunk.get("length") or 0)
+                if chunk.get("eof"):
+                    break
+            finish = req("sftp/download/finish", {"taskId": task_id})
+            local_path = finish.get("localPath")
+            if not local_path:
+                raise AssertionError(f"watch fixture download has no localPath: {json.dumps(finish)[:120]}")
+            return local_path, size
+
+        def wait_watch_event(watch_id, marker, timeout_s=8.0):
+            # 事件帧在 socket 里堆到下一次请求才被 sidecar_client 读出，所以
+            # 用无害请求泵事件循环，直到目标 watchId 的 file-modified 出现。
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                req("local/capabilities")
+                for event in client.events[marker:]:
+                    if (event.get("method") == "watch/file-modified"
+                            and (event.get("params") or {}).get("watchId") == watch_id):
+                        return event
+                time.sleep(0.3)
+            raise AssertionError(f"watch/file-modified for {watch_id} not seen in {timeout_s}s")
+
+        def watch_modified_events(marker):
+            return [event for event in client.events[marker:]
+                    if event.get("method") == "watch/file-modified"]
+
+        def case_watch_register_two():
+            # 两个文件并发注册：watchId 互不相同、各带自己的本地副本。
+            # 组自洽：显式归位 auto（wa/wb 是 clean 名，走高层写/读即可），
+            # 不依赖持久档里 sftp_name_encoding 的历史残留值。
+            req("local/preferences/set", {"sftp_name_encoding": "auto"})
+            req("sftp/createDirectory", {"sessionId": session_id, "path": watch_dir})
+            req("sftp/write", {"sessionId": session_id, "remotePath": f"{watch_dir}/wa.txt",
+                               "dataBase64": base64.b64encode(b"watch-a v1\n").decode()})
+            req("sftp/write", {"sessionId": session_id, "remotePath": f"{watch_dir}/wb.txt",
+                               "dataBase64": base64.b64encode(b"watch-b v1\n").decode()})
+            local_a, size_a = watch_download_local(f"{watch_dir}/wa.txt")
+            local_b, size_b = watch_download_local(f"{watch_dir}/wb.txt")
+            if (size_a, size_b) != (len(b"watch-a v1\n"), len(b"watch-b v1\n")):
+                raise AssertionError(f"watch fixture sizes: {size_a}/{size_b}")
+            watch_state["id_a"] = str(req("watch/start", {
+                "sessionId": session_id, "remotePath": f"{watch_dir}/wa.txt",
+                "localPath": local_a}).get("watchId") or "")
+            watch_state["id_b"] = str(req("watch/start", {
+                "sessionId": session_id, "remotePath": f"{watch_dir}/wb.txt",
+                "localPath": local_b}).get("watchId") or "")
+            if not watch_state["id_a"] or not watch_state["id_b"] \
+                    or watch_state["id_a"] == watch_state["id_b"]:
+                raise AssertionError(f"watch ids: {watch_state}")
+            watch_state["local_a"], watch_state["local_b"] = local_a, local_b
+            watch_state["marker"] = len(client.events)
+            print(f"    watchId a={watch_state['id_a'][:8]}… b={watch_state['id_b'][:8]}…")
+
+        def case_watch_edit_upload():
+            # 外部编辑 a：直接改本地副本（编辑器保存语义），事件须按 watchId
+            # 精确路由，upload-back 后远端字节与本地一致。先越过 pump 的启动
+            # 抑制窗（SUPPRESS_WINDOW=2s，编辑器预热噪音被直接丢弃）。
+            time.sleep(2.5)
+            Path(watch_state["local_a"]).write_text(f"external edit A {time.time()}\n")
+            event = wait_watch_event(watch_state["id_a"], watch_state["marker"])
+            params = event.get("params") or {}
+            if params.get("remotePath") != f"{watch_dir}/wa.txt" or params.get("sessionId") != session_id:
+                raise AssertionError(f"event a routing: {params}")
+            watch_state["marker"] = len(client.events)
+            back = req("watch/upload", {"watchId": watch_state["id_a"]})
+            local_bytes = Path(watch_state["local_a"]).read_bytes()
+            if int(back.get("size") or -1) != len(local_bytes):
+                raise AssertionError(f"upload-back size: {back}")
+            read_back = req("sftp/read", {"sessionId": session_id,
+                                          "path": f"{watch_dir}/wa.txt", "maxBytes": 4096})
+            if base64.b64decode(read_back.get("dataBase64", "")) != local_bytes:
+                raise AssertionError("upload-back content mismatch on wa.txt")
+            # 多文件互不串扰：编辑 b，事件路由到 b 自己的 watchId 并可独立回写。
+            Path(watch_state["local_b"]).write_text(f"external edit B {time.time()}\n")
+            event_b = wait_watch_event(watch_state["id_b"], watch_state["marker"])
+            if (event_b.get("params") or {}).get("remotePath") != f"{watch_dir}/wb.txt":
+                raise AssertionError(f"event b routing: {event_b.get('params')}")
+            watch_state["marker"] = len(client.events)
+            req("watch/upload", {"watchId": watch_state["id_b"]})
+            # 同内容重复保存（mtime 变、sha256 不变）不得再触发事件。
+            marker = len(client.events)
+            Path(watch_state["local_a"]).write_text(Path(watch_state["local_a"]).read_text())
+            time.sleep(2.0)
+            watch_drain = watch_modified_events(marker)
+            if watch_drain:
+                raise AssertionError(f"identical re-save re-fired: {watch_drain}")
+            print("    per-watch routing + upload-back round-trip + identical-save dedup ok")
+
+        def case_watch_stop_semantics():
+            req("watch/stop", {"watchId": watch_state["id_a"]})
+            marker = len(client.events)
+            Path(watch_state["local_a"]).write_text(f"post-stop edit A {time.time()}\n")
+            time.sleep(2.0)
+            stopped_fired = [event for event in watch_modified_events(marker)
+                             if (event.get("params") or {}).get("watchId") == watch_state["id_a"]]
+            if stopped_fired:
+                raise AssertionError(f"stopped watch still fired: {stopped_fired}")
+            # b 未受影响：仍能触发。
+            Path(watch_state["local_b"]).write_text(f"post-stop edit B {time.time()}\n")
+            wait_watch_event(watch_state["id_b"], marker)
+            result = req("watch/stop-all", {"sessionId": session_id})
+            if int(result.get("stopped") or 0) < 1:
+                raise AssertionError(f"stop-all stopped={result}")
+            print("    stop removes exactly its watch; b survives; stop-all sweeps")
+
+        def case_watch_latin1_back():
+            # latin-1 连接口径的真机门收口：wire 路径的注册/外部编辑/回写全链
+            # （此前只有 write_bytes latin-1 分支的单测与 MCP 往返覆盖，真容器
+            # 没跑过）。组尾自愈：回写校验后删残留并把偏好归位 auto。
+            req("local/preferences/set", {"sftp_name_encoding": "latin-1"})
+            req("sftp/createDirectory", {"sessionId": session_id, "path": watch_lat_dir})
+            wire = f"{watch_lat_dir}/caf%E9.txt"
+            req("sftp/write", {"sessionId": session_id, "remotePath": wire,
+                               "dataBase64": base64.b64encode(b"latin1 watch v1\n").decode()})
+            local, size = watch_download_local(wire)
+            if size != len(b"latin1 watch v1\n"):
+                raise AssertionError(f"latin-1 watch fixture size: {size}")
+            watch_id = str(req("watch/start", {"sessionId": session_id, "remotePath": wire,
+                                               "localPath": local}).get("watchId") or "")
+            if not watch_id:
+                raise AssertionError("latin-1 watch id missing")
+            marker = len(client.events)
+            time.sleep(2.5)  # 越过 pump 启动抑制窗
+            Path(local).write_text(f"latin-1 external edit {time.time()}\n")
+            event = wait_watch_event(watch_id, marker)
+            if (event.get("params") or {}).get("remotePath") != wire:
+                raise AssertionError(f"latin-1 event remotePath: {event.get('params')}")
+            marker = len(client.events)
+            back = req("watch/upload", {"watchId": watch_id})
+            local_bytes = Path(local).read_bytes()
+            if int(back.get("size") or -1) != len(local_bytes):
+                raise AssertionError(f"latin-1 upload-back size: {back}")
+            read_back = req("sftp/read", {"sessionId": session_id, "path": wire,
+                                          "maxBytes": 4096})
+            if base64.b64decode(read_back.get("dataBase64", "")) != local_bytes:
+                raise AssertionError("latin-1 upload-back content mismatch")
+            # 自愈：watch 已停，趁偏好仍在 latin-1 删掉 0xE9 字节名残留，再归位 auto。
+            req("watch/stop", {"watchId": watch_id})
+            req("sftp/delete", {"sessionId": session_id, "path": watch_lat_dir,
+                                "recursive": True})
+            req("local/preferences/set", {"sftp_name_encoding": "auto"})
+            print("    latin-1 wire register/edit/upload-back round-trip ok")
+
+        def case_mcp_sftp_toolface():
+            # M17-B MCP 工具面：sftp_mkdir/sftp_list_dir/sftp_rename/sftp_remove
+            # （+ sftp_exists 收口）在 autonomous 模式经 mcp/call 基本往返。
+            # smoke_mcp.py 走独立 --mcp stdio 进程；这里沿既有 ssh_exec 先例走
+            # embedded 桥（mcp/call + lifecycle），同一工具实现、无需第二进程。
+            created = call_tool_embedded("sftp_mkdir", {"path": mcp_dir}, connection_id=connection_id)
+            if created.get("created") is not True:
+                raise AssertionError(f"sftp_mkdir result: {created}")
+            listing = call_tool_embedded("sftp_list_dir", {"path": home}, connection_id=connection_id)
+            names = [str(e.get("name")) for e in listing.get("entries", [])]
+            if mcp_dir.rsplit("/", 1)[-1] not in names:
+                raise AssertionError(f"mcp sftp_list_dir missing {mcp_dir}: {names[:10]}…")
+            renamed = call_tool_embedded("sftp_rename",
+                                         {"sourcePath": mcp_dir, "targetPath": mcp_dir_renamed},
+                                         connection_id=connection_id)
+            if renamed.get("renamed") is not True:
+                raise AssertionError(f"sftp_rename result: {renamed}")
+            removed = call_tool_embedded("sftp_remove",
+                                         {"path": mcp_dir_renamed, "recursive": True},
+                                         connection_id=connection_id)
+            if removed.get("removed") is not True:
+                raise AssertionError(f"sftp_remove result: {removed}")
+            exists = call_tool_embedded("sftp_exists", {"path": mcp_dir_renamed},
+                                        connection_id=connection_id)
+            if exists.get("exists") is not False:
+                raise AssertionError(f"removed dir still exists per MCP tool: {exists}")
+            print("    mcp mkdir/list/rename/remove/exists round-trip ok")
+
         print("\n--- alert triage + audit group ---")
         report.run("ssh/alert/triage normalize+classify+playbook", "ssh/alert/triage",
                    case_alert_triage)
@@ -1541,6 +1986,47 @@ def main() -> None:
         report.run("ssh/audit/clear truncates the ledger", "ssh/audit/clear",
                    case_audit_clear,
                    needs="ssh/audit/list returns approval trail")
+
+
+        print("\n--- encoding / pipeline preferences group (M14-M17) ---")
+        report.run("local/preferences pipeline clamps read back", "local/preferences/set",
+                   case_prefs_pipeline_preferences)
+        report.run("local/preferences latin-1 encoding set", "local/preferences/set",
+                   case_latin1_pref_set)
+        report.run("latin-1 container create + list decode", "sftp/touch",
+                   case_latin1_create_and_list, needs="local/preferences latin-1 encoding set")
+        report.run("latin-1 wire write/read + exists both forms", "sftp/write",
+                   case_latin1_write_read_exists, needs="latin-1 container create + list decode")
+        report.run("latin-1 tree download keeps byte-faithful names", "sftp/download/tree/start",
+                   case_latin1_tree_download,
+                   needs="latin-1 wire write/read + exists both forms")
+        report.run("latin-1 raw rename + wire delete", "sftp/rename",
+                   case_latin1_rename_delete,
+                   needs="latin-1 tree download keeps byte-faithful names")
+        report.run("latin-1 symlink create/read/update round-trip", "sftp/symlink-create",
+                   case_latin1_symlink_roundtrip,
+                   needs="latin-1 raw rename + wire delete")
+        report.run("per-connection encoding override applies", "local/preferences/set",
+                   case_encoding_override_active,
+                   needs="latin-1 symlink create/read/update round-trip")
+        report.run("per-connection override falls back to global auto", "local/preferences/set",
+                   case_encoding_override_fallback, needs="per-connection encoding override applies")
+        report.run("MCP tool-face sftp round-trip (autonomous)", "mcp/call",
+                   case_mcp_sftp_toolface)
+
+        print("\n--- watcher external-edit group (M20) ---")
+        report.run("watch/start registers two files with distinct ids", "watch/start",
+                   case_watch_register_two)
+        report.run("watcher external edit routes events per watch + upload-back",
+                   "watch/upload",
+                   case_watch_edit_upload,
+                   needs="watch/start registers two files with distinct ids")
+        report.run("watch/stop drops exactly its watch; stop-all sweeps", "watch/stop-all",
+                   case_watch_stop_semantics,
+                   needs="watcher external edit routes events per watch + upload-back")
+        report.run("watcher latin-1 wire path register/edit/upload-back", "watch/upload",
+                   case_watch_latin1_back,
+                   needs="watch/stop drops exactly its watch; stop-all sweeps")
 
         step("cleanup leftovers")
         # Best-effort mode/secret restore even when a late case failed: the
@@ -1552,10 +2038,36 @@ def main() -> None:
                                                 "sudoPassword": ""})
         except SidecarError:
             pass
+        # M14-M17 组兜底清理：先借 latin-1 原始字节路径删掉编码组残留（auto
+        # 下高层客户端删不掉 0xE9 字节名），再还原进组前的偏好快照。
+        try:
+            client.request("local/preferences/set", {"sftp_name_encoding": "latin-1"})
+            client.request("sftp/delete", {"sessionId": session_id, "path": enc_dir, "recursive": True})
+            print(f"    deleted {enc_dir}")
+        except SidecarError:
+            pass  # already cleaned by its case / never created
+        try:
+            client.request("sftp/delete", {"sessionId": session_id, "path": watch_dir,
+                                           "recursive": True})
+            print(f"    deleted {watch_dir}")
+        except SidecarError:
+            pass  # watcher group never reached registration
+        try:
+            client.request("local/preferences/set", {
+                "sftp_name_encoding": prefs_snapshot.get("sftp_name_encoding") or "auto",
+                "sftp_name_encoding_overrides": prefs_snapshot.get("sftp_name_encoding_overrides") or {},
+                "transfer_max_active": prefs_snapshot.get("transfer_max_active", 3),
+                "sftp_compat_mode": bool(prefs_snapshot.get("sftp_compat_mode")),
+            })
+            print("    preferences restored to pre-group snapshot")
+        except SidecarError:
+            pass
+        shutil.rmtree(enc_tree_local, ignore_errors=True)
         for path, recursive in ((touch_path, False), (write_path, False), (resume_src, False),
                                 (archive_path, False), (extract_dir, True), (sudo_dir, True),
                                 (f"{home}/.dbx-fs-smoke-sink", False),
-                                (f"{home}/.dbx-fs-smoke-sink2", False)):
+                                (f"{home}/.dbx-fs-smoke-sink2", False),
+                                (mcp_dir, True), (mcp_dir_renamed, True)):
             try:
                 client.request("sftp/delete",
                                {"sessionId": session_id, "path": path, "recursive": recursive})

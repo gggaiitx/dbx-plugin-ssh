@@ -3324,6 +3324,150 @@ OpenSSH 服务端未验证）；`-D`/映射持久化（跨会话记忆表单）�
   （重复 + 通配）与探测（回环存在）用例全过；浏览器 fixture 验收非法主
   机提示/冲突提示/网卡选取回填三交互。
 
+## 宿主 OS 级拖放上传接线收口 + 双注册修复（2026-09-22）
+
+**背景**：桌面宿主在 webview 层捕获 OS 拖放（HTML5 drop 事件到不了沙箱
+iframe），fileTransfer 桥（宿主 1.1 optional）的 `onDrop`/`onDragState`
+事件已在上游宿主合入。插件侧 1cb3e48/1bc3dfe 已接
+`registerHostFileTransferBridge`：`planHostFileDrop` 按面板状态分流——
+SFTP 面板打开→当前目录直传；solo 终端→复用 `terminalDropPrompt` 落点
+询问（接受 handle metas）；只读/无文件/传输中→忽略；旧宿主桥没有拖拽
+监听时 optional-chaining 降级，不再炸 initialize。
+
+**修复**：`initialize()` 内残留的第二套 `api.fileTransfer?.onDragState/
+onDrop` 直传注册（e2018a6，早于宿主事件可用时的假设实现）未随新接线
+移除——同一 fileTransfer 桥上双处理器并存，真机一次拖放会触发两次上传
+（旧处理器无视面板状态直传当前目录、绕过落点询问）；且 `mockDbxHost`
+的 `onDrop` 为 no-op，fixture 与单测都无法暴露，只有真机会撞上。移除旧
+注册及其 `unsubscribeFileDrag`/`unsubscribeFileDrop` 变量与卸载清理；
+`dragActive` 复位并入 `handleHostFileDrop`（对齐 HTML5 `onDrop` 惯例）。
+现 onDragState/onDrop 全仓仅 `registerHostFileTransferBridge` 一处注册。
+
+**验证**：`vue-tsc` 0 错；`vitest run` 60 文件 510 用例全绿；`pnpm build`
+过（ui/index.html 重产，含拖放接线与 #33/#71 诊断样式）；`cargo fmt
+--check` / `clippy -D warnings` / `cargo test` 533 全绿（含工作区未提交
+的 #33/#71 埋点）。
+
+**剩余风险**：真机拖放验收未跑（上游事件已合入，待 DBX 宿主实测：分屏
+直传 / solo 落点询问 / 只读忽略 / 多文件与大文件 / 悬停 overlay 两种
+面板模式）；`ui/index.html` 为 integrator 所有，留待打包时随工作区一并
+处理；宿主对同一 handleId 被并发 read 的语义未验证（修复后插件侧已回
+单消费者，风险仅存于修复前的安装版本）。
+
+> **合并注记（nyaterm-parity-integration）**：与 main 0.6.0 的拖放门禁工作
+> （drop-gate-consistency）融合后，注册点收敛为 `initialize()` 内的一处
+> `unsubscribeFileDrag`/`unsubscribeFileDrop`，onDrop 统一走融合版
+> `handleHostFileDrop`：`canAcceptFileDrop` 门禁 → `planHostFileDrop` 落点
+> 分流（含 targetDir）→ 桥故障回退原生选择器；`registerHostFileTransferBridge`
+> 注册器已随之移除，上节「仅一处注册」的表述以本注记为准。
+
+## M1 nyaterm-parity 波次（2026-09-23）
+
+对齐 docs/IMPL_PLAN_NYATERM_PARITY.zh-CN.md（v2）P1 五任务、DEV_PLAN W1 三 agent 并行拓扑落地：
+
+- **并行执行**：`parity-gpu`（9a/9b GPU+NPU）、`parity-actions-gutter`（8b+8c）、`parity-suggest-transfer`（8a+10b）三 worktree 并行 TDD；热点治理按计划生效（App.vue 接线点错峰，merge 仅 3 文件冲突且全为两侧追加型）。
+- **集成修复**：i18n.ts 追加块丢 for 循环闭合、preferences.rs keep-both 结构损伤——最终以「C 版为底 + B 版片段函数级插入」重建（cargo 595 全绿）；GPU 卡片窄卡显存折行/`NPUCANN` 徽标粘连/CANN 徽标右对齐三处 UI 打磨。
+- **mock 夹具**：mockDbxHost 的 `ssh/metrics` 补 `gpu`/`npu` sections（双 A100 + 910B4/310P3 + 计算进程），供监控卡片视觉验证。
+- **验证**：cargo 595 / vitest 792 / vue-tsc 0 / build 过；e2e 七场景截图（连接、设置区、双列 gutter、建议浮层、Downloads 传输设置、GPU/NPU 卡片、动作链接下划线）经 visual-judge 终审 7/7 pass；详见 TEST_MATRIX「M1」节。
+- **遗留**：GPU/NPU 真机冒烟（需有卡主机）、Windows ConPTY gutter、DBX 桌面宿主手测（M1 里程碑 PR 前人工）。
+
+
+## M2 W2a（2026-09-23）
+
+- 三 agent 并行：`parity-otp`（OTP 库，625→修复接线后 625）、`parity-import`（617）、`parity-telnet`（611）。
+- 集成修复：ssh.rs 自动应答调用点对齐 `take_connection_totp_key(data_dir,…)`；main.rs 补齐 otp/* 七个协议方法（agent 超时中断在注册前）；clippy dead_code/复杂类型三处整理。
+- telnet 分支因 Cargo.lock 冲突 break 漏 merge，补并（无冲突）。
+- 全量：cargo **663** / vitest **792** / vue-tsc 0 / build 过（ui/ 含 Telnet 入口重生成）；Telnet 入口 e2e（确认对话框）验证。
+- 依赖评审：rqrr 0.9、image 0.25（png/jpeg/bmp/webp 裁剪）、zip 2、encoding_rs 0.8、sha3 0.10、cbc 0.9、aes 0.8、pbkdf2 0.12——均为 MIT/Apache 双许可主流 crate（以 docs.rs 为准），用途见 CHANGELOG；notify 0.6 由 W2b 引入，待其 PR 一并评审。
+
+
+## M2 W2b 进度（cron 看护中，2026-09-23）
+
+- **docker（P2-4）✅ 完成**：agent 全栈交付（docker.rs 676 行 + MCP docker_list/docker_action + DockerPanel.vue + SideNavPanel tab），只读门/审计/Quick Sudo 回退全接入；`docker/list|logs|action` + 白名单 + id hex 门；"在终端打开"为剪贴板降级（App.vue 禁改约束），升级点记遗留。集成零冲突，ui/ 重生成。
+- watcher（P2-5/6）进行中：file_watch.rs 已落盘，notify 接入。
+- feel（P2-7/8/9）进行中：大输出保护 gate（b197767）、右键在线搜索（a1bd975）已 commit，背景图进行中。
+- panels（P2-1/2 前端）进行中。
+- W2b 全部合入后统一跑 e2e UI 审查与 push。
+
+- **feel（P2-7/8/9）✅ 完成**：大输出保护背压 gate（128KiB 触发/64KiB 恢复/32KiB 分帧 + 扫描挂起 + 七语提示）、终端右键菜单 + 选中文本在线搜索（引擎可配，openExternal 缺失降级复制链接）、背景图（local/wallpaper/* + 魔数校验 + WebGL 挂起强制 DOM 渲染 + 透明化）。三增量 commit（b197767/a1bd975/6c04daf），817 前端 + 649 后端全绿。已集成（bf91fb5，零冲突）。
+- W2b 剩余：watcher（P2-5/6）、panels（P2-1/2 前端）进行中；两者合入后跑 e2e UI 审查并收口 M2。
+
+- **panels（P2-1/2 前端）✅ 完成**：OtpPanel（验证码倒计时/扫码导入/绑定管理/发送到终端）+ ImportWizard（三步向导/脱敏预览/主密码处理），827→852 前端全绿。SideNavPanel 冲突为机制性（docker 与 panels 各建额外 tab 状态机）——融合为统一 extraTab（"otp"|"import"|"docker"），App.vue 持久化契约不变。已集成（2e3b018）。
+- W2b 仅剩 watcher（P2-5/6）进行中；合入后 e2e UI 审查收口 M2。
+
+
+## M2 收口（2026-09-24）
+
+- **W2b 全部合入**：docker（6cccd71）/ watcher backend（7b3cdde）/ panels（2e3b018）/ feel（bf91fb5）。
+- **集成修复**：watcher 测试 helper 共享本地文件导致 dedup 互顶（多文件变体修复）；`fingerprint_detects_content_change` 同毫秒同长度写入误判 Same（fixture 改长度差异）；SideNavPanel 机制性冲突统一为 extraTab（"otp"|"import"|"docker"），App.vue 持久化契约不变；watcher main.rs 冲突两侧保留（telnet+watcher runtime 共存）。
+- **e2e UI**：Docker/OTP/Import 三面板截图（五 tab 导航、空态、三步向导、来源卡、本地存储注记），visual-judge **3/3 pass 可交付**。
+- **全量**：backend cargo **690** / clippy 0 / fmt 干净；frontend vitest **852** / vue-tsc 0 / build 过（ui/ 重生成）。
+
+### M3 遗留清单（需人工决策或后续轮次）
+
+1. **watcher/symlink 全栈 ✅ 完成（M3 轮，739301e）**：watcher agent 实际完成了全部五段增量——自死锁修复（dedup guard 跨 await 取写锁，agent 独立定位）、symlink 三命令（russh-sftp 原生 symlink/readlink，**wire 序 (linkpath,targetpath) 与 OpenSSH (target,linkpath) 反转已在对齐处交换参数**）、`watch/upload` 回传通道（remote-edit 路径读字节 → ensure_writable → 64MiB 上限 → .dbx-part 原子提交）、前端全量接线（右键"在外部编辑器打开"、file-modified 三选确认、symlink 对话框、tooltip）。遗留：单文件 MVP（多文件并行编辑需排队扩展）、FSEvents/inotify 真机联调、外部编辑器全链路真机手测。
+2. X11 转发 spike ✅ 完成（docs/SPIKE_X11_FORWARDING.zh-CN.md）：russh 0.62 三能力全部可行（request_x11 公开 API / server_channel_open_x11 回调需显式 gate / direct-tcpip 兜底受 X server 监听限制），推荐路线 channel_open_session→request_x11→回调校验→DISPLAY 桥接，估算 4.5-6.5 人日——**建议进 M4，排核心 parity 之后**（人工排期决策项）。
+3. 串口（serialport 依赖评审）、VNC（vnc 引擎选型+帧通道压测）——依赖评审通过后派发。
+4. RDP：vendored fork 链维护计划 + CredSSP 安全评审清单——人工评审门，未派发。
+5. 真机验收：GPU/NPU（nvidia-smi/npu-smi 主机）、Docker 主机、Windows ConPTY gutter、DBX 桌面端到端——人工项。
+6. Docker 面板"在终端打开"升级为事件直填输入行（需 App.vue 通道开放）。
+
+
+## M4 轮排期（2026-09-24，用户指令"继续排期，持续跑"）
+
+- 已派发（后台并发，worktree np4-x11 / np4-serial，分支 parity-x11 / parity-serial）：
+  1. **X11 转发实现**：按 spike 报告路线（request_x11 + server_channel_open_x11 显式 gate + DISPLAY unix/TCP 桥接 + 假 MIT-MAGIC-COOKIE 校验）；偏好键 `x11_forwarding`（默认关，read_only 禁用）；零新增依赖。
+  2. **串口会话**：serialport 4（依赖评审：MIT/Apache 双许可）+ `serial_session.rs`（仿 telnet 先例：ports/start/write/close/list）+ SerialConnectDialog 前端入口；若 Linux CI 需 libudev-dev 允许改 workflow 一处。
+- 维持人工门：VNC（引擎选型+帧通道压测）、RDP（vendored fork 链+CredSSP 评审）、真机验收、PR 合入。
+- 执行备注：首轮两 agent 因 API 网络瞬断（TLS 连接断开）失败且无产出丢失（worktree 仍在基线），已原样重试派发；cron 看护继续。
+- M4 完成判据：两分支合入 integration、全量验证绿（基线 cargo 696 / vitest 861 只增不减）、e2e 回归、push 后 CI 十一门 success。
+
+
+## M4 进度（2026-09-24）
+
+- **X11 转发 ✅ 全栈完成并已合入（75c5219）**：x11.rs 残留兑现（DISPLAY 解析 7 形态/假 cookie/Xsetup 检查/.Xauthority/准入门，12 测试）+ ssh.rs 接线（request_x11 于 PTY/env 后发送；`server_channel_open_x11` 显式 fail-closed gate——russh 默认 accept 的安全边界）+ `x11_forwarding` 偏好（启动/读写三处同步快速标志）+ SettingsDialog 开关（组件内自治 RPC）+ 七语文案。真机 X server 联调记遗留。
+- **串口 backend ✅**（parity-serial 分支）：serialport 4（MIT/Apache）+ serial_session.rs（ports/start/write/close/list + Backspace 映射 + 读线程→帧通道）+ 协议注册。前端入口（SerialConnectDialog + App.vue 接线）派 np4-serial 重试 agent 补齐。
+- 执行备注：M4 首两轮后台 agent 因 API 网络瞬断失败（无产出丢失），已原样重试；X11 改由主会话直接完成。
+
+
+## M4 收口（2026-09-24）
+
+- **X11 转发 ✅ 全栈合入**（75c5219 + 6e46fec/42bb29f platform-gate）：russh UnixStream 仅 unix 平台——bridge_channel 按 cfg(unix/windows) 拆分，Windows 侧 unix-socket 形态报可读错误指路 VcXsrv TCP；fmt 修复后 CI 全绿。
+- **串口会话 ✅ 全栈合入**（cbf6fa2）：backend（parity-serial 7b3cdde…20d0edf，含 serialport 4 依赖）+ 前端 SerialConnectDialog/App.vue 接线（serial/* JSON 写通道 MVP 取舍 + localUiMode 互斥 + 顺手修复 Telnet 会话被连接卡片遮挡的一行缺陷）。
+- **执行波折**：M4 首两轮后台 agent 因 API 网络瞬断失败；X11 改由主会话直接实现（兑现 x11.rs 残留）；串口前端第三轮 agent 成功。
+- **全量**：backend cargo **696**（含 x11 12 + serial 参数/生命周期测试）/ clippy 0 / fmt 干净；frontend vitest **861** / vue-tsc 0 / build 过。
+
+- **CI 收口 ✅**：libudev-dev 已入 workflow 三处 apt 步骤（serialport Linux 后端），run 35933731782 全绿——M4 全量 CI 收口完成。
+
+### M4 遗留（人工门）
+
+1. 真机：X server（XQuartz/VcXsrv）联调、串口硬件联调、GPU/NPU 主机、Windows ConPTY、DBX 桌面端到端。
+2. VNC（引擎选型+压测）、RDP（vendored fork+CredSSP 评审）——维持人工评审门。
+3. 串口 MVP 已知限制：JSON 写通道、无 replay/resize、ports 列表 USB 后缀需手输剥离。
+
+## M5 轮排期（2026-09-24，用户指令"直接进入M5"）
+
+- 已派发（后台并发，worktree np5-vnc / np5-docker-term，分支 parity-vnc / parity-docker-term）：
+  1. **VNC 会话**（差距项 2d）：spike 先行（上游 HsuJv/vnc-rs 0.6.0 async client 尽调：API 面/许可证/有界分配审查，对比 NyaTerm 0.5.3 加固 fork），可行即 MVP——None/VNC-Auth（密码 ≤8 字节提示）、Raw/ZRLE 优先、44 字节 patch 帧走现有二进制通道、前端画布复用 remote-desktop 渲染层思路、断线 generation 重连；vnc/ 前缀协议 + "New VNC session" 入口（localUiMode 互斥）。Tight JPEG 显式报错不实现（范围裁剪）。依赖评审随 PR。
+  2. **Docker"在终端打开"升级**（M3 遗留 6）：命令经 App.vue 内部通道直填输入行（复用 M1 动作链接的 fill 通道），替代"经 sendTerminalBytes 直写 PTY"；顺带补 Docker 面板 e2e 截图。
+- 维持人工门：RDP（vendored fork+CredSSP 评审）、真机验收、PR 合入。
+- M5 完成判据：两分支合入 integration、全量绿（cargo ≥696 / vitest ≥861 只增不减）、e2e、push 后 CI 十一门 success。
+
+
+## M5 收口（2026-09-24）
+
+- **VNC 会话 ✅ 全栈合入**（backend c7d745c + frontend dc4ba51）：vnc-rs 0.6（HsuJv，MIT OR Apache-2.0，依赖评审随 PR）+ vnc_session.rs（None/VNC-Auth，密码 >8 字节在 start 即拒绝；ZRLE+Raw+DesktopSize，Tight/JPEG 矩形显式失败；帧缓冲 3840×2160、patch ≤64MiB、剪贴板 Latin-1 ≤1MiB 三重上界；generation 断线重连，认证/协议错误不重试）。协议 `vnc/start|input|resize|reconnect|set-clipboard|close|list`，44 字节 patch 帧走 `vnc/frame/{id}` 二进制通道；前端 VncConnectDialog + VncSurface 画布（localUiMode 互斥、"仅受信网络"提示、七语文案）。
+- **Docker"在终端打开"✅**（3da01f5）：命令经 App.vue fill 通道直填输入行（替代 sendTerminalBytes 直写 PTY），Docker 面板 e2e 截图补齐。
+- **X11 spike 示例收尾 ✅**（a862bdf，merge da1dda3）：x11_spike.rs 纯编译验证示例入库（文件头注明永不接入插件；check_server_key 放行仅限 spike 本体），fmt/clippy/test 全绿。
+- **集成修复**：dc4ba51 提交的 App.vue 带两处未解决冲突标记（上轮 frontend 门未含 vue-tsc，漏过）——9302f1f 取 VNC 侧并去掉与 panels 侧重复的 panelSurface 定义（保留既有 558 行），terminal-overlay 条件合并 `!panelSurface` + `!isVncMode`；ui/ 随修复重生成（84d5e56）。
+- **全量**：backend cargo **719**（M4 基线 696，只增不减；vnc_session 新增 11）/ clippy `-D warnings` 0 / fmt 干净；frontend vitest **874**（基线 861，只增不减；vncFrame 帧编解码 9）/ vue-tsc 0 / build 过。
+
+### M5 遗留（人工门）
+
+1. 真机：VNC server（None/VNC-Auth）画面/输入/剪贴板联调、X server（XQuartz/VcXsrv）转发联调、串口硬件、GPU/NPU 主机、Windows ConPTY、DBX 桌面端到端。
+2. RDP（vendored fork 链 + CredSSP 评审）——维持人工评审门，未派发。
+3. VNC MVP 已知限制：Tight/JPEG 不支持（显式报错）；VNC-Auth 仅 ≤8 字节密码；剪贴板 Latin-1。
+
 ### 前端持久化迁移 host.storage（2026-09-24）
 
 - **背景**：工作台 iframe 是 sandbox="allow-scripts"（opaque origin），
@@ -3429,6 +3573,403 @@ clipboard Host API，`clipboardDeps()` 无需改动即可接管。
   文本，实现两层保护。
 - `ui/index.html` 重新生成，本地验证全绿。
 
+## M5.5 收口（2026-09-24，main 同步 + 三会话并行线）
+
+**三条并行线产出**（用户拆分的独立会话，不等轮次顺序）：
+
+- **RDP 立项材料 ✅**（parity-rdp-docs 66d6552/38d86ab，merge 73520a5）：
+  `docs/RDP_VENDOR_FORK_PLAN.zh-CN.md`（NyaTerm fork 链事实基线：ironrdp-client/connector/tls、picky、sspi 五 crate 补丁面 + `[patch.crates-io]` 整链同轮升级约束 + Route A/B/C 决策框架）与 `docs/RDP_CREDSSP_REVIEW_CHECKLIST.zh-CN.md`（【硬】/【条】两级清单：NTLMv2-only fail-closed、凭据委托最小化、TLS 证书策略、CVE 对齐）。**评审材料已备齐，评审执行仍是人工门**。
+- **串口遗留补齐 ✅**（parity-serial-enh a8f2e71，merge a7414c7）：ports 列表端口路径与描述规范化分离（USB 后缀不再手输剥离）+ start 行参数（baud/data bits/parity/stop/flow）严格校验，纯逻辑单测；协议级 resize/replay/二进制写通道升级仅出设计稿 `docs/SERIAL_ENHANCE_DESIGN.zh-CN.md`，不动 wire 协议（人工评审项）。
+- **X11 spike 示例收尾 ✅**（a862bdf，上轮已并入）：`backend/examples/x11_spike.rs` 纯编译验证示例入库。
+
+**main 同步 ✅**（ed4e910）：自 M2 时代的 merge-base 一口气补齐 main 侧 15 个 commit——0.7.0 版本 bump、交互式 MFA + 重复会话（cb0274f/e3442e6）、手动 OTP 提示（PR #107）、host.storage 偏好持久化（e9edf33）、右键粘贴插件视图副本降级链（PR #102）、kitty/XTVERSION/DECRQM 能力探测应答（PR #109）、randomUUID shim（PR #111）、manifest host.storage / host.clipboard:read 权限声明。
+
+**冲突解决摘要**（5 文件）：
+
+- **ssh.rs**：取 main 侧 `open_session` 新骨架（SessionOpenRequest / transport_lease / 认证传输复用路径），注入 integration 的 X11 arming 块；clippy 暴露 main 重写覆盖掉的 TOTP 绑定回落（`sudo_auth_for` 的 otp_store 回落 + `otp_bound_as_totp_secret` 映射 + 2 个 crate use）已恢复（c279407）。
+- **App.vue**：8 处冲突全解——偏好体系保留 integration 侧（terminalBehavior 结构化 + hotkeys + transfer/suggestion adapters），并入 main 的 `terminalCopyCache`/`resolveTerminalPasteText`（右键粘贴降级链）、`randomUUID` shim（issue #104）、工具栏"复制会话"按钮（与 telnet/VNC/serial 入口共存）；main 的 SELECT_COPY_KEY 独立键与 `toggleSelectCopy` 旧路径不取（已被结构化偏好取代），`pluginStore` 全量迁移留待下轮（遗留 3）。
+- **mockDbxHost**：main 的 pluginStore 种子写法 + integration 的 #33/#71 诊断注释融合。
+- **PROGRESS/TEST_MATRIX**：追加型冲突，双方时间线记录全保留。
+- **ui/index.html**：构建重生成（695d69d，对齐 main 侧 Node 22 产物）。
+
+**全量**：backend cargo **735**（M5 基线 719，只增不减）/ clippy `-D warnings` 0 / fmt 干净；frontend vitest **886**（基线 874，只增不减）/ vue-tsc 0 / build 过（ui/ 重生成）。
+
+### M5.5 遗留（人工门/后续轮）
+
+1. 真机验收（不变）：VNC server（None/VNC-Auth）、X server（XQuartz/VcXsrv）转发、串口硬件、GPU/NPU 主机、Windows ConPTY、DBX 桌面端到端。
+2. RDP：立项材料已备（`RDP_VENDOR_FORK_PLAN` / `RDP_CREDSSP_REVIEW_CHECKLIST`），评审执行仍为人工门；串口协议升级设计稿待评审。
+3. **App.vue 偏好存储 pluginStore 全量迁移**：main 侧已迁 12 个键；integration 结构化偏好新增的前端键（终端行为/快捷键/传输并发/命令建议等）仍走 localStorage 直写，在真机 opaque origin 下静默不持久化（行为可降但偏好不保）——建议下一轮统一切 `pluginStore` 并复验真机持久化。
+4. **操作规程**：同一 integration worktree 严禁两个会话并发写——本轮独立收口会话与看护会话曾在 merge 冲突解决上交叠（PROGRESS/mockDbxHost 被外部进程先行解决），靠互斥文件域与人工核验避免撞车；看护任务启动前必须确认既有会话已全部停止。
+
+
+## M6 轮：pluginStore 全量迁移（2026-09-24，后台 agent 并发）
+
+- **遗留 3 关单 ✅**（parity-plugin-store 93bc1ea/af4f73d，merge 9a1527a）：integration 结构化偏好三键迁入 pluginStore——`ssh-terminal-behavior` / `ssh-terminal-hotkeys` / `ssh-terminal-appearance`（PLUGIN_STORE_KEYS 现 15 键），实现模式对齐 terminalFont/terminalWebgl 先例（defaultStorage 返回 store 单例、显式注入保留为测试口），App.vue 调用点零改动；LEGACY_SELECT_COPY_KEY 降级镜像随主键写穿。**不迁键固化**：transfer/suggestions 五键与下载偏好同构（sidecar preferences 权威 + localStorage 同步缓存，迁走即双权威）、quick-commands（sidecar 迁移种子）、dbx-term-diag（诊断开关非偏好）——排除理由写入 pluginStore.ts 头注释与 spec 排除断言。
+- **全量**：frontend vitest **891**（基线 886，+5 默认存储回环/不抛用例）/ vue-tsc 0 / build 过（ui/ 重生成）；backend 零改动。
+- **遗留**：真机持久化复验（三键首装靠 pluginStore 惰性搬家带入 localStorage 旧值）仍属人工门；老宿主（Host API < 1.2）降级 guarded localStorage，行为等同迁移前。
+
+
+## M7 轮排期（2026-09-25，对标缺漏对齐——NyaTerm/Tabby 基准复审结论）
+
+全量源码对标复审（NyaTerm v1.2.11 /Users/Jinpy/btroot/nyaterm + Tabby/NetCatty/tiny-rdm/iShell 文档线索交叉）结论：已完成面见 FEATURE_PARITY（Tabby 配色 192 套/行为页/快捷键编辑器、tiny-rdm 后端全家族、NetCatty 五项、iShell 四件、NyaTerm 七差距项 2a-2d/4/5/7/8a-8f/9a-9c/10a/10c），剩余缺漏按优先级排出 M7 并发实施（全部从 670d124 切独立 worktree）：
+
+- **P0-1 Telnet auto_login**（np9-telnet-autologin）：声明式正则自动登录（用户名/密码/成功/失败正则+重试），对标 NyaTerm `TelnetAutoLoginConfig`；落点 backend/telnet_session.rs + TelnetConnectDialog。
+- **P0-2 会话导入补四格式**（np9-import-formats）：SecureCRT(.xml)/FinalShell/Electerm/Termius，对标 NyaTerm `core/importer/`；落点 backend/connection_import.rs + ImportWizard。
+- **P0-3 串口 XMODEM/YMODEM/ZMODEM 上传**（np9-serial-xymodem）：对标 NyaTerm `serial/xymodem.rs`；走现有 serial JSON 写通道内嵌协议，不动 wire 协议（SERIAL_ENHANCE_DESIGN 评审项不受影响）。
+- **P0-4 连接级启动命令 startup_commands**（np9-startup-commands）：Tabby Login scripts 对标（REVIEW_FORM_VS_TABBY P2-5 曾提出后掉跟踪）；落点 sidecar 偏好（x11_forwarding 先例，不改 manifest）+ open_session shell 建立后按序注入。
+- **P1 docs-sync**（np9-docs-sync）：文档同步修编——NetCatty 对标行补入 FEATURE_PARITY、COMPARISON 过时结论更新、tssh/iShell 节"X11/VNC/Telnet/串口不做"矛盾回写、NETCATTY checkbox 补勾、8d 翻译重启条件补跟踪点；并登记 P1/P2 候选缺口（认证 Auto 模式、每连接编码、录制 transcript/自动录制/搜索、SFTP pipeline/兼容模式/文件名编码、Quick Commands 导入、iShell 句柄/监听端口维度、NetCatty 三遗留）。
+- **在途**：np8-e2e（smoke_ui_settings 超时修复，已见 terminalModeQueries/smoke_ui_fresh_review 改动）；cron 每 10 分钟看护（交付标准五条）。
+- 维持人工门：RDP 评审执行、串口协议升级评审、真机验收矩阵、PR #98 合入。
+- M7 完成判据：五分支合入 integration、全量绿（cargo ≥735 / vitest ≥891 只增不减）、e2e walkthrough 绿、push 后 CI 十一门 success。
+
+
+## M7 收口（2026-09-25，并发验证轮：实例测试 / 真机模拟 / e2e 修复）
+
+**P0 回归修复 ✅**（parity-e2e-fix 9fcb326/f305b2f，merge 见 HEAD）：M5.5 从 main 合入的 `terminalModeQueries.ts`（837fbc7）把 XTVERSION 注册成 `{ prefix: ">", intermediates: "q" }`——`q`(0x71) 超出 xterm 合法 intermediates 区间 0x20..0x2f，`registerCsiHandler` 注册期抛错 → createTerminal 失败 → connected 永不可达 → 全部连接态 UI disabled（真实宿主同炸）。修复：XTVERSION 按真实线格式注册 `{ prefix: ">", final: "q" }` + 回调校验 params（空或 `[0]===0`）；kitty/DECRQM 两 handler 核查无同类问题；**spec 加固：fake parser 镜像 xterm 的 prefix/intermediates/final 区间校验，注册参数形态从此被 vitest 锁定**。同族 walkthrough `smoke_ui_fresh_review.mjs` 陈旧断言修正（凭据行迁 Quick Sudo 页签、键盘断言对齐按平台默认表与 KeyboardEvent.code）。
+
+**并发验证矩阵（三 agent 线）**：
+- 实例测试（8 项）：smoke_test 全链路 / smoke_fs 68 / smoke_mcp 33 工具 / smoke_login_mfa 13 / terminal_burst 737 帧 / validate_repo / connection-forms 502 组合全 PASS；smoke_forward 初跑 FAIL 归因容器 `AllowTcpForwarding no`，重建容器（双端口监听 + HUP 生效）复验 **6 用例全过（15.2s）**——插件转发无回归。
+- 真机模拟：干净容器首装挑战流 PASS（fs 的 sudo 组 3 项为新容器无 NOPASSWD sudoers 的环境前置，非回归）；浏览器场景矩阵抓出上 P0 回归（S1/S2/S3 同根因）。
+- e2e walkthrough：`smoke_ui_settings` 46 ok 全绿（修复前 20s 超时）、`smoke_ui_mock` 全绿、`smoke_ui_fresh_review` 4/4。
+
+**全量**：frontend vitest **891** / vue-tsc 0 / build 过（ui/ 重生成）；backend 零改动。
+
+### M7 遗留
+1. 真机人工门不变：DBX 桌面端到端、VNC/X server/串口硬件/GPU-NPU/ConPTY、pluginStore 三键真机持久化复验。
+2. 场景矩阵 S1/S2 已由修复后 walkthrough 等价覆盖（fresh_review 连接态 + settings 全绿）；S3（visual.html）修复后复验随本轮 CI 后补录。
+3. CI 门禁缺口已暴露：前端 walkthrough 不在 CI——是否纳入 CI 由人工排期（涉及 CI 时长/浏览器依赖）。
+
+
+## M7 进度（2026-09-25）
+
+- **docs-sync ✅ 合入**（parity-docs-sync 7adaa73/320d290/b53cd62，merge 48a29b7）：NetCatty 对标节补入 FEATURE_PARITY（五项已实现+五项不做）、9 项候选缺口登记、tssh/iShell 节过期结论回写、COMPARISON 双语更新、NETCATTY 计划 checkbox 校准补勾、8d 翻译重启条件跟踪点。agent 自行纠正任务书三处事实偏差（审计日志无 0600 等）。遗留提示：IMPL_PLAN_NYATERM v2 重判表多行仍标"❌ 仍缺"与 M1-M5 不符——留待下轮 docs 批校准。
+- **startup-commands ✅ 合入**（11277dc，merge 无冲突）：连接级启动命令序列（Tabby Login scripts 对标）——`startup_commands` 偏好（每连接 ≤20 条/单条 ≤4KiB/延迟 ≤30s）+ open_session shell 后顺序注入（TerminalCommand::Input 通道，remote_command exec 会话跳过）+ `ssh/startup` 事件（不含命令内容）+ SettingsDialog 编辑区（七语）。backend +10 / frontend +7 / 容器 smoke 实跑 PASS。PROTOCOL 同步。
+- **import-formats ✅ 合入**（f9fed3c，merge 无冲突）：SecureCRT(.xml hex 端口优先)/FinalShell(zip+folder.json 组链，DES 密文不迁移)/Electerm(bookmarks 组父链)/Termius(加密 blob 启发式丢弃、明文 PEM 迁移) 四解析器，统一 `secret_note` 原因码 + 预览横幅七语。backend +14 / frontend +3。
+- **全量（三线合并后）**：backend cargo **759**（基线 735）/ clippy 0 / fmt 干净；frontend vitest **901**（基线 891）/ vue-tsc 0 / build 过（ui/ 重生成）。
+- **在途**：telnet-autologin、serial-xymodem、np8-e2e（walkthrough 超时修复）。
+
+
+## M7-Warp 进度（2026-09-25）：结构化补全 spec 下拉 ✅ 合入
+
+- **Warp 对齐线 2 ✅**（parity-warp-spec 9717fa1，merge f12f4d3）：`lib/completions/spec.ts`（fig 思路裁剪 schema + token 切分/层级匹配/评分纯函数）+ 首批 12 个精选 CLI spec（git 28 子命令含二级树/docker 28/kubectl 21/ssh/systemctl/tmux/cargo/npm/pnpm/yarn/curl/grep）+ `CompletionMenu.vue` 三级下拉（flag/子命令/值候选，动态值出 `<branch>` hint 不枚举）。命令条接线：spec 优先、历史浮层回落并存；SettingsDialog"结构化补全"开关（默认开，pluginStore 键 `ssh-completion-spec`）；i18n `completionMenu.*` 七语。零 AI、零运行时依赖。
+- 冲突：SettingsDialog 与 M7 startup-commands 块追加型冲突（保留双方）。
+- **全量**：backend cargo **766**（M5.5 基线 735，M7 三线 + spec）/ clippy 0 / fmt 干净；frontend vitest **934**（94 文件）/ vue-tsc 0 / build 过（ui/ 重生成）。
+- 在途：Warp 线 1（ghost 行内建议，np8-warp-ghost）、e2e 修复线（np8-e2e）、M7 剩余（telnet-autologin / serial-xymodem）。
+
+
+## M7 进度（二）（2026-09-25）
+
+- **telnet-autologin ✅ 合入**（5b18690，merge 零冲突）：声明式 auto_login（提示正则+凭据降级共享 Expect 引擎、成功/失败正则监督、重试预算、超限关闭会话带可读原因；密码脱敏 Debug/事件红线），TelnetConnectDialog 折叠区七语 15 键。与 NyaTerm 差异：匹配载体用共享引擎（无第二套匹配器）、未做 send_wake_enter/timeout_ms、手动输入不解除、超限改为关会话（NyaTerm 仅禁用）——差异点已记录。
+- **全量（四线合并后）**：backend cargo **766**（基线 735）/ clippy 0 / fmt 干净；frontend vitest **934**（基线 891）/ vue-tsc 0 / build 过（ui/ 重生成）。
+- **在途**：serial-xymodem、np8-e2e。
+
+
+## M8 收口（2026-09-25，Warp 对齐 + np9 并发轮）
+
+- **Warp 线 1 行内 ghost 自动建议 ✅ 合入**（parity-warp-ghost cee2c90，merge 5bf6505）：`terminalGhostSuggest.ts` 纯状态机（onData 字节分类/行尾门闩/严格前缀扩展过滤，接受字节=精确剩余后缀的 typed 等价 PTY 注入，零协议变更）+ App.vue 终端区 overlay DOM 渲染（→ 一次接受、IME/粘贴/远端命令中隐藏）+ SettingsDialog 自治开关（pluginStore 键 ssh-terminal-ghost-suggest，默认开）+ i18n 七语块 + 26 新单测。
+- **Warp 线 2 结构化补全 ✅ 合入**（parity-warp-spec，merge f12f4d3）：`lib/completions/spec.ts` schema/评分纯函数 + specs/ 精选 CLI 库 + CompletionMenu 三级下拉 + 命令条接线（spec 优先/历史回落）+ SettingsDialog 开关（键 ssh-completion-spec）+ completionMenu.* 七语。
+- **np9 并发线 ✅ 合入**：telnet-autologin（dab496b，声明式正则自动登录）、import-formats（34fd7b1，SecureCRT/FinalShell/Electerm/Termius 四解析器）、startup-commands（b673496，连接级启动命令 sidecar 偏好 + open_session 注入，remote_command 语义冲突已文档化）、docs-sync（48a29b7，NetCatty 对标/COMPARISON/候选缺口登记）。
+- **集成修复**：warp-ghost 合入的 SettingsDialog/i18n 共享闭合括号错位（两线 load 函数共用冲突块外 `}`）手工重排修复；pluginStore/spec 断言双键并保。
+- **全量**：frontend vitest **960**（91→95 文件，基线 901 只增不减：ghost 26 + spec/telnet/startup/import 各线 spec 并入）/ vue-tsc 0 / build 过（ui/ 重生成）；backend cargo **745**（startup_commands 并入后全绿）/ fmt 干净 / clippy 0。
+
+
+## M7 进度（三）（2026-09-25）
+
+- **serial-xymodem ✅ 合入**（8356403，merge 两处追加型冲突：i18n 双键块拼接 + PROTOCOL 表行并档；修复拼接时被冲突标记吞掉的 terminalGhost 合并循环闭合括号）：串口 XMODEM/YMODEM/ZMODEM 纯状态机（~1300 行，可注入时钟单测；ZDATA 保守单 ZCRCW 子包、ZRPOS 续传、ZSKIP/CAN 取消），serial/upload/start|data|cancel + progress 事件，前端 File API 流式分块（≤64KiB，总量 ≤256MiB）+ 弹窗/进度 overlay/传输中吞键入，七语。backend +35 / frontend +15；PTY 回环因 serialport-rs ENOTTY 记 SKIP（协议语义由进程内喂字节单测覆盖），smoke 5 PASS / 2 SKIP。
+- **并入确认**：warp 线 1（np8-warp-ghost 行内 ghost 建议）已由并行会话先行合入（terminalGhost 文案块在案），本次 merge 基于其上。
+- **全量（六线合并后）**：backend cargo **801**（基线 735）/ clippy 0 / fmt 干净；frontend vitest **975**（97 文件，基线 891）/ vue-tsc 0 / build 过（ui/ 重生成）。
+- **在途**：np8-e2e（walkthrough 修复）。M7 剩余：全量数字随最后一线上升后做终收口。
+
+- **serial-xymodem ✅ 合入**（parity-serial-xymodem 8356403，merge 42264bb）：XMODEM/YMODEM/ZMODEM 文件上传（NyaTerm parity P0-3，serial JSON 写通道内嵌协议，不动 wire 协议）+ 前端 serialUpload 状态机 + 七语文案 + smoke_serial_upload.py 上传冒烟。**np9 五线全部合入，M7 排期清零。**
+- **M8 全量终值**：backend cargo **801**（745 + xymodem 56）/ clippy 0 / fmt 干净；frontend vitest **975**（97 文件，960 + xymodem 15）/ vue-tsc 0 / build 过。
+
+
+## M8 收口补遗：serial-xymodem 全量数字（2026-09-25）
+
+- **P0-3 串口 XMODEM/YMODEM/ZMODEM 上传 ✅ 合入**（8356403 + merge 42264bb）：backend `serial_xmodem.rs`（2069 行，走现有 serial JSON 写通道内嵌协议，不动 wire 协议）+ 前端 SerialUploadDialog/serialUpload + `smoke_serial_upload.py`（406 行）+ PROTOCOL 文档同步。
+- **全量**：backend cargo **801**（M5.5 基线 735 → M7 766 → 801，只增不减）/ clippy `-D warnings` 0 / fmt 干净；frontend vitest **975**（97 文件，基线 891 → 934 → 975）/ vue-tsc 0 / build 过（ui/ 重生成）。
+- **交付核验 ✅**（reverify.md）：UI 场景矩阵 13/13（原 3 FAIL 随 XTVERSION 修复 9fcb326 全部转绿）、walkthrough 家族 3/3（settings/mock/fresh_review 全绿）、smoke 双件套 PASS。
+- 至此 M7 五任务 + Warp 两线全部合入，CI 覆盖最新 HEAD。
+
+
+## M9 轮：连接表单协议化（2026-09-25，用户指令"对标 Tabby 做进连接设置"）
+
+- **manifest 连接表单 protocol 字段 ✅**（parity-protocol-connect 53d29f6）：`protocol` select（ssh 默认/telnet/vnc）+ 29 个 SSH 特有字段挂 `visible_when`（原单条件升级 all_of 叠加 protocol=ssh，passphrase_command/password_prompt_hint 展平为三条件）+ username 覆盖 ssh+telnet + 七语 label/options/description；RDP 刻意不提供（实现不存在，评审门材料在 docs/RDP_*）。connection-forms/verify.mjs 断言同步（502 组合全过）。
+- **工作台协议路由 ✅**（e68f808）：openSession 读连接 protocol——telnet/vnc 连接直启各自会话（参数=连接 host/port + 上次使用偏好），失败回落预填弹窗；SSH 保持默认路径。backend 零改动（telnet/vnc start 参数直传，不依赖 SSH StoredConnection）。
+- **对话框参数记忆 ✅**（6bc0496）：Telnet/Serial/VNC 三弹窗经共享 `lib/connectLastParams.ts` 回填/写穿上次参数（pluginStore 三新键）；凭据字段一律不落盘。
+- **全量**：frontend vitest **980**（98 文件，基线 975 只增不减：connectLastParams 5）/ vue-tsc 0 / build 过（ui/ 重生成）；backend 零改动；connection-forms verify 502 组合全过。
+- **遗留**：telnet/vnc 连接驱动的直启路径需扩展 mockDbxHost fixture（telnet/start mock）后才能 e2e 验证——下一轮；serial 协议化 deferred（参数组不同构）；RDP 表单暴露待实现落地。
+
+
+## M10 收口（2026-09-25，评审修复批次：四线并发 + cron 看护）
+
+两轮代码评审（结构/性能/UI体验/安全）发现的问题按四条并发线修复合入：
+
+- **fe-fix（19cde73/b187746，merge bad2baa）**：ghost 锚点视口公式（cursorY-viewportY → cursorViewportRow/cursorAbsoluteRow，新 lib/terminalAnchor.ts + 5 用例含旧公式负值对照）；confirmTelnetOpen 补关 serialSession；Serial/VNC 弹窗补 X 关闭图标 import；ghost 与结构化补全互斥（ghostMenuSuppressed + ArrowRight 消费顺序）。
+- **x11-gate（2bdeb42，merge 后 backend 818）**：两轮 CRITICAL 闭环——SshClient 覆写 server_channel_open_x11（fail-closed：准入→setup 校验→真 cookie 替换→桥接；accept 后缓冲校验是 SSH 协议顺序约束，文档注释说明）；ACTIVE_GATE OnceLock → Mutex<Option<Arc>>，re-arm 替换 + 最后会话关闭全局 disarm；+6 测试（替换拒绝/计数独立/分块 cookie/setup 超限等）。
+- **watch-path（7a5ca42/967a11d，merge 后 823）**：watch/start+upload_back 复用 validate_remote_edit_path（canonical 前缀 + symlink 逃逸/目录穿越反例测试）；upload_back metadata 预检 + spawn_blocking；指纹哈希异步化；QR 解码 ImageReader limits；OTP tmp 0600 先建后写。
+- **ci-contract（71253b4/78d32b3，merge 后 812→合入时点）**：UI walkthrough 挂入 CI frontend job（DBX_SMOKE_STRICT=1 下依赖缺失即失败，退出码分离实测）；agent-flow validation.local 补两项；PROTOCOL.zh-CN.md 补 vnc/frame 44 字节契约节；跨端 golden hex 向量双侧断言（后端 +1）。
+
+**上轮评审闭环**：CRITICAL 2/2（X11 gate、ghost 锚点）、HIGH 4/4（watch 路径、telnet 漏关、X 图标、浮层互斥）、MEDIUM 若干（QR limits、0600、upload 预检、e2e 门、契约文档）；X 图标与 telnet 漏关为第二轮复核确认的残留，本轮清零。
+
+**全量**：backend cargo **823**（811 → +12，只增不减）/ clippy -D warnings 0 / fmt 干净；frontend vitest **990**（980 → +10）/ vue-tsc 0 / build 过（ui/ 重生成）。CI 含新挂的 UI walkthrough 门（strict 模式），首次 CI 观测项见 commit 注记。
+
+### M10 遗留
+
+1. CI 的 UI walkthrough job 首次运行需观测（runner Chrome 与 playwright-core 协议匹配无法本地验证，回退方案已写入 ci.yml 注释）。
+2. X11 guard 页面缺位：setup 校验在 accept 后（协议约束），畸形流量最坏影响为上限 8 的悬挂通道——已记录，不阻塞。
+3. 评审其余 MEDIUM/LOW（串口上传内存上限/写线程化、gutter 满容量平移、协议表单端口联动、modalOpenStates 注册器化等）留下一轮按优先级消化。
+
+
+## RDP 实施轮 RDP-1（2026-09-25，vendored fork 链）
+
+- **vendored 链 ✅ 合入**（parity-rdp-vendor 7de0ef1/a23abcd）：六 crate 锁步入 vend——ironrdp umbrella 0.17.0（crates.io tarball sha256 与 NyaTerm lock 逐字节一致，额外纳入 patch 堵漂移入口）+ ironrdp-client 0.1.0（3 处注入补丁）/ connector 0.10.0 / tls 0.2.2 / picky 7.0.0-rc.25 / sspi 0.21.0（NyaTerm 副本原样）。Cargo.lock +2025 行完整提交；`backend/vendor/` 3.5MB/260 文件。
+- **锁步 CI 断言**：`scripts/check_vendor_lockstep.py`（lockfile patched 段 ↔ vendor/ 目录一致性，漂移非零退出；三种负路径验证），接入 ci.yml backend job。
+- **全量**：backend cargo **823**（vendored 生效后全绿）/ clippy 0 / fmt 0 / lockstep PASS；frontend vitest **990**（99 文件，含并行 M10 波次增量）/ vue-tsc 0 / build 过。
+- 遗留：ironrdp-client 发布包无 LICENSE（已从 upstream monorepo 补 APACHE/MIT 并登记 vendor/README）；ironrdp-tls 补丁状态缺口（计划 §5-1）按"原样搬运"登记，升级轮对照原包核实；Windows native-tls/Schannel 路径依赖 CI windows-regression 兜底。
+- **下一棒 RDP-2**：rdp_session.rs MVP（对标 NyaTerm src/core/rdp.rs：NLA/CredSSP 认证、TLS 证书策略 prompt、text-only 剪贴板桥、按错误类型重连门控）+ rdp/* 协议面 + PROTOCOL 文档——基线含本棒 vendor 链。
+
+> CI 观测补记（M10）：UI walkthrough strict 门经三次观测迭代后于 runner 全绿（run 36080783898，十一门全 success）——首轮暴露 pnpm exec 包装吞 stdout（改为直启 vite 二进制），次轮暴露快捷键冲突步骤的平台键位假设（改为按宿主平台录制实际被占有的组合）。两处均为门外脚本盲区，产品代码零回退。
+
+
+## 串口增强实施轮（2026-09-25，按评审定稿蓝图实施）
+
+- **三增量 ✅ 全栈合入**（parity-serial-enh-impl 五 commits）：B1 二进制写通道（Stdin=3 流标签 + 上传互斥门 + sidecar 拒收后盾）、serial/replay 序号制（与 telnet/local 先例逐字段同构、128 KiB 缓冲、前端 drain 复用 + 7 语截断提示）、写序列化与回压（专用写线程 + 256 KiB 有界队列 + 4 KiB 分帧 + 队满报错不阻塞生产者）。能力探测降级（binaryInput 字段）随 start 落地；resize 按文档明确不实现。安全修复（0 字节 final、坏帧预算 32）零改动。
+- **实施定稿参数**：分帧 4 KiB / 队列 256 KiB / 键入单包 16 KiB（文档标注"实施时定稿"项）；写失败镜像 `serial/write/error` 事件（会话保持）已记入 PROTOCOL 契约。
+- **全量**：backend cargo **867**（825+RDP-2 后合入累计）/ clippy 0 / fmt 0；frontend vitest **998**（100 文件）/ vue-tsc 0 / build 过（ui/ 重生成）。
+- 遗留：二进制事件在宿主桥的流量控制行为需实测（文档标注）；真口回环 smoke 与 install 检查按规约归 integrator。
+
+
+## RDP 实施链收官（2026-09-25，RDP-1/2/3 全链合入）
+
+- **RDP-1 vendored 链 ✅**（0319148e）：六 crate 锁步 + lockstep CI 断言，CI 五平台验证通过。
+- **RDP-2 sidecar 引擎 ✅**（09c84b5e，+31 测试）：IronRDP 客户端独立线程 + vendored 注入补丁接线；证书策略 prompt/strict/accept-temporarily 状态机（120s 窗、remember 落盘、generation 防串话）；CredSSP/NLA；44 字节 patch 帧走 rdp/frame/{id}（与 VNC 同构）；text-only CLIPRDR 双向桥（16 MiB 双向硬上限）；按错误类型重连门控（认证类 fail 不重试，退避 1/2/4/8/15s 封顶 30s）；安全【硬】清单全落地（NTLMv2-only 源码断言钉住、凭据 Zeroizing 不落日志、证书 fail-closed、剪贴板不落审计）。协议 rdp/start|input|resize|set-clipboard|reconnect|certificate/resolve|close|list + PROTOCOL 文档节。
+- **RDP-3 前端 ✅**（本 merge，+21 测试）：RdpSurface（rAF 合帧/缩放三态/pointer 四型含位图光标）+ RdpConnectDialog（分辨率门限/证书策略三选/凭据不落盘）+ App.vue localUiMode 互斥接线 + rdp-certificate 专属确认弹窗（SHA256+倒计时+remember，fail-closed）+ rdp.* 七语 56 键 + mockDbxHost rdp/* 全协议桩（?rdpCert/rdpErr 走查参数）。
+- **全量终值**：backend cargo **854** / clippy 0 / fmt 0 / lockstep PASS；frontend vitest **1019**（101 文件）/ vue-tsc 0 / build 过（ui/ 重生成）。
+- **遗留（人工门）**：RDP 真机 server 联调（握手/帧/剪贴板/重连端到端）、canvas 位图光标 WKWebView 走查、`?rdpCert/rdpErr` mock 走查路径浏览器复验、rdp/resize 前端触发入口（按需）、CredSSP CBT 端到端核对（评审动作）。
+
+
+## RDP 收官对抗审查与修复轮（2026-09-25）
+
+- **审查结论**：8 攻击面 8 安全 / 7 问题（中 2 低 5）/ 4 需确认。凭据流（Zeroizing 闭环）与证书状态机（120s fail-closed/generation 竞态闭环）两大核心通过。
+- **修复 ✅ 全部合入**（parity-rdp-fix 978f151a/a215a65a，+29 测试）：C2 剪贴板分片发送（JSON 转义后 7MiB 预算切分、chunkIndex/Total、App 会话隔离缓冲拼接）保 16MiB 契约可用；C1 入口长度门（原始载荷先于 String 物化拒绝）——**缓解+登记**（crates.io cliprdr 0.7.0 PDU 整包物化不可避免，完全修复走 vendored fork plan 另一工作流）；D3 ReconnectBudget 状态机（总预算 50 次永不重置，active 只重置退避步长，防恶意服务器无限循环）；E5 unicode 4096 上限 + scan_code u16→u8 显式拒绝；B4 known-certs 写盘 uuid tmp + rename、磁盘格式 V1→V2 信封向后兼容、真"最旧"淘汰；B6 Debug 手写脱敏 + host/username/domain 上限；cert_key 大小写归一；mock 桩对齐（challengeId 一次性 + 120s fail-closed + 序号全局单调防 walkthrough 假死），余偏差头注释登记。
+- **全量终值**：backend cargo **883** / clippy 0 / fmt 0；frontend vitest **1019** / vue-tsc 0 / build 过（ui/ 重生成）。
+- **RDP 链状态：正式收官**。遗留人工门：真机 RDP server 联调、WKWebView 位图光标走查、CBT 端到端核对、C1 完全修复（属 vendored fork plan 升级工作流）。
+
+
+## M13 收口（2026-09-25，对标差距批次三线并发）
+
+- **认证 Auto 模式 ✅**（parity-np13-auth-auto-np13 三 commits，merge 5eda9804）：`AuthenticationMethod::Auto` + `authenticate_auto` 纯编排器（密码→私钥→KI 含 TOTP→agent 固定顺序，AUTO_AUTH_ORDER 契约常量 + debug_assert 不变式）；逐阶段复用既有 helper（Quick Sudo OTP/挑战流零改动），私钥/agent partial-success 走既有 MFA KI 续答不重复提问；逐跳过/失败发 `ssh/auth/auto` 事件入连接日志，全失败按序汇总原因。frontend：表单 Auto 选项 + 七语 + 卡片日志渲染；存量连接零迁移。
+- **Quick Commands 导入 ✅**（parity-np13-quickcmds-proc-np13 99a27e48，merge 4f8f0091）：JSON 数组 + Tabby snippets 格式映射；同名跳过去重 + 上限 20 导入前 N 条策略；解析纯函数 9 单测 + 导入子视图（文件/粘贴 → 预览 → 确认逐条 save）。
+- **进程管理维度 ✅**（同 commit）：`ssh/processes/list` 加 fdCount（/proc/<pid>/fd 纯内建计数，零 spawn）与 listenPorts（/proc/net/tcp{,6} 监听态 inode 关联，去重升序 ≤16）；`ss -tlnp` 降级有意省略（无 root 同样拿不到 pid 归属，注释写明）；前端两列可排序 + 七语；mock 补 processes/kill。
+- **对标文档同步 ✅**（parity-np13-docs-sync-np13 383967c0，merge fa0abe59）：COMPARISON 矩阵 RDP 行改"内置（vendored 链，真机联调人工门）"+ 新增 5 行能力 + Telnet/串口行补注；FEATURE_PARITY 候选缺口表核实（会话导入实为 7 格式，纠正任务卡 8 的笔误）；PROTOCOL 补 RDP 三处契约（E5 4096/C2 分片/D3 预算）。
+- **⚠️ manifest 解释偏差（待 integrator 复核）**：A 线按 agent-flow ownership（frontend 拥有 manifest.json）增量修改 manifest——① 认证 select 加 Auto 选项+七语 description；② 6 个凭据字段 visible_when.one_of 追加 "auto"（否则选中 Auto 后凭据字段级联隐藏）；③ password 七语 hint 弱化"必填"表述。**逐行复核通过**：无版本号/permissions/贡献点/其他字段改动。已知限制：required_when 单字段表达力下 Auto+password_source=direct 仍强制填密码（密钥-only 用户暂用显式方式），登记遗留。
+- **全量终值**：backend cargo **894**（887+7）/ clippy 0 / fmt 0；frontend vitest **1031**（102 文件，1029+2）/ vue-tsc 0 / build 过（ui/ 重生成）；connection-forms verify 598 组合 PASS。
+
+### M13 遗留
+
+1. Auto+direct 密码必填（manifest required_when 表达力限制）——未来可评估条件化 required_when 或 options_action 动态选项。
+2. `ssh/auth/auto` 事件无 sessionId 过滤（连接期无 session，与 host-key/notice 同策略）；connection/test 也触发该事件。
+3. mockDbxHost 未模拟 Auto 场景（纯展示层 spec 已覆盖）；COMPARISON.en.md 未同步（需双语一致可另开小轮）。
+4. 候选缺口表消化后剩余：录制增强（transcript/自动录制/搜索）、SFTP 管线（深度/兼容模式/文件名编码）、DownloadSudo、多文件 watcher、BiDi（观察）、云同步降维（待安全评审）。
+
+
+## M14 收口（2026-09-25，对标差距批次二：录制/SFTP 管线/DownloadSudo 三线并发）
+
+- **录制增强 ✅**（parity-np14-record-enh 754589e7，merge 92d1f7bd）：Transcript 导出（**前端纯函数选型**——回放链已分页拉到前端，零新协议面；ANSI/OSC 剥离+CR 丢弃+可选时间戳，保留终端换行布局）；auto_record 自动录制（严格镜像 x11_forwarding 先例：偏好白名单+进程内快速标志+open_session 挂钩，与手动录制互斥，ssh/recording/auto 事件一次性提示）；录制搜索（后端即时扫描 ≤200 会话、每录制 5 条命中摘录，不建持久索引）。
+- **SFTP 传输管线 ✅**（parity-np14-sftp-pipeline 12e729cb，merge b676a8c9）：并发深度可配 transfer_max_active 1-8（sidecar 权威，进行中任务按旧深度完成）；sftp_compat_mode 兼容模式（new_with_config 1/1 禁流水线+深度强制 1；本插件从不发起 extended 请求已核实）；非 UTF-8 文件名——**agent 发现 russh-sftp 反序列化层 from_utf8_lossy 拿不到原始字节，新增 584 行裸包 SFTPv3 客户端**（INIT/OPENDIR/READDIR/STAT/OPEN/READ），latin-1 模式显示=latin1 解码、传输=%XX 转义 wire 形式、下载自动还原原始字节；硬分离（显示解码绝不回灌传输）纯函数+往返单测落地。
+- **DownloadSudo ✅**（parity-np14-download-sudo c4390870，merge 本轮）：`sudo/download/start|cancel`——远端临时文件方案（同目录 mktemp → **chown 登录uid + chmod 600**（修正任务卡 0600 设计错误：root 属主下登录用户读不了）→ 复用既有 sftp/download/next/finish/progress 与传输面板全链 → finally sudo rm 清理含会话关闭/取消/出错）；sudo dd 流式否决（无二进制边界/无续传/需另建管线）；路径校验复用 sudo 族先例；右键"以 root 下载"（只读门禁一致）；smoke_fs_test.py 增 sudo/download 用例。**P0 核心清单 Sudo 文件操作族至此全量补齐。**
+- **集成修复**：B 合入时 localPrefsState 两声明重复（拼接缺陷）合并为单一 8 键声明；C 合入零冲突；**集成线复审发现 escape_wire/unescape_wire 往返不对称**（文件名含字面 `%XX` 时 escape 直通、unescape 误解——latin-1 模式下路径被改），修 `%`→`%25` 自转义 + 往返闭环单测（cargo 925 不变，sftp_name 模块 12 用例含往返）。
+- **全量终值**：backend cargo **925**（894+31）/ clippy 0 / fmt 0；frontend vitest **1047**（104 文件，1031+16）/ vue-tsc 0 / build 过（ui/ 重生成）。
+
+### M14 遗留
+
+1. 非 UTF-8 名字的 rename/delete/树下载仍走高层客户端（按字面量发送）；完整字节保真需全路径操作迁 raw 层（超范围登记）。
+2. 兼容模式"禁用扩展"落地为"不发起 extended + 禁流水线"；crate 内 fsync-on-flush 仅服务器自报扩展时触发，无法外部关闭。
+3. DownloadSudo 暂存 cat 为阻塞 exec（5-300s 超时夹取，约 16GiB 需 >55MB/s 磁盘）；远端需与源等量临时空间；sudo/download 与无残留清理的真机 smoke 待集成线跑 smoke_fs_test.py。
+4. raw SFTPv3 客户端 async 通道交互需真机回环（沿 smoke 惯例）。
+
+
+## M15 收口（2026-09-25，遗留消化批次：多文件 watcher / SFTP raw 路径保真 两线并发）
+
+- **多文件并行 watcher 编辑 ✅**（parity-np15-watcher-multi 8927fe4/95ad9ee，merge 9d8007d）：侦察发现后端本就按 watchId HashMap + `{sessionId}:{canonicalLocalPath}` dedup 支持并行，瓶颈纯在前端（单 ref 顶替）——**零协议改动**选型：前端并发打开（移除全局 externalEditBusy 门禁）+ `lib/watchEdits.ts` WatchRegistry（watchId→条目，同远端路径按 remotePath 粒度顶替旧条目与 sidecar dedup 收敛一致）；file-modified 三选确认改 `watchModifiedQueue` 队列（未知 watchId 丢弃、同文件未决去重、队头决议出队、过期决议拒绝），多文件同时 modified 排队逐个弹确认不互顶不丢事件；watch/upload 回传前端 promise 串行链逐个执行；回传暂存隔离补 64 并发不重名单测（`.dbx-part-<uuid>` 本就按调用唯一）。
+- **SFTP 非 UTF-8 路径操作 raw 层迁移 ✅**（parity-np15-sftp-raw 0d3b1b2/864f6f0，merge 7205099）：raw 客户端补 FXP_LSTAT/REMOVE/MKDIR/RMDIR/RENAME wire op（错误映射沿既有惯例）；选型**仅 latin-1 切 raw，auto 完全不动**（回归风险最小），判定点在 main.rs handler（与 sftp/list 读偏好模式一致）；回退策略——仅裸包客户端建立失败时回退高层（未发出任何请求，安全），操作发出后失败原样报错不回退（写操作回退可能重复执行）；rename 目标/mkdir 名经 `write_path_bytes`（目录前缀按 %XX 还原 wire 形式 + 最后一段用户新输入显示编码回字节，字面 %XX 不二次转义）；latin-1 树下载遍历走 raw（`scan_tree_with_raw` 单通道 LSTAT 预检 + READDIR 递归，LSTAT 判型 REMOVE/RMDIR/后序递归树删，symlink 绝不跟随）。显示解码绝不回灌传输路径契约不受影响。PROTOCOL 同步 sftp/list 节 M15-B 段 + 递归目录下载节。
+- **候选缺口表清理 ✅**：M13/M14/M15 已交付项从「候选缺口（未排期）」表移除；**云同步经决策除名——DBX 宿主基础能力已提供配置同步/上传，插件侧不再立项**（含口令加密导出导入降维方案）。剩余候选：每连接编码选择、终端 BiDi（观察）。
+- **基线口径注记**：cargo 用例数存在平台差异——M14 记录 925 为 macOS 实测，Windows 实测基线 d023963 为 920（A 线 agent 以基线 commit `--list` 复核、集成线 worktree 全量复测一致）。本轮"只增不减"以同平台 Windows 口径执行：合并后 **929**（920+9）。
+- **全量终值（Windows 实测）**：backend cargo **929/929**（win 基线 920+9）/ clippy 0 / fmt 0；frontend vitest **1057/1057**（105 文件，1047+10）/ vue-tsc 0 / build 过（ui/ 重生成单独 commit 0baa803）。两 merge 零冲突。
+
+### M15 遗留
+
+1. latin-1 模式 `sftp/exists` 覆盖预检、`sftp/rename-unique` 撞名探测仍按字面量发送（预检失败不阻断，已知边界）。
+2. 上传（sftp/upload/*、write、touch、symlink 三命令）新输入名仍按字面量发送；MCP 工具面 sftp_mkdir/remove/rename（mcp.rs 独立客户端）未迁移 raw 层。
+3. raw 客户端每操作独开 sftp 子系统通道（写操作低频，未做复用）；SFTPv3 RENAME 不覆盖已存在目标（与 auto 模式高层语义一致）。
+4. 多文件 watcher：外部编辑器全链路真机手测、FSEvents/inotify 真机联调（沿 M3 既有人工门）。
+
+
+## M16 收口（2026-09-25，候选缺口消化批次：SFTP 编码保真收尾 / 每连接编码选择 两线并发）
+
+- **SFTP 编码保真收尾 ✅**（parity-np16-sftp-enc-finish 80dad21，merge 0102267）：raw 客户端补齐写侧——OPEN(creat|write|trunc)/WRITE（32KiB 分块）/SETSTAT/READLINK/SYMLINK（OpenSSH wire 次序，与高层 symlink(target,linkPath) 生产语义一致）+ RawAttrs atime/encode_attrs 闭环；exists/rename_unique 迁 raw（LSTAT 探测，候选名 latin1_encode_display 编码逐候选探测、name 返回保持显示形式）；touch/write_file/write_bytes/symlink 三命令/upload_watched_file 迁 raw（暂存 ASCII 临时文件 → SETSTAT 0o7777 权限保留 → 原子 rename → 失败清理，对齐高层 issue #37 语义）；finish_upload 增 latin-1 raw 暂存分支（取消检查/进度事件与高层管线逐块对齐）。**路径来源两分工**：wire 目录前缀 + 用户新输入显示末段（write_path_bytes）＝touch/symlink-create/exists/rename-unique/upload start|finish；整条 wire 路径（unescape_wire）＝sftp/write（previewPath）/upload-local/symlink-update 链接路径/rename 源/delete。回退沿 M15 先例。
+- **每连接编码选择 ✅**（parity-np16-conn-encoding 3aeabb9，merge 76a619f）：对标候选表最后一项非观察项。侦察修正先例——auto_record 实为全局偏好链，真正的连接级先例是 M7 `startup_commands`（preferences 单键按 connectionId 分桶）；新键 `sftp_name_encoding_overrides`（sanitize 桶上限 512/白名单外静默丢弃）+ `resolve_sftp_name_encoding` 三态纯函数（连接覆盖 > 全局 > 缺省 auto）；5 个判定点切连接级；前端连接设置区控件 + connNameEncoding 七语 + mock 镜像。vitest 抓住并修复 merge 上限检查误用 `out.length` 的真实 bug。
+- **集成线统一 ✅**（6bbbc2d）：两线在 main.rs 编码判定点各有落点，融合期把 A 线按现状读全局的调用点全部统一到 B 线连接级判定（新增 `resolve_sftp_encoding_opt`；watch/upload 经 `watcher.session_for_watch`、sftp/upload/finish 经 `ssh.upload_session_id` 两个最小访问器取回所属会话）；`preferences::sftp_name_encoding` 无二进制调用者后删除（测试改走 `sftp_name_encoding_for(dir, None)`），死代码标注清零。
+- **COMPARISON.en.md 双语同步 ✅**（M13 遗留 3 消化）：M13 同步轮的 5 新行/RDP·Telnet·串口行更新/协议路线注记/Tabby 定位差异/如何选择各节镜像到英文版，双语结构对齐。
+- **全量终值（Windows 实测）**：backend cargo **937/937**（M15 后基线 929：A 线 +6、B 线 +2）/ clippy 0 / fmt 0；frontend vitest **1061/1061**（106 文件，1057+4）/ vue-tsc 0 / build 过（ui/ 重生成单独 commit 3af0d43）。两 merge 零冲突。
+
+### M16 遗留
+
+1. 粘贴预检（exists 的 paste 调用方，整条 wire 名）与底层 sftp/copy、sftp/move 在 latin-1 下仍未迁移。
+2. 终端拖入上传的手输/shell cwd 目标目录非 ASCII 路径无法还原 latin-1 字节。
+3. MCP 工具面 sftp_mkdir/remove/rename 字面量发送——需 MCP 面自身编码模式 + 列表层迁移的后续设计（单点迁移为零收益半迁移，已核实）。
+4. 候选缺口表仅剩：每连接编码选择本口消化完毕后为空（BiDi 为观察项不列），对标缺口表至此后备候选为零。
+
+
+## M17 收口（2026-09-25，工程面收官批次：latin-1 最后收尾 / MCP 工具面编码 两线并发）
+
+- **latin-1 最后收尾 ✅**（parity-np17-enc-last 1c1de5f，merge 054e23d）：粘贴预检走 `sftp/exists` 新增可选 `form:"wire"`（整条 wire 还原，缺省仍为 wire 前缀+显示末段分工）；`sftp/copy`/`sftp/move` 覆盖预检改逐个裸包 LSTAT、同目录 move 快路径改裸包 RENAME（撞名/跨设备回落 shell mv 语义不变）；拖入上传落点（手输/shell cwd 回读）经前端 `displayPathToWire`（与 sidecar `latin1_encode_display`+`escape_wire` 逐字符等价含 % 自转义）转 wire 后命中 write_path_bytes 分工；查漏补缺 `sftp/stat`/`sftp/chmod` 迁 raw（LSTAT/SETSTAT，属主列 shell 查询尽力而为）。**登记边界**：远端 exec 层（cp -a/mv -f/df/tar/sudo 族）命令串为 UTF-8 String，字节不可控——执行层不强迁，clean 名行为不变、转义名由远端报错；shell cwd 回读的非 UTF-8 字节在终端解码层已丢失（U+FFFD）不可恢复。
+- **MCP 工具面编码 ✅**（parity-np17-mcp-enc 7424193，merge bf81cee）：复用连接级判定（`arguments.connectionId` → `sftp_name_encoding_overrides` > 全局 > auto，内联拨号按未覆盖），不引入工具面编码参数；`sftp_list_dir` 走裸包 READDIR，**名字口径为显示形式**——latin-1 解码输出恒在 U+0000..=U+00FF 域，`latin1_encode_display` 是精确逆变换，AI 把返回 path 原样回传 mkdir/remove/rename 即落回原始字节（往返闭环单测）；写工具整条按显示编码还原字节后走裸包（remove 判型分派/symlink 不跟随/递归复用 raw_delete_tree）；回退与工作台一致；auto 模式四工具行为不变。
+- **集成冲突融合**：ssh.rs（classify_raw_kind 可见性双侧同改）取带说明注释侧；PROTOCOL 双方 M17 段全部保留、遗留项融合为单一状态（①②③ 均已消化，MCP 其余工具登记沿同一模式补齐）。
+- **过程记录**：A 线 agent 前两实例死于基础设施错误（Captcha instance timed out，非任务失败），第三次拉起成功——未触发"3 周期失败转人工"线。
+- **全量终值（Windows 实测）**：backend cargo **940/940**（M16 后基线 937：A 线 +1、B 线 +2）/ clippy 0 / fmt 0；frontend vitest **1064/1064**（106 文件，1061+3：displayPathToWire 3）/ vue-tsc 0 / build 过（ui/ 重生成单独 commit）。
+
+### M17 遗留
+
+1. MCP 面其余工具（sftp_read_file/write_file/stat/exists/chmod/copy/move）latin-1 下按字面量发送——非 ASCII 名探不到目标（报错而非误操作），沿 M17-B 同一模式可补齐。
+2. shell 执行层字节边界（copy/move 跨目录执行、df/tar/sudo 族）与 shell cwd 非 UTF-8 回读丢失——设计边界，已登记 PROTOCOL。
+3. **非观察工程 backlog 至此清零**。剩余：终端 BiDi（观察项，未立项）；真机人工门（latin-1 全链真机联调、多文件 watcher 外部编辑全链路、RDP/sudo smoke 等沿既有登记）。
+
+
+## M18 收口（2026-09-25，欠账清理批次：MCP 剩余工具 / smoke 与 mock 补齐 两线并发）
+
+- **MCP 工具面剩余工具 latin-1 迁移 ✅**（parity-np18-mcp-rest 23b19ba，merge 本轮）：沿 M17-B 同一模式补齐读侧 sftp_stat（裸包 LSTAT，uid/gid shell 查询尽力而为、字节边界失败回 null）/sftp_exists（**只认 SSH_FX_NO_SUCH_FILE 为不存在**，保留"权限错误绝不误报 exists:false"契约）/sftp_read_file（OPEN+READ 32KiB 分块，maxBytes 截断+offset 分页沿既有边界，读失败回退高层）；写侧 sftp_write_file（**直写** OPEN CREAT|WRITE|TRUNC——暂存是工作台上传族需求，MCP 沿既有直写语义）+sftp_chmod（SETSTAT）；sftp_copy/sftp_move 执行层确认远端 shell cp/mv、命令串字节不可控→**执行层不迁**（M17-A 边界保留），裸包车道迁移覆盖预检 + 同目录 move 的 RENAME 快路径（与工作台 M17-A 模式同构）。sftp_raw.rs 收编 M18-A 坠毁实例的留学生改动（read_file(offset,cap)/error_status 桩复用模块）并修复其测试两处小漏。PROTOCOL 遗留③销项 + MCP.zh-CN.md 工具表同步。
+- **smoke 用例补齐 ✅**（parity-np18-smoke-m13fix 8753ab7，merge 本轮）：smoke_fs_test.py 补 9 用例（+252 行，Report.run + SKIP 机制 + needs 链式门控，幂等自清理 + 偏好快照还原）——latin-1 编码族真容器 6 链路（偏好写读→0xE9 字节名落盘→list 解码忠实→write/read 往返→exists 双形态+交叉反例→树下载逐字节→raw RENAME 收口）、每连接编码覆盖生效/回退 2、管线偏好钳制 1、MCP 面经 embedded 桥 mcp/call 往返 1（无需第二进程）。M14-M17"单测+smoke+对标"三件套欠账至此补清。
+- **mockDbxHost Auto 场景 ✅**（同线 d2c74ce，M13 遗留 3 消化）：`?auth=auto|autofail` URL 参数驱动（与 ?err=* 先例同构）——AUTO_AUTH_ORDER 逐方式进度事件（形状镜像 authenticate_auto emitter，成功方式不发事件对齐真实）、全败聚合错误串、缺省零事件；3 条 vitest spec。
+- **过程记录**：A 线首实例死于基础设施错误（Captcha timeout，第 3 次出现），遗留学生改动由重拉实例审用收编（含 2 处测试修复）——未触发转人工线。
+- **全量终值（Windows 实测）**：backend cargo **950/950**（M17 后基线 940+10）/ clippy 0 / fmt 0；frontend vitest **1067/1067**（106 文件，1064+3）/ vue-tsc 0 / build 过（B 线前端改动为 mock/spec 不进产物包，ui/ 无变化）；两 merge 零冲突。
+
+### M18 遗留
+
+1. copy/move 执行层字节闭环需 exec 命令串支持非 UTF-8 字节参数（设计边界，已登记）；sftp_stat latin-1 下 uid/gid 对非 ASCII 名为 null（与工作台一致）。
+2. smoke latin-1 组未覆盖 sftp/symlink-* 的 latin-1 路径（同族可按需补）；smoke_mcp.py stdio 面未新增（embedded 路径已覆盖同一工具实现）。
+3. sftp_upload/sftp_download MCP 工具与 sudo 族维持既有策略（不在本批次范围）。
+4. 工程面 backlog 持续为零；真机人工门沿既有登记。
+
+
+## M19 收口（2026-09-25，编码保真家族收尾批次：MCP 传输工具 latin-1 / smoke symlink 补齐）
+
+- **MCP sftp_upload/sftp_download latin-1 迁移 ✅**（parity-np19-mcp-io，M18 遗留 3 消化）：沿 M17-B/M18 同一模式（显示路径整条 `latin1_encode_display` 还原字节 + 连接级裸包客户端）——`sftp_upload` 走裸包 LSTAT 覆盖预检 + OPEN(CREAT|WRITE|TRUNC) 截断直写 + WRITE 32 KiB 分块（**选型**：沿既有 MCP 传输直写语义，无工作台上传族 `.dbx-part` 暂存需求；复用 M18 `sftp_write_file` 直写核心抽出的 `raw_sftp_write_bytes`，按工具各自响应形状组装）；`sftp_download` 走裸包 OPEN(READ)+READ 分块（`maxDownloadBytes+1` 探测封顶，超限沿 post-read 口径报错；目录 OPEN 被拒后落回高层给 auto 同款「is a directory」错误）。回退沿先例：download 读侧裸包任何失败回退高层重读、upload 写侧仅裸包建立失败回退；auto 模式行为不变（本地校验/传输根/敏感路径/大小上限均先于拨号不受影响）。单测 3 条（duplex 桩字节级）：upload 帧序+路径字节+载荷落帧、upload↔download 同显示路径 OPEN 帧字节一致 + 载荷逐字节回收（往返闭环）。PROTOCOL M19 节 + MCP.zh-CN.md 工具表同步。
+- **smoke latin-1 组补符号链接三命令 ✅**（同线，M18 遗留 2 消化）：smoke_fs_test.py latin-1 组新增 `latin-1 symlink create/read/update round-trip` 用例（needs 链插在 raw rename 与每连接覆盖之间）——`sftp/symlink-create` 0xE9 字节链接名落盘 + 列表 kind=symlink、`sftp/symlink-read` 整条 wire 路径读指向、`sftp/symlink-update` 显示形式新指向再编码回字节后 read 回环验证（latin-1 域内读↔写精确闭环）；链接/锚点 finally 自清理，交还空目录给每连接覆盖组（沿用快照/自清理/needs 门控结构）。
+- **遗留销项**：M18 遗留 2、3 销项；遗留 1（exec 命令串字节参数）维持设计边界登记。sudo 族维持既有策略（非编码家族范围）。
+
+
+## M19 集成收口补记（2026-09-25，raw early-eof 根因修复 + 编码家族收官）
+
+- **raw "early eof" 根因修复 ✅**（parity-fix-raw-eof 1b19a01，merge 本轮）：M18 CI ssh-smoke 真容器首次覆盖裸包客户端即爆雷（71 过/2 挂，`SFTP raw read failed: early eof`）——根因为 **`RawSftp::mkdir` 的 SSH_FXP_MKDIR 帧漏发规范强制的 ATTRS 字段**（draft-ietf-secsh-filexfer-02 §5.2），OpenSSH sftp-server `decode_attrib` 解析失败即 fatal 退出 → 通道 EOF；两失败用例的第一个 raw 操作都是 MKDIR，且 mkdir 回退仅在"裸包客户端建立失败"时触发、INIT 成功后操作错误原样上抛，故直穿到 smoke。修复：`build_mkdir` 携带 flags=0 空 attrs（OpenSSH 按 0777 & umask 建目录，与高层缺省一致）；既有宽松内存桩升级为**严格一致性桩**（draft-02 逐类型精确校验帧布局、违规 hexdump panic）+ `openssh_fatal_server` 负路径桩离线逐字复现 CI 错误串（`attrless_mkdir_reproduces_ci_early_eof_against_openssh_fatal_stub`）。russh 0.62.7 通道层排除（rx EOF 语义/自动扩窗核对）。
+- **MCP 传输工具收官 ✅**（parity-np19-mcp-io 61b6e94，merge 本轮）：sftp_upload（裸包直写车道：LSTAT 预检 + OPEN CREAT|WRITE|TRUNC + WRITE 32KiB 分块）、sftp_download（裸包 OPEN+READ 分块，maxDownloadBytes+1 探测封顶；目录探测由高层给出一致错误）——latin-1 编码保真家族从列表/属性/单文件写/上传族/树到 MCP 工具面全链闭环。smoke latin-1 组补 symlink 三命令 0xE9 字节用例。
+- **过程记录**：M19 线与修复 agent 各遭基础设施中断一次（captcha），分别以"审用半成品重拉"与"保留上下文续跑"恢复，均未触发转人工线。
+- **全量终值（Windows 实测）**：backend cargo **957/957**（940+4 修复 +3 M19）/ clippy 0 / fmt 0；前端零改动沿 ecbc305 口径 vitest 1067 / vue-tsc 0 / build 过；两 merge 零冲突。
+- **CI 复验预期**：ssh-smoke 全组 96 PASS / 0 FAIL 方向（M18 失败的 2 用例 + 连锁 SKIP 5 例恢复）。
+
+## M19.5 真机复验轮（2026-09-25，Mac 容器实测：MKDIR 修复后连剥三层 wire 缺口至全绿）
+
+- **CI 复验揭出修复只到第一层**：run 36155020114（含 1b19a015 MKDIR ATTRS 修复）ssh-smoke 仍红（3m10s），与 Mac 本地容器（同 linuxserver/openssh-server 镜像）复现完全一致（71 过/5 SKIP/2 挂，FAIL 仍报 `SFTP raw read failed: early eof`）——MKDIR ATTRS 是必要非充分。
+- **诊断方法**：独立探针进程（russh 直连容器手搓 wire 帧）与 sidecar 临时 `[raw-trace]` 帧级日志对剖——探针侧 INIT/MKDIR(带 ATTRS)/LSTAT/OPENDIR 全部正常，把挂点逼进 sidecar 独有的帧内容；trace 显示 raw list 的第三笔请求 `type=16`，实锤第四层。连剥三层：
+  1. **`FXP_READDIR` 常量错值 16（=REALPATH，规范值 12）**：raw 列表的 READDIR 实际发出 REALPATH 帧（4 字节 handle 被当路径且含 NUL）→ OpenSSH sftp-server fatal → 通道 EOF。离线桩测不出的根因是**自洽盲区**——`validate_request` 严格校验器用同一错误常量对照。修复：常量 12 + 新增 `request_type_codes_match_draft02_literals` 把全部 23 个类型码对 draft-02 **字面值**逐一对表（读帧字节而非读常量）。
+  2. **`sftp/read` 缺 latin-1 车道**：M16 编码家族唯一漏网（wire 路径直入高层客户端按 UTF-8 open → NO_SUCH_FILE）。修复：分发层按 `resolve_sftp_encoding` 分支，Latin1 走 `raw_read_chunk`（download 分片同款整条 wire 还原 + 裸包 READ；多读 1 字节对齐高层 `truncated` 语义）。
+  3. **树下载逐文件读取无 raw 车道**：扫描是 raw READDIR 字节保真（files 的 remote_path 为 wire 形式），但分块读取高层 open → NO_SUCH_FILE 记 failure 跳过 → 本地缺文件（只剩空目录骨架）。修复：`TreeDownloadState.latin1` 标记，latin-1 下逐文件分块走 `raw_read_chunk`，实现与本节 PROTOCOL「分块下载按转义自动走 raw READ」的既有声明对齐。
+- **Mac 真机终值**：smoke_fs_test **79 PASS / 0 SKIP / 0 FAIL**（71/5/2 → 全组恢复，含 M18 两条失败用例与 np19 symlink 用例）；全量 cargo **963/963**（win 957 + 字面值对表 1，mac 口径 963）/ clippy 0 / fmt 0 / vitest 1067 / vue-tsc 0 / build 过（ui/ 无变化还原）。
+- **过程记录**：接力会话接手时交接的 Windows 修复线（E:\...np19-fix-raw-eof）已在远端完成收口（0c1b3dad docs(m19)）；Mac 侧重建 worktree 后先复验揭出上述三层，全部改动在本轮一并落地（codex/ssh/parity-fix-raw-eof 分支续用）。
+
+## M20 批次（2026-09-26，watcher 外部编辑真容器链路收口：smoke +3 至 82/82 全绿）
+
+- **批次来源**：M19.5 后工程 backlog 清零（交接口径），从"真机人工门"清单里挑可自动化部分立项——「多文件 watcher 外部编辑全链路」此前只有前端 watchEdits 单测与 file_watch 单测，smoke 层零覆盖。
+- **新增**：smoke_fs_test.py watcher external-edit 组 3 用例——双文件并发注册（watchId 互异）、外部保存按 watchId 精确路由 + upload-back 远端字节校验 + 同内容重复保存 sha256 去重、stop 精确移除 + stop-all 全清。localPath 沿工作台 `openInExternalEditor` 同一分工（`sftp/download/start` 带 `downloadDir=<下载目录>/remote-edit/<stamp>/`），落在 `validate_remote_edit_path` 白名单域内。
+- **用例开发中顺带确认的行为点**（非缺陷，均已登记进用例注释）：pump 有 SUPPRESS_WINDOW=2s 启动抑制窗（编辑器预热噪音丢弃），外部编辑用例须先越过；持久档 `sftp_name_encoding` 历史残留会让 auto 语义用例误走 latin-1 裸包分支，watcher 组进组显式归位 auto 自洽。
+- **Mac 真机终值**：smoke_fs_test **82 PASS / 0 SKIP / 0 FAIL**；backend 代码零改动，cargo 963 / clippy 0 / fmt 0 沿 M19.5。
+
+## M21 批次（2026-09-26，latin-1 watcher 回写收口 + 第五层 wire 缺口修复）
+
+- **批次来源**：M20 的真机门清单明确承认「latin-1 连接下的 watcher 回写」只有单测覆盖——本轮补真容器全链：wire 路径注册 → 外部保存事件 → `watch/upload` 裸包回写 → `sftp/read` wire 车道字节校验（smoke 83/0/0）。
+- **第五层 wire 缺口修复**：`sftp/download/start` 转义路径的 size 探测发 raw LSTAT 时漏 `unescape_wire`（字面 `%XX` 字节当路径，start 即 NO_SUCH_FILE）——M21 用例真机曝露。修复一行探测调用 + 注释；与下载分片（`raw_read_chunk`）、树扫描（`scan_tree_with_raw`）的既有还原口径拉齐。该缺口此前不可见：wire 单文件下载此前无真容器用例，树下载 size 走扫描不经探测点。
+- **Mac 真机终值**：smoke_fs_test **83 PASS / 0 SKIP / 0 FAIL**；cargo 963 / clippy 0 / fmt 0。
+
+## M22-A 批次（2026-09-26，MCP stdio 在线段纳入 CI ssh-smoke：真容器 tools/call 全链进流水线）
+
+- **动机**：M17-M19 的 MCP 工具面改动（参数校验、编码家族、quick sudo 等）此前只有两条覆盖通道——其它 CI job 的离线 stdio 段（无真服务器），与本机 workbench 面的真容器联调；CI 里"独立 stdio 进程 × 真容器"的组合（`ssh_test_connection` browse-first、SFTP 全家族、run_bg/task_status、metrics、上传下载字节回环、live enum/pipelining 尾段）零覆盖。
+- **改动**：`.github/workflows/ci.yml` ssh-smoke job 在既有两条 smoke 命令后追加 `scripts/smoke_mcp.py` 在线段（`--host 127.0.0.1 --port 2222 --username sshuser`，复用 job 内一次性测试容器凭据；密码经步骤 env `DBX_SSH_SMOKE_PASSWORD` 注入而非命令行参数，避免 ps 泄露）。脚本本身零改动。
+- **验证**：YAML 解析通过（PyYAML 本机缺失，用系统 ruby YAML 全文解析 OK）；Mac 本机真容器（dbx-ssh-test:2222）以 debug sidecar 跑通 `smoke_mcp.py --binary <debug> --host 127.0.0.1` 全绿——`live round-trip ok (test/browse/exec/background/family/metrics/transfer)`、`live pipelining ok`、`MCP smoke: all green`，exit 0。
+
+## M22 收口巡检补记（2026-09-26）
+
+- **M20/M21 smoke 批次 CI 复验全绿**：run 36168745204 success（SSH container smoke 2m46s，watcher 组在 CI 真容器通过，PR #98 同代码 push CI 36168736222 同绿）。此前 36165580277 / 36166909296 的失败（watch/start 报 "File watching is only available on desktop"）根因为 headless runner 的 `can_save_local` 探测误判，`DBX_SSH_LOCAL_SAVE=1`（3ba0e574，smoke 与 DBX_SSH_DOWNLOAD_DIR 同点注入）覆盖修复。
+- **M22-A**（parity-np22-ci-mcp-smoke c0581681）：ssh-smoke job 追加 smoke_mcp.py 在线段（MCP stdio 独立进程真容器全链；密码走步骤 env DBX_SSH_SMOKE_PASSWORD 注入）——M17-M19 的 MCP 工具面由此获得独立 stdio 进程口径的 CI 覆盖。
+- **M22-B**（parity-np22-protocol-audit e168c41f）：协议-实现对账审计（报告 docs/AUDIT-PROTOCOL-IMPL.zh-CN.md）——12 条差异修文档 8 处（watch/* 族补协议专节、递归下载 latin-1 段批次标注、FEATURE_PARITY 方法数重清点 68→182 等）；实现层仅登记 4 条待人工确认，最重要 R1：工作台与 MCP 两个 sftp/exists 面对 LSTAT 错误的语义不一致（M18「权限错误绝不误报 false」契约只覆盖 MCP 面）。
+- **M22 合并后 CI 全绿**：run 36174063661 success（31m49s，SSH container smoke 3m23s 含 MCP stdio 在线段首跑）。至此 M19.5→M22 全批次 CI 口径收口；可自动化 backlog 清零，剩余 R1（exists 双面语义拉齐，实现变更）等审计登记项待人工决策。
+
+## M24 批次（2026-09-26，审计登记簿 R3 拉齐收口：raw_read_chunk 补 normalize）
+
+- **来源**：M22-B 审计登记簿唯一剩余项 R3（M23 批已处置 R1/R2/R4）——`raw_read_chunk` 不经 `normalize_remote_path`，latin-1 车道缺 auto 车道的组件归一（绝对化 + 去 `.`/`..`/空段）。复核修正审计原文：normalize 不做 `~` 展开，差异仅为组件归一。
+- **修复**：`raw_read_chunk` 在 unescape 前对 wire 字符串跑同一 `normalize_remote_path`（转义名还原出字面 `..` 的文件名不受影响——归一只作用于还原前的 wire 字符串组件）。三条调用链（sftp/read latin-1 分发、树下载逐文件、单文件下载转义分支）自动收齐。
+- **验证**：cargo **981/981** / clippy 0 / fmt 0；smoke_fs_test **83/0/0**（latin-1 read、树下载、watcher 全链回归）。审计登记簿四项至此全部闭环。
+- **CI 复验全绿**：run 36212498165 success（SSH container smoke 6m32s）。
+
+## M25 批次（2026-09-26，MCP 工具面路径组件归一：latin-1 与 auto 两车道对齐工作台口径）
+
+- **动机**：MCP 是 AI 客户端入口，路径参数来自模型自由文本（可能为 `/a//b/../c`、空串、含 NUL），此前两条编码车道（latin-1 裸包 / auto 高层）都把路径直接送进 SFTP 操作，不经组件归一——与工作台车道（M24 已拉齐：所有入口先 `normalize_remote_path`：绝对化 + 去 `.`/`..`/空段 + 拒空/拒 NUL、不做 `~` 展开）同类缺口且面更宽。
+- **修复范围**（`backend/src/mcp.rs`，每臂拿到路径后立即归一）：`sftp_list_dir` / `sftp_stat` / `sftp_exists` / `sftp_read_file` / `sftp_write_file` / `sftp_mkdir` / `sftp_remove` / `sftp_rename`（sourcePath 与 targetPath 均归一）/ `sftp_chmod` / `sftp_disk_usage`（与工作台 `sftp_disk_usage` 的 df -kP 前归一同口径）/ `sftp_upload`、`sftp_download` 的 remotePath（localPath 不动）。latin-1 臂归一发生在 `latin1_encode_display` 编码还原之前（clean 名字节还原不受影响）；helper（`raw_sftp_exists`/`raw_sftp_read_file`/`raw_sftp_write_file`/`raw_sftp_write_bytes`/`raw_sftp_chmod`）内部不重复归一（调用方已归一），且经 grep 排查无绕过分发臂的调用方。`sftp_copy`/`sftp_move` 的 from/toDir 经 `sftp_copy::parse_request` 内部本已归一，无需改动。
+- **单测**：`tests` 模块新增 3 条 M25 契约用例（归一映射 `/a//b/../c`→`/a/c` 等；拒空串/含 NUL；latin-1 显示域 clean 名归一前后字节还原一致，列表回传路径往返闭环不被破坏）。
+- **验证**：cargo **984/984**（基线 981 + 3）/ clippy 0 / fmt 0；本地容器（dbx-ssh-test）smoke_fs_test **83 PASS / 0 SKIP / 0 FAIL**；smoke_mcp 在线段（--host 127.0.0.1 --port 2222）**all green**。发现记录已登记 docs/AUDIT-PROTOCOL-IMPL.zh-CN.md「后续发现」节。
+
+## M25 收口巡检补记（2026-09-26）
+
+- **M25 合并后 CI 全绿**：run 36217342433 success（15m32s）。M24/M25 两批归一拉齐后，工作台与 MCP 两条车道、auto 与 latin-1 两种编码的远端路径组件归一口径完全一致。
+
+## M26-A 批次（2026-09-26，纯文档审计：latin-1「字面量残留」登记失实表述修正）
+
+- **审计范围**：PROTOCOL.zh-CN.md M17 段末「仍按字面量发送的残留点」登记逐点对照实现核实——工作台 `sftp_disk_usage`（ssh.rs：normalize → shell_quote → `df -kP`）、MCP 面 diskUsage（mcp.rs M25 已同口径归一）、`sftp_ext::archive`/`extract`（`clean_source_paths` 逐个归一 + archivePath/destinationPath 归一 + tar 命令逐参数 `shell_quote`）、sudo 全族（sudo_fs.rs 十一个入口 + sudo_download.rs 的 mktemp/cat/chown 链全部 normalize + `shell_quote`，无裸拼路径）。
+- **修正点**：PROTOCOL 该登记段由失实的「仍按字面量发送、由远端报错」改写为分层表述——路径参数**已 normalize + shell_quote**（穿越/注入安全），但 **shell 参数字节保真不可达**（SSH exec 命令串是 UTF-8 String，latin-1 字节名经该边界按 UTF-8 重编码，远端按 locale 解释，与服务器原始字节不一致）；核实结论为**无完全字面量裸拼的残留入口**，真正不可变的只有 exec 命令串的 UTF-8 字节边界本身（与 copy/move 执行层、`stat -c` 属主查询边界同源）；sudo 族补充「无 wire 名字来源、latin-1 裸包车道不适用」的原状说明。
+- **交叉核对**：FEATURE_PARITY.zh-CN.md grep 字面量/字节不可控/shell 相关行——无同类失实表述（M22-B 审计已对账）；MCP.zh-CN.md 的 copy/move「执行层按字面量发送」表述与实现一致，不改。
+- **验证**：git diff --check 无空白错误；grep 确认修正后 PROTOCOL 不再有「仍按字面量发送的残留点」失实表述。代码零改动（cargo/(smoke) 口径沿 M25：不适用于纯文档批次）。
+
+## M26 收口巡检补记（2026-09-26）
+
+- **M26-A/B 合并后 CI 全绿**：run 36220536854 success（18m50s）。latin-1 字节保真边界矩阵（NAME-ENCODING-BOUNDARY.zh-CN.md，45 入口 38✅/16⚠️/5❌）成为该家族的权威盘点与维护基线；PROTOCOL 失实的「字面量残留点」登记已重写为分层准确口径。
+- **下轮候选（登记簿疑点 D1）**：`sftp/download/start|next` 以 `has_wire_escapes` 判分支，手输字面 `%XX` 文件名会被误按转义还原，与 PROTOCOL「字面 %XX 保持字面量」表述存在张力——属行为语义决策（方案空间：入口区分 wire/显示形态、或明确契约），先核实 wire 域内 `%` 自转义约定再立项。
+
+## M27-A 批次（2026-09-26，纯文档裁决：疑点 D1 定性为契约内正确 + 下载车道 wire 形式契约明示）
+
+- **裁决结论（D1 闭环）**：`sftp/download/start|next` 的 `has_wire_escapes` 判分支（`ssh.rs:6018/6483`）在 latin-1 车道是**契约内正确行为**，非缺陷。证据链：① wire 域 `%` 自转义约定——`escape_wire` 把字面 `%` 编码为 `%25`（`sftp_name.rs:85–99`，单测 `escape_wire_percent_escapes_invalid_bytes`），因此 wire 字符串中出现的 `%XX`（X∈hex）唯一解读就是转义，字面 `%` 在 wire 域内不存在歧义；② 前端三个下载入口（单文件 `App.vue:8451`、外部编辑 `:8215`、目录树 `:8571`）与 sudo 下载 `:8450` 一律传 `pathFromUri(entry.uri)`（`App.vue:10869`），即列表回传的 wire 形式——latin-1 列表 uri 由 `escape_wire` 产出（`ssh.rs:4396–4401`），该入口是排他 wire 契约、无用户自由输入显示文本的链路，「手输字面 `%XX` 文件名」在该入口不可达；③ PROTOCOL M15-B 的「字面 `%XX` 保持字面量」本就限定于写操作末段显示编码（`latin1_encode_display`，`sftp_name.rs:186`），与下载车道的 wire 整条还原是 M16 段两条不同分工，张力为表述缺声明而非真矛盾。
+- **裁决分离出的真实边界（D-7 登记，不动代码）**：单文件下载判分支不区分编码——auto/latin-1 回退列表（`ssh.rs:4310/4305`）uri 由高层 `sftp_uri(&entry.path())` 产出（`ssh.rs:4367`），字面 `%` 未经 `%25` 自转义，含字面 `%XX` 序列的合法 UTF-8 文件名经该列表回传下载会被误还原。影响面小（罕见名形 + 前端无手输下载路径入口），修复涉及 wire 编码空间全局一致性选型，登记于 NAME-ENCODING-BOUNDARY「疑点」节 D-7 供后续批次决策。
+- **文档落地**：PROTOCOL RPC 表 `sftp/download/start|next|finish` 行与 `sftp/download/tree/start` 行补「路径形态契约（M27-A）」声明（latin-1 下载 `remotePath` 必须是列表回传 wire 形式、字面 `%` 在 wire 域编码为 `%25`）；PROTOCOL `sftp/list` 节 M14-B 段补「下载路径形态契约（M27-A 明示）」段并澄清与 M15-B 末段显示编码分工不矛盾；NAME-ENCODING-BOUNDARY 矩阵 `sftp/download/start`/`next` 两行备注改指 D-1 闭环，D-1 条目闭环（含证据链），新增 D-7 登记。
+- **验证**：git diff --check 无空白错误。代码零改动（纯文档批次，cargo/(smoke) 不适用）。
+
+## M27-B 批次（2026-09-26，疑点 D2 收编：shell_quote 单一实现）
+
+- **动机**：M26-B 矩阵疑点 D2 登记了 `exec.rs:1217` 与 `sudo_fs.rs:27` 两份文本等价的 `shell_quote`（POSIX 单引号转义）；收编前核查另发现第三处——`sftp_ext.rs:703` 私有实现（注释自称 "byte-for-byte compatible with exec::shell_quote"），三处均为同一行 `format!("'{}'", x.replace('\'', r"'\''"))`。三处单测口径一致（exec 1 条；sudo_fs 1 条 4 断言含反斜杠外元字符与换行；sftp_ext 1 条 4 断言），行为完全等价。
+- **处置（最小 diff，纯重构零行为变更）**：`exec.rs` 的 `pub fn shell_quote` 保留为唯一规范实现；`sudo_fs.rs` 删除本地 fn，改为 `#[doc(hidden)] pub(crate) use crate::exec::shell_quote;` 再导出——`sudo_download.rs` 的 `use crate::sudo_fs::{shell_quote, sudo_exec}` 与 sudo 族内部全部调用点（约 20 处）签名与路径零改动；`sftp_ext.rs` 删除本地 fn，加 `use crate::exec::shell_quote;`——模块内约 10 处调用零改动。三处原有单测全部原地保留，测的都是收编后同一函数。
+- **验证**：cargo **984/984**（基线保持，只增不减约束满足）/ clippy `-D warnings` 0 / fmt --check 0；本地容器（dbx-ssh-test）smoke_fs_test **83 PASS / 0 SKIP / 0 FAIL**——sudo 族用例真实走过收编后的 `shell_quote` 路径。疑点 D2 在 AUDIT-PROTOCOL-IMPL.zh-CN.md「后续发现」节与 NAME-ENCODING-BOUNDARY.zh-CN.md D-2 条目同步闭环。
+
+## M28-A 批次（2026-09-26，纯文档收口：字节边界矩阵疑点 D-3/D-4/D-5/D-6 全部闭环）
+
+- **范围**：NAME-ENCODING-BOUNDARY.zh-CN.md 矩阵疑点节 D-3/D-4/D-5/D-6 四条（D-1/D-2 已在 M27-A/M27-B 闭环，本批不动）；代码零改动。
+- **D-3（home 探测 lossy 边界登记缺口，已闭环）**：`sftp/home`（`ssh.rs:3505`）与 MCP `sftp_pwd`（`mcp.rs:2473`）走高层 `canonicalize(".")`，家目录名非 UTF-8 时返回串含 U+FFFD、字节已丢。落地：PROTOCOL RPC 表 `sftp/home` 行补「编码边界（登记，M28-A）」——与 `sftp/list` 节 M17 段 shell cwd 回读（PROTOCOL 429 行）同类不可恢复边界呼应；BOUNDARY D-3 条目标「已闭环（M28-A）」。
+- **D-4（「字面量发送」措辞，已闭环）**：核查 PROTOCOL 431 行现状——M26-A 已把「仍按字面量发送的残留点」重写为「路径参数已 normalize + shell_quote；shell 参数字节保真不可达」的分层准确表述，原易误读措辞已不存在，PROTOCOL 无需再改；BOUNDARY D-4 条目标「已闭环（M28-A）」并注明 M26-A 重写后措辞已准确。以现状为准，不制造重复表述。
+- **D-5（upload/start 无 latin-1 分支为有意选型，已闭环）**：`sftp/upload/start` 只写本地 spool（`ssh.rs:5359`）、不发远端请求，字节保真由 `finish_upload`（`ssh.rs:5618`）执行。落地：BOUNDARY 矩阵 `sftp/upload/start` 行备注补「有意选型（M28-A）：只写本地 spool，字节保真在 finish 执行（`ssh.rs:5618`），无 latin-1 分支非缺口」；D-5 条目标「已闭环（M28-A）」。
+- **D-6（MCP sftp_download 目录探测选型，已闭环）**：latin-1 分支不单独裸包 STAT 目录，依赖 OPEN 被服务器拒绝后回退高层报「is a directory」（`mcp.rs:2979–2984`），与 auto 报错语义一致。落地：BOUNDARY 矩阵 MCP `sftp_download` 行备注补「目录探测有意选型（M28-A）：不单独裸包 STAT，依赖 OPEN 被拒回退（`mcp.rs:2979–2984`），与 auto 报错语义一致」；D-6 条目标「已闭环（M28-A）」。
+- **验证**：git diff --check 无空白错误；grep 确认 BOUNDARY 疑点节 D-3..D-6 均带「已闭环（M28-A）」、D-7 保持登记待议不动。代码零改动（纯文档批次，cargo/(smoke) 不适用）。
+
+## M28-B 批次（2026-09-26，疑点 D-7 修复：单文件下载判分支按生效编码区分）
+
+- **动机**：M27-A 裁决 D1（latin-1 下载车道 wire 契约内正确）时分离登记的真实往返缺口 D-7——单文件下载的 `has_wire_escapes` 判分支（原 `ssh.rs:6018` size 探测、原 `ssh.rs:6483` 分块读取）不区分编码：auto/latin-1 回退列表 uri 由高层 `sftp_uri(&entry.path())` 产出（`ssh.rs:4367`），字面 `%` 未经 `%25` 自转义，含字面 `%XX` 十六进制对的合法 UTF-8 文件名回传下载会被误判转义、`unescape_wire` 还原成错误字节路径命中不了远端文件。latin-1 车道不受影响（列表 uri 经 `escape_wire`，字面 `%` 已是 `%25`）。
+- **方案（按生效编码区分车道，最小 diff）**：`main.rs` `sftp/download/start` 分发臂 resolve 编码（`resolve_sftp_encoding`，连接覆盖 > 全局偏好 > 缺省 auto，与 `sftp/download/tree/start` 同先例）传入 `start_download`；`DownloadState` 新增 `latin1: bool` 字段（参照 `TreeDownloadState.latin1` 先例），start 登记、`download_chunk` 从登记表读取；车道判定统一收口为 `sftp_name.rs` 新增纯函数 `has_wire_lane(remote_path, encoding)`——latin-1 维持现状（`has_wire_escapes` → raw 车道，D-1 契约不动），**auto 一律走高层客户端**（auto 车道本就以字面量语义与列表一致：列表回传什么名就按什么名打开，这正是修复目标）。树下载按 `tree.latin1` 判（M21）、sudo 下载走独立车道（sudo_download.rs，`DownloadState.latin1` 仅做字段填充），均不在本修复范围；`normalize_remote_path`/`escape_wire`/`unescape_wire` 语义零改动。
+- **单测回归**：`sftp_name.rs` 新增 `has_wire_lane_branches_on_effective_encoding`——latin-1 转义名走 raw、latin-1 无转义名与 auto 全形态（含字面 `%XX`、字面 `%`、纯 UTF-8）一律高层。
+- **文档落地**：NAME-ENCODING-BOUNDARY 矩阵 `sftp/download/start`/`next` 两行按编码区分口径改写、D-7 条目标「已修（M28-B）」含修复描述与验证数；PROTOCOL RPC 表 `sftp/download/start|next|finish` 行与 `sftp/list` 节各补一句「车道判定按生效编码区分（M28-B）」。
+- **验证**：cargo **985/985**（基线 984 + 1，只增不减）/ clippy `-D warnings` 0 / fmt --check 0 / build 通过；本地容器（dbx-ssh-test）smoke_fs_test **83 PASS / 0 SKIP / 0 FAIL**——smoke 的 latin-1 下载与树下载用例是本修复的直接回归。
+
+## M29 收口补记（2026-09-26）
+
+- **总收口 CI 全绿**：run 36233032323 success（18m11s，11 job 全过，darwin-x64 包候选含 Offline MCP smoke 恢复）。此前 36231728791 的 darwin-x64 挂因为 8 MiB 巨行用例在慢 CI runner 超 60s 性能预算——该用例验证"不 panic 不 hang"而非耗时上限，预算放宽至 120s（68b6b82f，慢 runner 余量、非功能上限）；再前一轮 36228886665 的 darwin-x64 挂因为 GitHub upload-artifact 基础设施超时（与本仓无关）。
+- **字节边界矩阵疑点登记簿 D1-D7 全部闭环**：D1（M27-A 裁决契约内正确）、D2（M27-B shell_quote 三处收编）、D3-D6（M28-A 文档澄清）、D7（M28-B auto 车道按生效编码判分支，985/985 + smoke 83/0/0）。
+- **迭代全景（M19.5→M29 十一轮）**：early eof 五层 wire 缺口修复 → watcher/latin-1 真容器收口（smoke 71/5/2→83/0/0）→ MCP stdio 在线段进 CI → 协议对账审计（R1-R4）→ 归一四象限拉齐（M24/M25）→ 边界矩阵与疑点全闭环（M26-M28）→ CI 预算余量（M29）。cargo 基线 950→985，integration head = 700ac07a。剩余人工门：PR #98 合并、watcher/latin-1 GUI 手测、终端 BiDi（未立项）。
+
 ### 目录跟随开关持久化到全局偏好（纯前端轮，2026-09-26）
 
 用户报告「目录跟随」开关每次打开工作台都要重新设置。定位结论：`followDirectory`
@@ -3490,3 +4031,317 @@ transferable type.`，传输历史全部"已取消"，sidecar 与接口无异常
 分支去掉 `new Uint8Array(...)` 包装、直接 transfer `ArrayBuffer`（与同文件
 `sendBinary`/`saveFile` 分支对齐），并补真实 postMessage 边界的 spec 用例
 （现有 spec 未覆盖该分支，jsdom 无 transfer 校验所以从未拦截）。
+
+## M30-A 批次（2026-09-26，main 未吸收 3 提交并入 integration 线）
+
+- **动机**：`origin/main` 领先 `origin/codex/ssh/nyaterm-parity-integration` 3 个提交
+  （integration 反向领先 342 个 nyaterm parity 提交），用户在 main 上直推的三项
+  修复/增强一直没被 integration 吸收，其中 **#116 是用户报的关键 bug**（SFTP 下载
+  必炸）。本轮在 `codex/ssh/parity-np30-main-sync`（基线 63931060）先做集成验证，
+  由主会话收口 merge 进 integration。
+- **并入的 3 提交**：
+  1. `03ab46c8` fix(sftp)：fileTransfer 落盘改传独立 ArrayBuffer 修复下载必炸
+     （issue #116，宿主桥 transfer 列表只收 ArrayBuffer，Uint8Array 视图被
+     Chromium 拒绝）；
+  2. `9a149c4a` feat(workbench)：目录跟随开关持久化为全局偏好
+     （`ssh-follow-directory`，per-tab 的 workbenchState 仍优先）；
+  3. `f65f48c4` fix(workbench)：面板（底部栏）形态禁用 SFTP 域工具栏图标
+     （含新传输事件不再自动弹出传输面板）。
+- **冲突处理**：`git merge origin/main` 两处冲突，均按语义融合（双方意图都保）——
+  - `frontend/src/App.vue`：两侧各加一行 import（integration 加
+    `pickProtocolSessionForReattach`，main 加 `resolveDirectoryFollow` /
+    `sanitizeDirectoryFollowPref`），取并集；两符号在合并后 body 中均被引用
+    （`pickProtocolSessionForReattach` 于 reattach 路径、`resolveDirectoryFollow` /
+    `sanitizeDirectoryFollowPref` 于 restoreUiState 与偏好读取处），无死 import。
+  - `docs/PROGRESS-P-SSH.zh-CN.md`：两侧均为纯追加、零删除（base→HEAD +542 行 /
+    base→main +62 行），保留双方段落。
+  - **`ui/index.html` 无冲突**：`.gitignore` 第 9 行 `/ui/` 使其在三个分支上均未入库
+    （`git ls-tree` 计数 0），且 main 的 3 提交都不碰 `ui/`；仍按仓库惯例由
+    `frontend && pnpm run build`（`build.mjs` 输出 `../ui`）重新生成，
+    `ui/index.html` 4,138,980 B。
+- **融合时发现并修复的语义缺口（本轮独有）**：#116 在 main 只覆盖 3 个
+  `fileTransfer.write` 调用点（trzsz 下载 / SFTP 下载 / GIF 导出），integration 线
+  独有 M14 的 **transcript 导出**第 4 处（`exportRecordingTranscript`）仍传裸
+  `Uint8Array`——同源缺陷（同一宿主桥 transfer 校验），main 因缺该功能无法覆盖。
+  已按同一模式改为 `standaloneArrayBuffer(bytes)` 并补注释；合并后 4/4 站点全部
+  归一（`grep fileTransfer.write | grep -v standaloneArrayBuffer` 为空）。
+- **验证**（全部在合并+融合后的最终代码上跑）：
+  - 前端三件套：`pnpm vitest run` **110 文件 / 1086 用例全绿**（含
+    `standaloneBuffer.spec.ts` 5 用例）；`vue-tsc --noEmit` 0 错；
+    `pnpm run build` 通过并重生成 `ui/`。
+  - backend：`cargo test --locked` **985/985**（基线 985，只增不减）/ clippy
+    `--all-targets -- -D warnings` 0 / `cargo fmt --check` 0。
+  - 本地容器 smoke（`dbx-ssh-test` Up，debug sidecar）：`smoke_fs_test.py`
+    **83 PASS / 0 SKIP / 0 FAIL**（59.7s）。
+  - #116 核验：`standaloneBuffer.ts` 与 main 逐字一致（`git diff origin/main` 空），
+    全跨度视图零拷贝直返底层 buffer、否则按视图区间拷贝；四处调用点均传
+    `standaloneArrayBuffer(...)`。
+- **剩余风险**：宿主侧根治（`pluginHostBridge.ts` write 分支去掉 `new
+  Uint8Array(...)` 包装）仍需宿主发版，插件侧规避随本线发版生效；真机 GUI 手测
+  （下载落盘、目录跟随跨新 tab、panel surface 图标禁用）留待人工门。
+
+## M30-B 批次（2026-09-26，open issue 全量分诊：20 条定性 + 2 项低风险自动化落地）
+
+- **动机**：仓库积压 20 条 open issue，长期未做系统性定性——既有"其实早就修好但没关"（#77/#91/#105/#80），也有"已修但只在 main、没进 integration"（#116），还有真缺功能（#78/#90/#66/#96）与纯需补料（#23/#25/#103/#100）。本轮做一次逐条对码分诊，并把其中低风险、可本地验证、不碰 manifest.json 的部分直接落地。
+- **分诊结论（全部 20 条，见 `docs/ISSUE-TRIAGE.zh-CN.md`）**：**已修复-随 M30-A 并入 1 条**（#116：`03ab46c8` 在 main、`--is-ancestor HEAD` = false，尚未进 integration）；**已交付 3 条**（#105 命令建议浮层 + 行内 ghost、#91 行距/字距/字重/内边距、#80 选中即复制 + 右键四档含沙箱降级链）；**已交付 + 本轮实施 2 条**（#73、#77，核心早已在 integration，本轮补残留缺口）；**需人工 14 条**（上游依赖 #76/#57、需补料 #23/#25/#103/#100、需复现 #95、中等改动未立项 #90/#96/#78/#66、宿主侧主因 #72、能力已落地待用户核验 #75、含大改 #108）。
+- **本轮实施①：#77 裸 `crypto.randomUUID` 回归守卫**（`frontend/src/lib/uuidCallSites.spec.ts`，98 行 / 4 用例）。issue 正文明确该修复**已回归过一次**（0.7.0 发布分支合并 main 时把带保护调用覆盖回裸写法，5 个平台安装包全含该缺陷），两次都靠人眼 review 发现、无自动检查兜住。手法沿用仓库既有 `i18nKeyReferences.spec.ts` 的 `import.meta.glob(..., "?raw")` 源码扫描：glob 自检（防检查空跑）→ 全量扫描非 shim 源码禁止裸调用（报错带 `文件:行号`）→ 钉住 shim 特性检测前提（防白名单变漏网通道）→ 钉住 App.vue 确实 import shim。**反向验证**：把 `App.vue:1647` 临时改回裸调用，守卫如期失败并精确报出 `../App.vue:1647 -> crypto.randomUUID(`，恢复后转绿——证明守卫对该缺陷形态真实有效。shim 本体（`lib/uuid.ts`，`dcf42057` + `6c96c1fe`）与 6 处调用点早已在 integration，本轮不重写、只补守卫。
+- **本轮实施②：#73 终端底色净化**（`frontend/src/lib/terminalBackground.ts`，103 行，纯函数 + 9 用例）。在 `@xterm/xterm@6.1.0-beta.304` 打包产物中直接核实到落黑机制：`ThemeService._setTheme` 用内部 `css.toColor()` 解析 `theme.background`，解析抛错时**静默回退内建常量**（`function m(e,t){if(void 0!==e)try{return a.css.toColor(e)}catch{} return t}`，t = `css.toColor("#000000")`）；而 `css.toColor` 只可靠处理 hex / **逗号分隔** `rgb()/rgba()` / 字面 `transparent`（解析成功但 rgba=0），其余靠 canvas 探针——探针对 `var()`/`color-mix()` 这类需级联求值的形态必抛 `Unsupported css format`。宿主设背景图时下发的 `--color-background` 恰好常落这两类 → 静默黑底。`21c66bf2`（已在 integration）修的只是 viewport 的 `#000` 规则即黑边框那一半，主题底色这半本轮补上。净化口径只拦"可证明 xterm 拿不到色"的四类（空值 / 字面 `transparent` / 需级联求值的函数形态 / 显式 `alpha≤0`），其余原样透传（hsl、命名色不改写），调用点 `App.vue:2043`（`hostTerminalTheme()`，净化值同时喂 xterm ITheme 与 `--ssh-terminal-background` 变量，`--background` 等 UI 变量不经过本模块）。**登记未做**：让背景图真正透出终端需 xterm `allowTransparency: true`（连带渲染器/WebGL 取舍），属独立决策。
+- **验证**：`pnpm vitest run` **1092/1092 通过**（基线 1079 + 13 新增：9 底色净化 + 4 uuid 守卫）/ `vue-tsc --noEmit` 0 错误 / `python3 scripts/validate_repo.py` PASS（`io.dbx.ssh 0.7.1-beta.3`）。纯前端批次，cargo/(smoke) 不适用。
+- **边界遵守**：未改 `manifest.json`、未使用真实凭据、未关闭任何 issue（关闭由人工决定）、未 merge integration、未触发 CI。单 issue 改动均远低于 ~150 行阈值，未触协议/认证语义。
+
+## M30 收口补记（2026-09-26）
+
+- **M30-A/B 合并后全量验证全绿**：vitest **1099/1099**（112 文件）/ vue-tsc 0 / cargo **985/985** / 容器 smoke **83/0/0**。integration head = f1f3f6f1。
+- **main 3 提交已并入**（#116 fileTransfer ArrayBuffer 修复 + 目录跟随偏好 + panel 图标禁用），且 integration 独有的 transcript 导出第 4 处 fileTransfer.write 站点按同模式补齐（4/4 归一）——宿主桥 transfer 缺陷在两条线全部堵上。
+- **open issue 分诊完成**（ISSUE-TRIAGE.zh-CN.md）：20 条定性完毕，#77 UUID 守卫与 #73 终端底色净化本轮落地（13 新增前端用例）；14 条需人工（需补料 #23/#25/#103/#100、宿主侧 #72、未立项 #90/#96/#78/#66、需复现 #95 等），关闭候选建议见报告——**未关闭任何 issue**（人工决定）。
+- **登记转人工**：`codex/host-capability-form` 分支（f42d6354，动 manifest.json 199 行 + engines 版本要求，2026-09-17 旧分支，patch-id 未命中 main/integration）——按守卫（不改 manifest.json）不自动合并，需人工评估是否还有效。
+
+## M31-C 批次（2026-09-26，issue #96：JSON 格式化预览 + 字段/整篇复制，纯前端）
+
+- **动机**：#96 要求文件预览对 JSON 数据提供格式化预览，并支持复制单个字段/值与整篇文本。M30-B 分诊时定性为"中等改动未立项"，本轮按纯前端方案落地（预览链路已有：`openEntry` 经 `sftp/read`（maxBytes 1 MiB，超限 truncated）解码出 `previewText`，无需后端改动）。
+- **纯函数层 `frontend/src/lib/jsonPreview.ts`**（新建）：
+  - **检测口径（双条件命中其一）**：扩展名直判 `.json`/`.geojson`；或无扩展名文件内容嗅探（首个非空白字符为 `{`/`[`，改名 config 仍可命中）。`.jsonl`/`.ndjson` 显式排除（行分片文档整篇 pretty 会把 N 个独立对象拼成非法 JSON，误导用户——取舍：保持原始预览）；有扩展名的非 JSON 文件不做嗅探（结构化日志 `.log` 开头即 `{`，不被劫持成 JSON 视图）。
+  - **降级链**：候选 → 截断或字节量 >1 MiB → `too-large`（仅原文）；`JSON.parse` 失败 → `invalid`（仅原文 + 提示条）；成功 → `ok`（2 空格 pretty + 字段树）。任何失败都不抛错。
+  - **字段树**：展平为 `[{path, key, value, fullValue, type}]`，JSONPath 风格路径（`$.a.b[0]["weird key"]`）；仅叶子标量与空容器（`{}`/`[]`）产出行，复合子树复制由 pretty 文本选区承担（避免逐节点 stringify 的 O(n²)）；字符串展示截断 200 字符而 `fullValue` 全量可复制；行数 2000 / 递归深度 128 双上限。
+- **组件 `frontend/src/components/JsonPreviewPanel.vue`**（新建）：工具栏「格式化/原始」切换（reka ToggleGroup wrapper）+ 字段搜索框（纯前端 filter，大小写不敏感匹配路径/值，`{matched}/{total}` 计数）+「复制整篇文本」（格式化视图取 pretty、原始视图取原文）；格式化视图 = pretty `<pre>` + 300px 字段列表（每行「复制值」「复制路径」，复制走 `lib/clipboardBridge` 三级降级：宿主桥 → `navigator.clipboard` → execCommand，结果按钮内联反馈"已复制/复制失败"，不依赖 App 错误条）。`invalid`/`too-large` 状态下组件退化为提示条 + 只读 `TextPreview`（保留既有语法高亮）。换文件自动清空搜索词。
+- **App.vue 接线（最小化）**：新增 `jsonPreviewState` computed（`buildJsonPreview(previewTitle, previewText, {truncated})`）与模板一处条件分支——非编辑态且非 `unavailable` 时渲染 `JsonPreviewPanel`，其余（非 JSON 文件、编辑/保存态、加载失败信息）回落既有 `TextPreview`，编辑保存路径零改动。
+- **i18n**：`jsonPreview.*` 12 键 × 七语全补（en/zh-CN/zh-TW/es/it/ja/pt-BR，supplemental 平铺 dotted key 模式）。
+- **测试**：`jsonPreview.spec.ts` 16 用例（检测/降级链/路径正确性/数组索引/非标识符键引用/截断展示 vs 全量复制/空容器/标量根/数组根/行数与深度上限/过滤）+ `JsonPreviewPanel.spec.ts` 9 用例（渲染/搜索/复制值/复制路径/整篇复制随视图切换/原始视图/invalid/too-large/搜索随文件切换重置，CodeMirror 以 stub 替换）。无新协议方法 → 无 smoke 增量（同 2026-08-30 交互轮口径）。
+- **验证**：`pnpm vitest run` **1124/1124 通过（114 文件）**（基线 1099/112，+25 用例 +2 文件，只增不减）/ `vue-tsc --noEmit` 0 错误 / `pnpm run build` 通过（`ui/` 重生成，integrator 所有权）。`git diff --check` 干净。
+- **边界遵守**：未改 `manifest.json`、后端零改动（无协议/权限/能力变化）、未关闭 issue #96（关闭由人工决定）、未 merge integration、未触发 CI；未使用真实凭据。
+- **已知边界**：① `truncated`（>1 MiB 只加载头部）不提供格式化视图——半截 JSON 无法可靠 parse；② `.jsonl` 按设计不做整篇 pretty；③ `.json` 扩展名但内容为 JSON-lines 的文件会落入 `invalid` 提示 + 原文视图；④ 编辑态切回 `TextPreview`（可编辑 CodeMirror），保存后按新文本重新检测。
+
+## M31-D 批次（2026-09-26，终端输出族两 issue：#95 取证闭环 + #90 ZMODEM 触发检测）
+
+分支 `codex/ssh/parity-np31-terminal-output`（基线 cd205df4）。两 issue 同属 PTY 数据通路，一线统一处置。
+
+### #95「终端执行 git 的时候看不到内容」——取证完成，非插件数据通路缺陷，不做猜测性修复
+
+**取证方法**：本地容器 `dbx-ssh-test`（apk 装 git 2.54.0，对齐用户"跑 git"场景；lrzsz 未装属 #90 范围）+ `scripts/sidecar_client.py` 建真实 PTY 会话（120×30），逐帧抓 `ssh/terminal/out/<id>` 二进制帧原始字节（探针脚本与完整输出留档 `/tmp/np31_probe/`，不进仓库）。
+
+**证据链**：
+1. `git --version` / `git status`（含 `\x1b[31m` 红色着色）输出在二进制帧上**字节级完好**；
+2. `git log` 触发 pager（git 默认 `LESS=FRX`，单屏内容渲染即退出）时，`\x1b[0;0H…\x1b[K` 渲染帧同样完好送达——**pager/alternate screen 假设排除**（且 xterm.js 本身支持 1049 切换）；
+3. 前端输出管线逐环节审计：`terminalCommandMarkers.ts`（OSC 633）与 `terminalDirectoryTracking.ts`（OSC 7）解析器都是**旁路观察**（返回 updates，原始字节原样进 xterm）、`terminalWriteThrottle` 与 `terminalBackpressure` 字节保持（有单测）、zmodem.js sentry 与 trzsz filter 空闲态透传——**无吞字节环节**；
+4. issue 截图（611×210）重新判读：`On branch master` 标题、`(use "git add…")` 提示、`nothing added to commit` 页脚全部完整——若输出被流解析吞掉，这些英文行同样会碎；"红色碎片"（`'`、`i`、`0,`、`[`、`true,`）实为 TAB 缩进的**完整短行**，正是 git 未跟踪文件的文件名，且其形态是 JSON/Python 字面量（`'i'`、`0,`、`[True,`…）被 shell 按空白分词后逐 token 成名的特征。
+
+**结论**：终端渲染的正是 git 的真实输出；"看不到内容"源于提问者仓库里确实存在这些垃圾文件名（最可能由更早一条未加引号的命令或粘贴事故创建），不是输出丢失。三个候选（pager/alternate screen、viewport 滚动、ANSI 净化误伤）逐一排除或与截图矛盾。**处置**：TRIAGE #95 行改判"取证完成"，建议回复提问者让其核对 `ls -la` 的未跟踪文件；不改任何代码。
+
+### #90「sz 命令下载文件没有反应，无任何反馈」——反馈层修复（MVP）
+
+**现状取证**：容器无 lrzsz（按任务约束不安装）；此前行为=远端 `sz` 发 ZRQINIT 后前端 zmodem.js sentry 检测到 `role="receive"` 会话即 `detection.deny()`，无提示无传输——即 issue 所述"没有任何反馈"。
+
+**协议依据**（lrzsz 0.12.20 源码核实，`zmodem.h`/`zm.c`/`lsz.c`/`lrz.c`）：`'B'`=ZHEX、`'A'`=ZBIN、`'C'`=ZBIN32（lrzsz 命名与 spec 惯例相反）；ZRQINIT=0x00、ZRINIT=0x01；`sz` 上线与重试全走 `zshhdr` hex 帧：`**\x18B` + `"00"` + 12 hex（4 字节数据+crc16）+ `0D 8A` + `11`（XON），重试间隔 10s、3 次后放弃（~30s 生命周期）；`rz` 上线发 hex ZRINIT（`**\x18B01…`），**必须原样透传**——前端 sentry 的 rz 上传流程依赖看到它。
+
+**实施**：
+- `backend/src/zmodem_detect.rs`（新，纯状态机）：流式检测 `2A 2A 18` + framin + ZRQINIT 帧型；命中即进入 40s 抑制窗口（覆盖 sz 整个重试生命周期，超时自动回透传，无需手动复位），窗口内同类头静默丢弃；`PendingDrop::HexRun` 处理 hex 头跨 binary 帧切割（哨兵、类型位、12 hex 负载、CRLF/XON 尾都可能被任意分帧）。**9 条单测**：单帧命中、8 种切分位置跨帧检测零泄漏、ZRINIT 字节级透传、二进制 ZBIN32 ZRQINIT 命中、二进制 ZRINIT 透传、窗口内重试静默+窗口后复位、字面 `**` 文本无损（含分帧）、非 ZRQINIT hex 帧型透传、尾部候选字节不丢。
+- `backend/src/ssh.rs` 接线：PTY 输出泵（channel.wait 分支 + directory-filter 定时冲刷分支）在录制/发布前过检测器（仅 Stdout 流；空帧不发布），首次命中发 `ssh/zmodem` 事件 `{sessionId, kind: "zrqinit"}`（重试不重复发）；状态随会话任务存续。
+- 前端：`App.vue` 事件分发新增 `ssh/zmodem` 处理 → `showNotice(t("zmodemDownloadUnsupported"))`；i18n 七语全补（zh-CN/zh-TW/en/es/it/ja/pt）。
+- 协议文档：`PROTOCOL.zh-CN.md` 新增「ZMODEM 触发检测」节。
+
+**验证**：cargo **994/994**（基线 985 + 9 新增）/ clippy `--all-targets -D warnings` 0 / `cargo fmt --check` 0；`scripts/smoke_zmodem_detect.py`（新）四用例全 PASS（真实容器 PTY：sz ZRQINIT 抑制+事件恰一次、窗口内重试静默、ZRINIT 透传、字面 `**` 文本无损）；`smoke_fs_test.py` **83/0/0**；vitest **1099/1099**（112 文件）/ `vue-tsc --noEmit` 0。
+
+**明确不做（边界）**：不实现 ZMODEM 协议本身（不应答 ZRINIT、不收发文件）——"sz 直传下载"需独立立项（接收方向状态机 + 进度 UI + 与 SFTP 面板的关系）；检测器仅接 SSH PTY stdout，local/serial/telnet 通路未接；manifest.json 未动；未关闭任何 issue。
+
+## M31-A 批次（2026-09-26，issue #78 文件夹上传：SFTP 面板递归目录上传）
+
+- **动机**：分诊（ISSUE-TRIAGE）将 #78「希望支持文件夹上传」定性为中等改动未立项。MVP 结论：**纯前端编排**，零新增后端方法——后端 `sftp/upload/start|next|finish`（本地 spool 管线）、`sftp/createDirectory`、`sftp/exists`、`sftp/rename-unique` 能力已齐，PROTOCOL 不改。
+- **方案**：SFTP 面板空白右键菜单新增「上传文件夹…」（`FolderUp` 图标），隐藏 `<input type="file" webkitdirectory>` 选择目录；`lib/folderUpload.ts`（纯函数层，零 UI/零 sidecar 依赖）把 FileList 整理为上传计划：`webkitRelativePath` 归一（Windows 反斜杠→`/`、空段/`.` 跳过、`..` 栈式回弹），远端目录集去重且父先于子（深度升序 + 字典序），树落在当前目录下以所选根名命名的一层（与目录下载同语义）。App.vue 仅接线：逐目录 `sftp/createDirectory`（单目录失败不阻断，由文件上传结果兜底）→ 逐文件 `uploadSource` 复用既有管线（并发调度/暂停/断点/进度事件全部继承）。
+- **冲突策略对接**：`transfer_duplicate_policy=rename/overwrite` 交给既有 `resolveUploadDuplicateName`（rename-unique 探测 / 直接覆盖）；`ask` 在文件夹批量下**降级为已存在跳过**（`sftp/exists` 预检 + 计数），完成提示尾注说明，避免上百次逐文件弹窗。
+- **进度展示**：传输面板新增聚合进度卡「目录 X/Y · 文件 N/M · 字节 + 在传相对路径」（`folderUploadProgress` ref），逐文件任务卡照常出现在下方；完成 toast 报成功/失败/跳过计数。
+- **能力探测**：onMounted 一次性探测 `webkitdirectory`（老 webview 缺失时菜单项与 input 均不渲染，文件级上传不受影响）。
+- **i18n**：`folderUploadMessages` supplemental 块七语全补（action/title/progress/completed/completedWithFailures/skippedNote/empty，7 键 × 7 语）。
+- **验证**：`pnpm vitest run` **1107/1107**（113 文件；本 worktree 基线 cd205df4 = 112 文件/1099 用例，+1 文件 +8 用例 `folderUpload.spec.ts`，只增不减；M31-C/D 在 integration 分支、按守卫未并入本分支）/ `vue-tsc --noEmit` 0 错 / `pnpm run build` 成功（ui/ 重生成，integrator 所有）/ `git diff --check` 0。纯前端批次，cargo/(smoke) 不适用。
+- **边界遵守**：未改 `manifest.json`、未新增后端方法/协议条目、未使用真实凭据、未 merge integration、未触发 CI、未关闭/评论 issue。App.vue 改动控制在接线级（编排逻辑全在 lib/）。
+- **已知边界**：①空目录不传（浏览器 File API 天然不产空目录条目，远端不会出现空目录骨架）；②单目录 createDirectory 失败（如权限）不中止整批，受影响文件在上传阶段自然失败计入 failed；③ask 降级与单文件上传的逐个询问语义有差异（批量 MVP 取舍，尾注已说明）；④超大目录（万级文件）为逐文件串行 ensure/exists，无批量 RPC，速度受 RTT 影响——后续可评估后端批量 mkdir/mput。
+
+## M31-B 批次（2026-09-26，issue #66：SFTP 下载限速）
+
+- **动机**：open issue #66「希望 ftp 下载时支持限速功能」——正文明确指向下载方向，范围收敛在
+  SFTP 下载（单文件 + 递归目录）；上传侧与 sudo 下载（独立车道）本期不做，报告里登记边界。
+- **偏好键 `transfer_download_limit_kib`**（`backend/src/preferences.rs`）：白名单新键，u64，
+  `0..=1048576` KiB/s，0=不限速（缺省）；超界钳制、非法回落 0（`sanitize_u64_clamped` 同款语义，
+  set 不报错）。PROTOCOL `local/preferences` 行同步键说明。设置 UI（`SettingsDialog.vue` 传输组
+  数值输入 + `App.vue` 权威态/适配器/localStorage 缓存/sidecar 同步，照既有传输键模式）；
+  文案七语齐套（`transferCfg.downloadLimit`/`downloadLimitHint`，i18n 键集对比测试把关）。
+- **限速实现**（新模块 `backend/src/transfer_throttle.rs`，纯逻辑 + 5 单测）：`Throttle::new(limit_kib)`
+  在下载任务 start（`sftp/download/start`/`tree/start`）时对偏好现值**快照一次**——改动对下一个下载
+  任务生效，进行中任务节奏不抖动；每个分块（256KiB 上限，含 latin-1 raw 车道）从读开始计量耗时，
+  读毕按「理想耗时（bytes / (limit×1024)）− 实际耗时」的差额 sleep（逐块瞬时比较，不跨块累计漂移）。
+  限速 0/缺省时 `pace` 为纯即时调用，热路径零分配零等待；`DownloadState` 新增 `throttle` 字段
+  （sudo 车道字面填充 `Throttle::new(0)` 不受影响），ssh.rs 只做接线。
+- **单测**：`transfer_throttle` 5 例（0 关闭、差额正部、比率缩放、溢出饱和、真实 sleep）+
+  preferences 新键 clamp/非法值回落 1 例；前端 `clampTransferDownloadLimit` spec 1 例。
+- **文档**：PROTOCOL（偏好键 + 「下载限速生效口径」段）；FEATURE_PARITY iShell 对标表补
+  「SFTP 下载限速」行。
+- **验证**（本分支基于 M30 patrol head `cd205df4`，M31-C/D 的 integration 提交不在本线）：
+  cargo test **991/991**（本分支基线 985 + 6 新增：throttle 5 + 偏好 1）/ clippy
+  `-D warnings` 0 / fmt 0 / build OK；vitest **1100/1100**（112 文件，基线 1099 + 1 新增）/
+  vue-tsc 0 / build OK；容器 smoke `smoke_fs_test.py` **83 PASS / 0 SKIP / 0 FAIL**
+  （限速缺省 0 不影响既有时序）。
+- **边界遵守**：未改 `manifest.json`、未使用真实凭据、未关闭 issue、未 merge integration、未触发 CI。
+- **已知边界**：sudo 下载与上传方向不限速（scope 明示排除）；限速按平均速率口径（分块间瞬时
+  等待），非令牌桶毫秒级平滑；`sftp/read` MCP 分片读不受限速（非下载任务链路）。
+
+## M31 收口补记（2026-09-26）
+
+- **M31 四特性批次两波 CI 全绿**：第一波 36241282306（C+D）、第二波 36245140413（A+B 全量，18m 级，11 job 全过）。integration head = d9ac8d71。
+- **里程碑**：cargo **1000/1000**（M19.5 起点 950 → +50）、vitest **115 文件/1133**、smoke 83/0/0 保持。
+- **四特性交付**：#78 文件夹上传（纯前端编排复用既有 upload 管线 + 聚合进度卡）、#66 下载限速（transfer_download_limit_kib 偏好 + 逐块补差限速器，缺省零开销）、#96 JSON 预览（pretty + 字段树 + 三级复制）、#90 sz 反馈（ZMODEM 触发检测抑制乱码 + 七语通知）；#95 取证闭环定性非插件缺陷（PTY 帧字节级完好）。
+- **四波 CI 验证节奏**（用户指示不逐轮 CI 后采用分波）：C+D 先行一波（局部回归），A+B 齐后全量一波（四特性组合回归）——两波均一次通过。
+
+## WezTerm 对标登记与排期重编号（2026-09-26，WT-1–WT-4）
+
+- **登记轮 `129f636f`**：FEATURE_PARITY 新增「WezTerm 对标补充」节——15 行能力对照
+  （同水位/差距/刻意不做三类；SFTP、录制回放、协议广度等本插件领先项不在差距之列）
+  + 四批次实施排期。登记时编号 M27–M30（拟接续当时的 M26-A）。
+- **撞号发现与重编号**：并行工作线在同一分支把 M27–M31 占用为另一系列（PROGRESS 的
+  M27-A/B = latin-1 疑点裁决 + shell_quote 收编、M28-A/B = 下载编码修复、M29 = 冒烟
+  预算、M30-A/B = main 并线 + 20 条 issue 分诊、M31-A/B/C/D = 四特性批次），与本节
+  排期互不知情。本轮把 WezTerm 排期重编号为独立前缀 **WT-1–WT-4**（内容与验收口径
+  不变），FEATURE_PARITY 内 12 处 M 引用全部改写并在排期标题下保留撞号说明。
+- **六项排期均未实施**（本轮代码级核实，防止「排期即交付」误读）：
+  - **WT-1** 终端交互批（纯前端）：Quick Select Mode（frontend 零命中）+ DECSET 2026
+    应答翻转（`terminalModeQueries.ts` 仍回 unsupported）。
+  - **WT-2** 协议应答矩阵审计批：DSR 5/6、Primary DA、SGR 冒号形式核对成文 +
+    OSC 1337 SetUserVar / OSC 9·777 接入（frontend 零命中）+ TEST_MATRIX 新节。
+  - **WT-3** OpenSSH config 导入批：`connection_import.rs` 仍为 7 种第三方来源，
+    其中的 `ssh_config` 命中仅是 Termius 格式内部键。
+  - **WT-4** 同 transport 命令会话批：spawn 语义未实现（`main.rs` spawn 命中均为
+    `thread::spawn`）。
+- **明确不做**（随登记轮沉淀）：vi Copy Mode、tmux control-mode 桥接、Lua/插件化配置、
+  SSH 持久 mux server、WezTerm 私有 SGR 6、8 位 C1 控制码（GBK 堡垒机行为纳入 WT-2
+  实测记录）。
+- **边界遵守**：纯文档轮（FEATURE_PARITY + 本节），未动代码/manifest/`ui/`，
+  未关闭任何 issue，未触发 CI；`docs/M32-IMPL-PLAN.zh-CN.md` 为另一工作线的
+  未跟踪设计稿，本轮不代为提交。
+
+## M32 终端工具条职责归位 + 连接类型补全（2026-09-26，M32-A/B）
+
+- **实施依据**：`docs/M32-IMPL-PLAN.zh-CN.md`（基线 integration `9ed6cce2`，M31 收口后）。
+  原则：终端工具条 = 会话内即时操作；连接管理 = 宿主职责；配置管理 = 设置窗口。
+- **M32-A（纯前端，App.vue + SettingsDialog + 两个新组件）**：
+  - A1 移除 4 个协议直开图标（telnet/vnc/rdp/serial）及其 `request*` 函数、
+    4 组"占用终态先确认"弹层与状态 ref（modalOpenStates 同步收敛）——协议连接
+    统一走宿主连接管理 → openSession 路由；`serial.upload.open` 等会话内动作保留。
+  - A2 关键词高亮管理迁「设置 → 终端」：新增 `HighlightRulesSection.vue`
+    （草稿/校验在组件，RPC 数据面留 App；保存成功以 rules 引用替换感知并复位草稿），
+    删除工具栏 Palette 弹层与 App 侧草稿状态；渲染链（compiledHighlightRules +
+    decoration 引擎）不动。
+  - A3 快速命令拆分：工具条 Zap 弹层只留列表+搜索+执行（Run/Paste），footer 增
+    `quickCommands.manageHint` 七语指路说明；编辑器+导入迁 `QuickCommandsSection.vue`
+    （设置·终端），`addQuickCommand/confirmQuickImport` 重构为载荷式
+    `saveQuickCommand/importQuickCommands`，删除确认移入管理视图。
+  - A4 quick sudo profiles 管理入口（KeyRound）移除——设置·sudo 内联管理
+    （`profilesManage`）已覆盖；`openProfilesManager` 删除，`profilesOpen`
+    独立弹窗管道保留（组件面契约未动）。
+  - 附带清理：rdpExperimental 前端内存门副本删除（后端 `rdp_start_gate` 为权威门，
+    `update:rdpExperimental` emit 链下线）；结构守卫测试
+    `workbench.spec.ts` 弹层清单同步（highlightMenuOpen/toggleHighlightMenu 退役）。
+- **M32-B（manifest + 路由 + 后端两分支）**：
+  - B1 manifest `protocol` options 追加 `serial`/`rdp`，description 去旧表述
+    （七语同步）；serial 组 6 字段（serial_port/baud/data_bits/parity/stop_bits/
+    backspace）+ rdp 组 4 字段（rdp_domain/resolution/certificate_policy/clipboard）
+    全带 `visible_when` 门控；host/port 改为 TCP 四协议共用（serial 隐藏），
+    username 扩至 ssh/telnet/rdp；`verify.mjs` 新增 M32 协议门控矩阵断言
+    （603 组合全过），七语 label/options 契约全覆盖。
+  - B2 前端 `openSession` 补 serial/rdp 路由：`startSerialFromConnection`
+    （config → SerialConnectOptions，缺设备路径回落表单）与
+    `startRdpFromConnection`（host/port/username + rdp_* config；失败回落
+    RdpConnectDialog）；后端 `connection/test` serial 跳过 probe（提示连接时校验）、
+    rdp 并入 TCP probe，`connection/connect` 非 SSH 协议一律直通，
+    `RuntimeEndpoint`/`StoredConnection` 协议归一白名单扩展；
+    model.rs 契约测试字段清单同步（44 字段）。
+- **验证**：vue-tsc 0 错；vitest 117 文件/1139 用例（基线 1133 + 新增 6，
+  含 HighlightRulesSection/QuickCommandsSection 组件测试 6 例）；`pnpm build` 成功；
+  cargo test 1000/1000；clippy -D warnings / fmt --check 0；validate_repo.py PASS；
+  vendor lockstep/integrity PASS；`smoke_ui_mock.mjs` 全绿（新增 5 条协议图标移除
+  守卫 + 设置内管理链路走查，删除链路改走设置）；`smoke_ui_settings.mjs` 全绿。
+  容器 smoke 见 test.sh 记录。
+- **边界**：`serial_port` 未设必填（设备可后插，连接时校验）；RDP 仍为实验能力
+  （`rdp_experimental_enabled` 后端门不变）；`profilesOpen` 独立弹窗管道保留未删。
+
+## WezTerm 对标实施收口 WT-1–WT-4（2026-09-27，四批并发实施 + 集成收口）
+
+- **实施方式**：四条独立 agent 工作线各自 worktree 并行实施（一个 checkout 一个 agent），
+  分支 `codex/ssh/parity-wt{1..4}-*-2026` 均基于集成分线基线 `f837d28d`，各自目标级验证
+  绿后合入集成线 `codex/ssh/parity-wt-integration-2026`（四批 merge **零冲突**），随后统一
+  跑全量测试基线。**未使用 M 编号**（遵守 2026-09-26 重编号决定）。
+- **WT-1 终端交互批（纯前端，`d8122a06`）**：Quick Select Mode（`quickSelect.ts` 逻辑行
+  拼接 + URL/路径/IPv4/hash 抽取，容量上限/去重/折行定位；`TerminalQuickSelectPanel.vue`
+  overlay 逐项复制；快捷键注册表新动作 `quick-select` 默认 `Cmd/Ctrl+Shift+O` 可改）；
+  DECSET 2026 应答翻转（DECRQM 2026 改答「支持」，`terminalWriteThrottle.ts` 新增
+  `setHold`/`held` 实现「同步窗内缓冲、结束整批提交」）。
+- **WT-2 协议应答矩阵批（前端为主，`a87d31b0`）**：OSC 9/777 → 工作台通知、OSC 1337
+  SetUserVar → parser 层 cwd 元数据优先通道（`terminalOscChannels.ts`，提示符猜测降为
+  回落）；`TEST_MATRIX.zh-CN.md` 新增「WT-2 终端应答矩阵」节（DSR 5/6、Primary DA、
+  SGR 冒号形式以真实 xterm 内核 parser 单测 `terminalProtocolMatrix.spec.ts` 做实测锚点；
+  GBK 堡垒机 8 位 C1 诚实标注「设计立场 + 待真机实测」，未编造数据）。
+- **WT-3 OpenSSH config 导入批（后端 + 前端，`e78ba5b2` + `103a41f1`）**：
+  `connection_import.rs` 第 8 来源 `sshconfig`（Host 通配/Hostname/User/Port/IdentityFile
+  仅路径映射不读密钥材料 `key-path-only`/UserKnownHostsFile/Match host/user 受限支持；
+  Include 按「未跟随」标注降级；ProxyCommand/ProxyJump 仅标注不执行）；main.rs 零改动
+  （kind 注册集中在 connection_import.rs）；导入向导第 8 来源 + 七语；
+  `smoke_ssh_config_import.py`（免容器、含脱敏断言）。
+- **WT-4 同 transport 命令会话批（后端 + 前端，`77bcb5d5` + `a5ca5cd8`）**：
+  PROTOCOL 新节契约先行；`ssh/session/open` 可选 `spawnCommand`（独立 PTY channel 执行
+  指定命令，`sh -c` 单引号转义复用 `exec::shell_quote`，显式请求覆盖连接级
+  remote_command，命令会话跳过 startup_commands 注入）；复制会话共享引用预占与跳板链
+  生命周期复用，MaxSessions 失败可见；前端「命令会话」入口 + 七语；
+  `smoke_spawn_session_test.py`（spawn 开合 + 共享引用并发关闭，容器实跑 PASS）。
+- **集成期修复（2 处，均为跨文件护栏只在全量跑时暴露）**：① WT-4 的
+  `spawnSessionDialogOpen` 未进 App.vue `modalOpenStates` 焦点表（workbench.spec
+  结构护栏 2 断言红）→ 已补入；② `smoke_ui_settings.mjs` 硬编码「10 个可绑定动作」
+  → WT-1 新增后为 11，断言已更新并注明来源。
+- **测试基线（集成线实测，较上轮收口值全部上行）**：cargo test **1021 passed / 0 failed**
+  （上轮 1000）；clippy `-D warnings` 0、fmt 0；vitest **121 文件 / 1202 用例** 全绿
+  （上轮 115 文件 / 1133 用例）；vue-tsc 0；`validate_repo.py`、`connection-forms/verify.mjs`
+  PASS；`smoke_ui_mock.mjs`、`smoke_ui_settings.mjs` 全绿；容器 smoke 家族对本轮
+  debug sidecar 全量复跑 **17/17 全绿**（含新增 `smoke_ssh_config_import.py`、
+  `smoke_spawn_session_test.py`）。其中 `smoke_forward_test.py` 首轮失败经干净基线
+  （`f837d28d`）对照复跑同点失败，证实为测试容器 `AllowTcpForwarding no` 配置漂移
+  （初建时未按 SKILL.md 开启转发），容器内改为 `yes` 并重启后复绿、基线与集成线
+  均通过——非本轮回归。
+- **降级/未实施项（随收口沉淀）**：Include 递归跟随（管线只收上传字节，不做 sidecar
+  磁盘递归，防引入文件读取攻击面）；vi Copy Mode（维持不做）；GBK 堡垒机 8 位 C1
+  真机实测（待环境）；Quick Select 全缓冲档（已实现，默认 viewport 档）；spawn 会话
+  的 App.vue 新按钮无 UI 自动化用例（以容器 smoke 覆盖）。
+- **边界**：`ui/`、`dist/`、`Cargo.lock`、manifest 未动；未 push、未建 PR、未 merge
+  到集成分线；认证/协议语义改动（WT-3 信任模型、WT-4 spawnCommand 覆盖优先级）已在
+  PROTOCOL 成文，PR 需人工 review。
+
+## 协议矩阵 Docker 真机层（2026-09-27，telnet/serial/X-Y-ZMODEM 真机覆盖）
+
+针对"新协议会话缺真机层覆盖"的补位批次：现有 telnet 冒烟（smoke_telnet_autologin.py）
+只做 start 校验、串口 PTY 回环在 macOS 被 serialport-rs ENOTTY 跳过
+（smoke_serial_upload.py 注记"Linux 串口驱动或许可跑通"）。本批落地
+Docker 真机层并全量跑绿。
+
+- **资产**：`scripts/smoke_telnet_docker.py`（三味道：shell/login/login-fail，
+  未达服务器整跑 SKIP、方法未注册按惯例 SKIP）、`scripts/smoke_serial_docker.py`
+  （Linux 容器内跑：socat 虚拟空解调线 + 路由器控制台模拟器 + X/Y/ZMODEM）、
+  `scripts/docker/protocol-matrix/`（Dockerfile.telnetd = busybox telnetd
+  真实 IAC + login；Dockerfile.linux-test = rust+socat+python3+libudev；
+  run_matrix.sh 编排宿主机/容器两层并汇总退出码；README.zh-CN.md）、
+  `test.sh` 增 `DBX_PROTOCOL_MATRIX=1` opt-in 段（SKIP 不破套件全绿）。
+- **拓扑**：宿主机 sidecar（darwin-arm64）与 Linux 容器 sidecar（linux/arm64，
+  `cargo build --release --locked`，缓存走 dbx-proto-cargo/dbx-proto-target
+  命名卷）分别对真实 telnetd 验证；串口回环只在 Linux 容器（PTY 走真实
+  termios/baud）。
+- **结果（6 套件 31 用例全 PASS）**：宿主机 telnet 6/6 + 4/4 + 1/1；Linux
+  telnet 6/6 + 4/4；Linux serial 10/10（XMODEM 300B 字节级比对 + EOT 双确认；
+  ZMODEM ZRQINIT/取消序列/failed 事件；二进制键入与 JSON 兜底双通道；
+  parity 严格拒绝；replay/close/写后关）。密码字节零回显断言过。
+- **Windows 层**：macOS Docker 跑不了 Windows 容器，以 CI 原生证据覆盖——
+  run 36262285893 @ 3c1a9275（本批被测分支头）`windows-regression`
+  （windows-2022 原生 cargo test + release 构建 + smoke_mcp exe）与
+  `Package candidate (windows-x64)` 双 job success；真机 COM + DBX 安装
+  链路按约定人工门。
+- **契约注记（本次实测固化）**：serial/start 线上字段 snake_case（serde
+  default 会把错误键名吞成空串）；串口无 connected 状态事件（只 closed/
+  error，前端本地置 running）；Linux 后端不枚举 /dev/pts。均已写入
+  TEST_MATRIX 与两冒烟脚本注释。
+- **边界**：不动 backend/frontend/manifest；新脚本不入 CI 强制门（opt-in）；
+  inetutils-telnetd 容器路线放弃（in.telnetd exit 100 未深究，busybox 真实
+  IAC 协商已覆盖同一断言面）；RFC2217/真 USB 串口维持人工门。未提交、未
+  push、未建 PR。

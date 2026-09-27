@@ -38,7 +38,7 @@
       "label": "SSH server",
       "icon": "assets/plugin.svg",
       "database_type": "ssh",
-      "description": "SSH terminal and SFTP connection with password, private key, agent, or no authentication.",
+      "description": "SSH, Telnet, or VNC connection with protocol-appropriate authentication. Experimental RDP stays disabled by default and is not available as a connection profile.",
       "fields": [
         {
           "key": "display_name",
@@ -49,12 +49,46 @@
           "default": "SSH server"
         },
         {
+          "key": "protocol",
+          "label": "Protocol",
+          "type": "select",
+          "binding": "config",
+          "default": "ssh",
+          "options": [
+            {
+              "label": "SSH",
+              "value": "ssh"
+            },
+            {
+              "label": "Telnet",
+              "value": "telnet"
+            },
+            {
+              "label": "VNC",
+              "value": "vnc"
+            },
+            {
+              "label": "Serial",
+              "value": "serial"
+            },
+            {
+              "label": "RDP (experimental)",
+              "value": "rdp"
+            }
+          ],
+          "description": "Session protocol carried by this connection. Telnet, VNC and RDP connections open their own session view in the workbench (per-protocol options live there); serial connections talk to a local device and skip TCP host fields. RDP is experimental."
+        },
+        {
           "key": "host",
           "label": "Host",
           "type": "text",
           "binding": "host",
           "required": true,
-          "default": "127.0.0.1"
+          "default": "127.0.0.1",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": ["ssh", "telnet", "vnc", "rdp"]
+          }
         },
         {
           "key": "port",
@@ -63,7 +97,11 @@
           "binding": "port",
           "required": true,
           "default": 22,
-          "description": "TCP port, 1-65535 (default 22). The host refuses to connect when this is 0 or out of range."
+          "description": "TCP port, 1-65535. Defaults per protocol: SSH 22, Telnet 23, VNC 5900, RDP 3389.",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": ["ssh", "telnet", "vnc", "rdp"]
+          }
         },
         {
           "key": "username",
@@ -71,7 +109,15 @@
           "type": "text",
           "binding": "username",
           "required": true,
-          "default": "root"
+          "default": "root",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh",
+              "telnet",
+              "rdp"
+            ]
+          }
         },
         {
           "key": "authentication",
@@ -97,11 +143,21 @@
               "value": "agent"
             },
             {
+              "label": "Auto (try each in order)",
+              "value": "auto"
+            },
+            {
               "label": "No authentication",
               "value": "none"
             }
           ],
-          "description": "Choose how to sign in to the server: password, private key, SSH agent, or none."
+          "description": "Choose how to sign in to the server: password, private key, SSH agent, none, or Auto (tries password, private key, interactive prompts and SSH agent in order until one works).",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh"
+            ]
+          }
         },
         {
           "key": "password_source",
@@ -121,10 +177,21 @@
           ],
           "description": "Where the login password comes from. \"Enter in this form\" requires the Password field; \"Local command\" requires Password command, which runs with your user privileges at connect time.",
           "visible_when": {
-            "field": "authentication",
-            "one_of": [
-              "password",
-              "private-key-password"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "password",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
             ]
           }
         },
@@ -133,11 +200,21 @@
           "label": "Password",
           "type": "password",
           "binding": "password",
-          "description": "Password for \"Password\" and \"Private key, then password\", used when Password source is \"Enter in this form\". Switch Password source to \"Local command\" to fetch it with a local command instead.",
+          "description": "Password for \"Password\", \"Private key, then password\" and \"Auto\", used when Password source is \"Enter in this form\". Switch Password source to \"Local command\" to fetch it with a local command instead. Auto tries each method in order, so this is one of its possible sources.",
           "visible_when": {
-            "field": "password_source",
-            "one_of": [
-              "direct"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "password_source",
+                "one_of": [
+                  "direct"
+                ]
+              }
             ]
           },
           "required_when": {
@@ -155,9 +232,19 @@
           "default": "",
           "description": "Local command to fetch the login password. stdout minus one final newline is used. Required when Password source is \"Local command\"; runs with your user privileges.",
           "visible_when": {
-            "field": "password_source",
-            "one_of": [
-              "command"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "password_source",
+                "one_of": [
+                  "command"
+                ]
+              }
             ]
           },
           "required_when": {
@@ -178,10 +265,21 @@
           },
           "description": "Type the key path, or pick one: the suggestion list (desktop) and the file button both fill this field; in Web/Docker builds the file button uploads the key into Private key content below and clears this field. Path or content - at least one of the two.",
           "visible_when": {
-            "field": "authentication",
-            "one_of": [
-              "private-key",
-              "private-key-password"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
             ]
           }
         },
@@ -192,10 +290,21 @@
           "binding": "secret",
           "description": "Passphrase that unlocks the private key file; it is separate from the account password.",
           "visible_when": {
-            "field": "authentication",
-            "one_of": [
-              "private-key",
-              "private-key-password"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
             ]
           }
         },
@@ -207,10 +316,21 @@
           "required": false,
           "description": "Paste the private key contents (OpenSSH, PEM, or PPK); in Web/Docker builds the file button above uploads them here. Non-empty content wins over the key path, is kept in the secret store and never displayed again; choosing a file above clears this field.",
           "visible_when": {
-            "field": "authentication",
-            "one_of": [
-              "private-key",
-              "private-key-password"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
             ]
           }
         },
@@ -221,9 +341,20 @@
           "binding": "config",
           "description": "Optional SSH_AUTH_SOCK override. Leave empty for the environment default or Windows Pageant.",
           "visible_when": {
-            "field": "authentication",
-            "one_of": [
-              "agent"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "agent",
+                  "auto"
+                ]
+              }
             ]
           }
         },
@@ -247,7 +378,13 @@
               "label": "Off"
             }
           ],
-          "description": "Choose where sudo credentials come from: keep it Off unless this host needs sudo, then pick Custom (this connection) or a shared global Quick Sudo profile. Ignored for read-only connections. Off disables sudo credential handling; the 2FA field below still serves login-time MFA."
+          "description": "Choose where sudo credentials come from: keep it Off unless this host needs sudo, then pick Custom (this connection) or a shared global Quick Sudo profile. Ignored for read-only connections. Off disables sudo credential handling; the 2FA field below still serves login-time MFA.",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh"
+            ]
+          }
         },
         {
           "key": "sudo_profile",
@@ -256,9 +393,19 @@
           "binding": "config",
           "options_action": "sudo/profiles/options",
           "visible_when": {
-            "field": "sudo_source",
-            "one_of": [
-              "global"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "global"
+                ]
+              }
             ]
           },
           "description": "Optional global Quick Sudo profile."
@@ -269,9 +416,19 @@
           "type": "password",
           "binding": "secret",
           "visible_when": {
-            "field": "sudo_source",
-            "one_of": [
-              "custom"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom"
+                ]
+              }
             ]
           },
           "description": "Password for sudo; empty reuses the login password."
@@ -283,9 +440,19 @@
           "binding": "config",
           "default": false,
           "visible_when": {
-            "field": "sudo_source",
-            "one_of": [
-              "custom"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom"
+                ]
+              }
             ]
           },
           "description": "Request a TTY for sudo prompts."
@@ -297,10 +464,20 @@
           "binding": "config",
           "default": "",
           "visible_when": {
-            "field": "sudo_source",
-            "one_of": [
-              "custom",
-              "global"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom",
+                  "global"
+                ]
+              }
             ]
           },
           "description": "Optional sudo command allowlist, one entry per line. Empty allows all commands."
@@ -312,10 +489,20 @@
           "binding": "config",
           "default": "off",
           "visible_when": {
-            "field": "sudo_source",
-            "one_of": [
-              "custom",
-              "off"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom",
+                  "off"
+                ]
+              }
             ]
           },
           "options": [
@@ -344,10 +531,20 @@
           "type": "textarea",
           "binding": "secret",
           "visible_when": {
-            "field": "auth_flow_mode",
-            "one_of": [
-              "password_then_otp",
-              "password_plus_otp"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "auth_flow_mode",
+                "one_of": [
+                  "password_then_otp",
+                  "password_plus_otp"
+                ]
+              }
             ]
           },
           "description": "One per line: an otpauth:// URI or base32 key for automatic codes, or a static recovery code. Leave this blank to enter a rotating app, hardware-token, or SMS code in the connection-time dialog; do not save a current six-digit code here."
@@ -358,10 +555,20 @@
           "type": "text",
           "binding": "config",
           "visible_when": {
-            "field": "auth_flow_mode",
-            "one_of": [
-              "password_then_otp",
-              "password_plus_otp"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "auth_flow_mode",
+                "one_of": [
+                  "password_then_otp",
+                  "password_plus_otp"
+                ]
+              }
             ]
           },
           "description": "Optional extra text for recognizing OTP prompts. Built-in patterns already cover common wording such as \"[OTP Code]\" or \"Please Enter MFA Code.\" — only add a hint when the server asks differently."
@@ -373,6 +580,12 @@
           "binding": "config",
           "visible_when": {
             "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
               {
                 "field": "sudo_source",
                 "one_of": [
@@ -397,7 +610,13 @@
           "type": "boolean",
           "binding": "config",
           "default": false,
-          "description": "Show the less-used settings: timeouts, keepalive, environment, automatic replies, and read-only. Off by default."
+          "description": "Show the less-used settings: timeouts, keepalive, environment, automatic replies, and read-only. Off by default.",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh"
+            ]
+          }
         },
         {
           "key": "read_only",
@@ -407,9 +626,19 @@
           "default": false,
           "description": "Reject write operations on this connection.",
           "visible_when": {
-            "field": "advanced_options",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -421,9 +650,19 @@
           "default": 30,
           "description": "SSH handshake and authentication timeout.",
           "visible_when": {
-            "field": "advanced_options",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -435,9 +674,19 @@
           "default": 30,
           "description": "SSH keepalive interval; 0 disables it.",
           "visible_when": {
-            "field": "advanced_options",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -449,9 +698,19 @@
           "default": 0,
           "description": "Terminal idle keepalive; 0 disables it.",
           "visible_when": {
-            "field": "advanced_options",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -464,9 +723,19 @@
           "placeholder": "LANG=zh_CN.UTF-8",
           "description": "Optional KEY=VALUE entries sent on terminal, exec, and sudo channels.",
           "visible_when": {
-            "field": "advanced_options",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -478,9 +747,19 @@
           "default": false,
           "description": "Enable tssh/JSON Expect rules. Off by default; saved rules stay inactive.",
           "visible_when": {
-            "field": "advanced_options",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -493,9 +772,19 @@
           "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r",
           "description": "tssh/JSON Expect rules for automatic replies. A server can spoof prompts and receive configured replies. Empty disables.",
           "visible_when": {
-            "field": "triggers_enabled",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "triggers_enabled",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -506,9 +795,19 @@
           "binding": "secret",
           "description": "Secret sent when referenced by sendSecretKey. A server can spoof the prompt.",
           "visible_when": {
-            "field": "triggers_enabled",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "triggers_enabled",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -519,9 +818,19 @@
           "binding": "secret",
           "description": "Secret sent when referenced by sendSecretKey. A server can spoof the prompt.",
           "visible_when": {
-            "field": "triggers_enabled",
-            "one_of": [
-              "true"
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "triggers_enabled",
+                "one_of": [
+                  "true"
+                ]
+              }
             ]
           }
         },
@@ -535,6 +844,12 @@
           "visible_when": {
             "all_of": [
               {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
                 "field": "advanced_options",
                 "one_of": [
                   "true"
@@ -544,7 +859,8 @@
                 "field": "authentication",
                 "one_of": [
                   "private-key",
-                  "private-key-password"
+                  "private-key-password",
+                  "auto"
                 ]
               }
             ]
@@ -558,9 +874,265 @@
           "default": "",
           "description": "Run instead of the shell when a terminal opens. Empty uses a normal shell.",
           "visible_when": {
-            "field": "advanced_options",
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "serial_port",
+          "label": "Serial device",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Local serial device path, e.g. /dev/ttyUSB0 (Linux/macOS) or COM3 (Windows).",
+          "visible_when": {
+            "field": "protocol",
             "one_of": [
-              "true"
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_baud",
+          "label": "Baud rate",
+          "type": "select",
+          "binding": "config",
+          "default": "115200",
+          "options": [
+            {
+              "label": "9600",
+              "value": "9600"
+            },
+            {
+              "label": "19200",
+              "value": "19200"
+            },
+            {
+              "label": "38400",
+              "value": "38400"
+            },
+            {
+              "label": "57600",
+              "value": "57600"
+            },
+            {
+              "label": "115200",
+              "value": "115200"
+            },
+            {
+              "label": "230400",
+              "value": "230400"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_data_bits",
+          "label": "Data bits",
+          "type": "select",
+          "binding": "config",
+          "default": "8",
+          "options": [
+            {
+              "label": "7",
+              "value": "7"
+            },
+            {
+              "label": "8",
+              "value": "8"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_parity",
+          "label": "Parity",
+          "type": "select",
+          "binding": "config",
+          "default": "none",
+          "options": [
+            {
+              "label": "None",
+              "value": "none"
+            },
+            {
+              "label": "Even",
+              "value": "even"
+            },
+            {
+              "label": "Odd",
+              "value": "odd"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_stop_bits",
+          "label": "Stop bits",
+          "type": "select",
+          "binding": "config",
+          "default": "1",
+          "options": [
+            {
+              "label": "1",
+              "value": "1"
+            },
+            {
+              "label": "2",
+              "value": "2"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_backspace",
+          "label": "Backspace sends",
+          "type": "select",
+          "binding": "config",
+          "default": "del",
+          "options": [
+            {
+              "label": "DEL (0x7F)",
+              "value": "del"
+            },
+            {
+              "label": "Ctrl+H (0x08)",
+              "value": "ctrl_h"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "rdp_domain",
+          "label": "Domain",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Windows domain for NLA (optional).",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "rdp_resolution",
+          "label": "Resolution",
+          "type": "select",
+          "binding": "config",
+          "default": "1280x800",
+          "options": [
+            {
+              "label": "1024×768",
+              "value": "1024x768"
+            },
+            {
+              "label": "1280×720",
+              "value": "1280x720"
+            },
+            {
+              "label": "1280×800",
+              "value": "1280x800"
+            },
+            {
+              "label": "1366×768",
+              "value": "1366x768"
+            },
+            {
+              "label": "1600×900",
+              "value": "1600x900"
+            },
+            {
+              "label": "1920×1080",
+              "value": "1920x1080"
+            },
+            {
+              "label": "2560×1440",
+              "value": "2560x1440"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "rdp_certificate_policy",
+          "label": "Certificate policy",
+          "type": "select",
+          "binding": "config",
+          "default": "prompt",
+          "options": [
+            {
+              "label": "Ask on mismatch",
+              "value": "prompt"
+            },
+            {
+              "label": "Strict (reject mismatch)",
+              "value": "strict"
+            },
+            {
+              "label": "Accept temporarily",
+              "value": "accept-temporarily"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "rdp_clipboard",
+          "label": "Share clipboard",
+          "type": "boolean",
+          "binding": "config",
+          "default": true,
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
             ]
           }
         }
@@ -683,6 +1255,88 @@
             "display_name": {
               "label": "Nombre de conexión"
             },
+            "protocol": {
+              "label": "Protocolo",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "Serie",
+                "rdp": "RDP (experimental)"
+              },
+              "description": "Protocolo de sesión de esta conexión. Las conexiones Telnet, VNC y RDP abren su propia vista de sesión en el espacio de trabajo (las opciones por protocolo están ahí); las conexiones serie usan un dispositivo local y omiten los campos TCP. RDP es experimental."
+            },
+            "serial_port": {
+              "label": "Dispositivo serie",
+              "description": "Ruta del dispositivo serie local, p. ej. /dev/ttyUSB0 (Linux/macOS) o COM3 (Windows)."
+            },
+            "serial_baud": {
+              "label": "Baudios",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "Bits de datos",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "Paridad",
+              "options": {
+                "none": "Ninguna",
+                "even": "Par",
+                "odd": "Impar"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "Bits de parada",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "Retroceso envía",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "Dominio",
+              "description": "Dominio de Windows para NLA (opcional)."
+            },
+            "rdp_resolution": {
+              "label": "Resolución",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "Política de certificados",
+              "options": {
+                "prompt": "Preguntar si no coincide",
+                "strict": "Estricto (rechazar sin coincidencia)",
+                "accept-temporarily": "Aceptar temporalmente"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "Compartir portapapeles"
+            },
             "host": {
               "label": "Host"
             },
@@ -700,13 +1354,14 @@
                 "private-key": "Clave privada",
                 "private-key-password": "Clave privada y después contraseña",
                 "agent": "Agente SSH",
+                "auto": "Automático (probar en orden)",
                 "none": "Sin autenticación"
               },
-              "description": "Cómo iniciar sesión en el servidor: contraseña, clave privada, agente SSH o sin autenticación."
+              "description": "Cómo iniciar sesión en el servidor: contraseña, clave privada, agente SSH, sin autenticación o automático (prueba contraseña, clave privada, preguntas interactivas y agente SSH en orden hasta que uno funcione)."
             },
             "password": {
               "label": "Contraseña",
-              "description": "Contraseña para «Contraseña» y «Clave privada y después contraseña»; obligatoria cuando «Origen de la contraseña» es «Escribir en este formulario». Para obtenerla con un comando local, cambia ese origen a «Comando local»."
+              "description": "Contraseña para «Contraseña», «Clave privada y después contraseña» y «Automático»; obligatoria cuando «Origen de la contraseña» es «Escribir en este formulario». Para obtenerla con un comando local, cambia ese origen a «Comando local». Automático prueba cada método en orden, así que esta es una de sus posibles fuentes."
             },
             "password_source": {
               "label": "Origen de la contraseña",
@@ -871,6 +1526,88 @@
             "display_name": {
               "label": "Nome connessione"
             },
+            "protocol": {
+              "label": "Protocollo",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "Seriale",
+                "rdp": "RDP (sperimentale)"
+              },
+              "description": "Protocollo di sessione di questa connessione. Le connessioni Telnet, VNC e RDP aprono la propria vista di sessione nel workbench (le opzioni per protocollo si configurano lì); le connessioni seriali usano un dispositivo locale e omettono i campi TCP. RDP è sperimentale."
+            },
+            "serial_port": {
+              "label": "Dispositivo seriale",
+              "description": "Percorso del dispositivo seriale locale, es. /dev/ttyUSB0 (Linux/macOS) o COM3 (Windows)."
+            },
+            "serial_baud": {
+              "label": "Baud",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "Bit di dati",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "Parità",
+              "options": {
+                "none": "Nessuna",
+                "even": "Pari",
+                "odd": "Dispari"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "Bit di stop",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "Il backspace invia",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "Dominio",
+              "description": "Dominio Windows per NLA (facoltativo)."
+            },
+            "rdp_resolution": {
+              "label": "Risoluzione",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "Politica dei certificati",
+              "options": {
+                "prompt": "Chiedi se non corrisponde",
+                "strict": "Rigoroso (rifiuta se non corrisponde)",
+                "accept-temporarily": "Accetta temporaneamente"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "Condividi appunti"
+            },
             "host": {
               "label": "Host"
             },
@@ -888,13 +1625,14 @@
                 "private-key": "Chiave privata",
                 "private-key-password": "Chiave privata, poi password",
                 "agent": "SSH Agent",
+                "auto": "Automatico (prova in ordine)",
                 "none": "Nessuna autenticazione"
               },
-              "description": "Come accedere al server: password, chiave privata, agent o nessuna autenticazione."
+              "description": "Come accedere al server: password, chiave privata, agent, nessuna autenticazione o automatico (prova password, chiave privata, prompt interattivi e agent SSH in ordine finché uno funziona)."
             },
             "password": {
               "label": "Password",
-              "description": "Password per «Password» e «Chiave privata, poi password»; obbligatoria quando «Origine password» è «Inserisci nel modulo». Per recuperarla con un comando locale, cambia l'origine in «Comando locale»."
+              "description": "Password per «Password», «Chiave privata, poi password» e «Automatico»; obbligatoria quando «Origine password» è «Inserisci nel modulo». Per recuperarla con un comando locale, cambia l'origine in «Comando locale». Automatico prova ogni metodo in ordine, quindi questa è una delle possibili fonti."
             },
             "password_source": {
               "label": "Origine password",
@@ -1059,6 +1797,88 @@
             "display_name": {
               "label": "接続名"
             },
+            "protocol": {
+              "label": "プロトコル",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "シリアル",
+                "rdp": "RDP（実験的）"
+              },
+              "description": "この接続が扱うセッションプロトコル。Telnet・VNC・RDP 接続はワークベンチ内で各自のセッションビューを開きます（プロトコル固有の設定もそこにあります）。シリアル接続はローカルデバイスを直接使用し、TCP ホスト欄は不要です。RDP は実験的機能です。"
+            },
+            "serial_port": {
+              "label": "シリアルデバイス",
+              "description": "ローカルシリアルデバイスのパス。例: /dev/ttyUSB0（Linux/macOS）や COM3（Windows）。"
+            },
+            "serial_baud": {
+              "label": "ボーレート",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "データビット",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "パリティ",
+              "options": {
+                "none": "なし",
+                "even": "偶数",
+                "odd": "奇数"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "ストップビット",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "Backspace が送信する文字",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "ドメイン",
+              "description": "NLA 用の Windows ドメイン（任意）。"
+            },
+            "rdp_resolution": {
+              "label": "解像度",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "証明書ポリシー",
+              "options": {
+                "prompt": "不一致なら確認",
+                "strict": "厳格（不一致は拒否）",
+                "accept-temporarily": "一時的に受け入れる"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "クリップボード共有"
+            },
             "host": {
               "label": "ホスト"
             },
@@ -1076,13 +1896,14 @@
                 "private-key": "秘密鍵",
                 "private-key-password": "秘密鍵の後にパスワード",
                 "agent": "SSH Agent",
+                "auto": "自動（順に試行）",
                 "none": "認証なし"
               },
-              "description": "サーバーへのサインイン方法：パスワード、秘密鍵、SSH Agent、または認証なし。"
+              "description": "サーバーへのサインイン方法：パスワード、秘密鍵、SSH Agent、認証なし、または自動（パスワード→秘密鍵→対話プロンプト→SSH Agent の順に成功するまで試行します）。"
             },
             "password": {
               "label": "パスワード",
-              "description": "「パスワード」「秘密鍵の後にパスワード」で使うパスワードです。「パスワードの取得方法」が「このフォームに入力」のときは必須です。ローカルコマンドで取得する場合は取得方法を「ローカルコマンド」に切り替えてください。"
+              "description": "「パスワード」「秘密鍵の後にパスワード」「自動」で使うパスワードです。「パスワードの取得方法」が「このフォームに入力」のときは必須です。ローカルコマンドで取得する場合は取得方法を「ローカルコマンド」に切り替えてください。自動は各方式を順に試行するため、これは候補ソースの 1 つです。"
             },
             "password_source": {
               "label": "パスワードの取得方法",
@@ -1247,6 +2068,88 @@
             "display_name": {
               "label": "Nome da conexão"
             },
+            "protocol": {
+              "label": "Protocolo",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "Serial",
+                "rdp": "RDP (experimental)"
+              },
+              "description": "Protocolo de sessão desta conexão. Conexões Telnet, VNC e RDP abrem sua própria visualização de sessão no workbench (as opções por protocolo ficam lá); conexões seriais usam um dispositivo local e dispensam os campos TCP. RDP é experimental."
+            },
+            "serial_port": {
+              "label": "Dispositivo serial",
+              "description": "Caminho do dispositivo serial local, ex.: /dev/ttyUSB0 (Linux/macOS) ou COM3 (Windows)."
+            },
+            "serial_baud": {
+              "label": "Baud rate",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "Bits de dados",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "Paridade",
+              "options": {
+                "none": "Nenhuma",
+                "even": "Par",
+                "odd": "Ímpar"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "Bits de parada",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "O que o Backspace envia",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "Domínio",
+              "description": "Domínio do Windows para NLA (opcional)."
+            },
+            "rdp_resolution": {
+              "label": "Resolução",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "Política de certificado",
+              "options": {
+                "prompt": "Perguntar em caso de divergência",
+                "strict": "Rígido (rejeitar divergência)",
+                "accept-temporarily": "Aceitar temporariamente"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "Compartilhar área de transferência"
+            },
             "host": {
               "label": "Host"
             },
@@ -1264,13 +2167,14 @@
                 "private-key": "Chave privada",
                 "private-key-password": "Chave privada e depois senha",
                 "agent": "Agente SSH",
+                "auto": "Automático (tentar em ordem)",
                 "none": "Sem autenticação"
               },
-              "description": "Como entrar no servidor: senha, chave privada, agente SSH ou sem autenticação."
+              "description": "Como entrar no servidor: senha, chave privada, agente SSH, sem autenticação ou automático (tenta senha, chave privada, prompts interativos e agente SSH em ordem até que um funcione)."
             },
             "password": {
               "label": "Senha",
-              "description": "Senha para «Senha» e «Chave privada e depois senha»; obrigatória quando «Origem da senha» é «Digitar neste formulário». Para obtê-la com um comando local, mude a origem para «Comando local»."
+              "description": "Senha para «Senha», «Chave privada e depois senha» e «Automático»; obrigatória quando «Origem da senha» é «Digitar neste formulário». Para obtê-la com um comando local, mude a origem para «Comando local». Automático tenta cada método em ordem, então esta é uma das possíveis fontes."
             },
             "password_source": {
               "label": "Origem da senha",
@@ -1435,6 +2339,88 @@
             "display_name": {
               "label": "连接名称"
             },
+            "protocol": {
+              "label": "协议",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "串口",
+                "rdp": "RDP（实验性）"
+              },
+              "description": "此连接承载的会话协议。Telnet、VNC 与 RDP 连接会在工作台内打开各自的会话视图（协议选项在工作台内设置）；串口连接直接使用本地设备，无需 TCP 主机字段。RDP 为实验能力。"
+            },
+            "serial_port": {
+              "label": "串口设备",
+              "description": "本地串口设备路径，如 /dev/ttyUSB0（Linux/macOS）或 COM3（Windows）。"
+            },
+            "serial_baud": {
+              "label": "波特率",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "数据位",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "校验位",
+              "options": {
+                "none": "无",
+                "even": "偶校验",
+                "odd": "奇校验"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "停止位",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "退格键发送",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "域",
+              "description": "Windows NLA 域（可选）。"
+            },
+            "rdp_resolution": {
+              "label": "分辨率",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "证书策略",
+              "options": {
+                "prompt": "不匹配时询问",
+                "strict": "严格（不匹配即拒绝）",
+                "accept-temporarily": "临时接受"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "共享剪贴板"
+            },
             "host": {
               "label": "主机"
             },
@@ -1452,13 +2438,14 @@
                 "private-key": "私钥",
                 "private-key-password": "私钥后密码",
                 "agent": "SSH Agent",
+                "auto": "自动（按序尝试）",
                 "none": "无认证"
               },
-              "description": "选择登录服务器的方式：密码、私钥、SSH Agent 或无认证。"
+              "description": "选择登录服务器的方式：密码、私钥、SSH Agent、无认证或自动（按密码→私钥→交互式提问→SSH Agent 的顺序依次尝试，直到成功）。"
             },
             "password": {
               "label": "密码",
-              "description": "供「密码」「私钥后密码」两种认证使用；「密码来源」选「在表单中填写」时必填。若由本地命令取回，请把「密码来源」改为「本地命令取回」。"
+              "description": "供「密码」「私钥后密码」「自动」三种认证使用；「密码来源」选「在表单中填写」时必填。若由本地命令取回，请把「密码来源」改为「本地命令取回」。自动按序尝试各认证方式，密码只是其中一种来源。"
             },
             "password_source": {
               "label": "密码来源",
@@ -1623,6 +2610,88 @@
             "display_name": {
               "label": "連線名稱"
             },
+            "protocol": {
+              "label": "協議",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "串列埠",
+                "rdp": "RDP（實驗性）"
+              },
+              "description": "此連線承載的會話協議。Telnet、VNC 與 RDP 連線會在工作台內開啟各自的會話檢視（協議選項在工作台內設定）；串列埠連線直接使用本機裝置，無需 TCP 主機欄位。RDP 為實驗能力。"
+            },
+            "serial_port": {
+              "label": "串列埠裝置",
+              "description": "本機串列埠裝置路徑，如 /dev/ttyUSB0（Linux/macOS）或 COM3（Windows）。"
+            },
+            "serial_baud": {
+              "label": "鮑率",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "資料位",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "同位位元",
+              "options": {
+                "none": "無",
+                "even": "偶同位",
+                "odd": "奇同位"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "停止位元",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "退格鍵送出",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "網域",
+              "description": "Windows NLA 網域（可選）。"
+            },
+            "rdp_resolution": {
+              "label": "解析度",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "憑證策略",
+              "options": {
+                "prompt": "不符時詢問",
+                "strict": "嚴格（不符即拒絕）",
+                "accept-temporarily": "暫時接受"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "共用剪貼簿"
+            },
             "host": {
               "label": "主機"
             },
@@ -1640,13 +2709,14 @@
                 "private-key": "私鑰",
                 "private-key-password": "私鑰後密碼",
                 "agent": "SSH Agent",
+                "auto": "自動（依序嘗試）",
                 "none": "無認證"
               },
-              "description": "選擇登入伺服器的方式：密碼、私鑰、SSH Agent 或無認證。"
+              "description": "選擇登入伺服器的方式：密碼、私鑰、SSH Agent、無認證或自動（按密碼→私鑰→互動式提問→SSH Agent 的順序依次嘗試，直到成功）。"
             },
             "password": {
               "label": "密碼",
-              "description": "供「密碼」「私鑰後密碼」兩種認證使用；「密碼來源」選「在表單中填寫」時必填。若由本機命令取回，請把「密碼來源」改為「本機命令取回」。"
+              "description": "供「密碼」「私鑰後密碼」「自動」三種認證使用；「密碼來源」選「在表單中填寫」時必填。若由本機命令取回，請把「密碼來源」改為「本機命令取回」。自動依序嘗試各認證方式，密碼只是其中一種來源。"
             },
             "password_source": {
               "label": "密碼來源",

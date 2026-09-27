@@ -25,13 +25,22 @@ use crate::agent_terminal::{self, AgentTerminalMode};
 use crate::alert_triage;
 use crate::app_bridge;
 use crate::audit_log;
+use crate::docker;
 use crate::exec::{self, AuthFlowMode, Hints, SudoAuth};
 use crate::host_key::HostKeyVerifier;
 use crate::mcp_safety::{self, CommandRisk};
-use crate::model::{AuthenticationMethod, JumpHost, StoredConnection, SudoSource};
+use crate::model::{
+    normalize_remote_path, AuthenticationMethod, JumpHost, StoredConnection, SudoSource,
+};
 use crate::multi_exec;
+use crate::preferences;
 use crate::sftp_copy;
-use crate::ssh::{SshClient, SshRuntime, NO_TERMINAL_SESSION_MESSAGE};
+use crate::sftp_name;
+use crate::sftp_raw;
+use crate::ssh::{
+    classify_raw_kind, raw_delete_tree, RawSftpClient, SshClient, SshRuntime,
+    NO_TERMINAL_SESSION_MESSAGE,
+};
 use crate::sudo_allowlist;
 use crate::sudo_profiles;
 
@@ -260,28 +269,68 @@ fn permission_mode_from_env(lookup: impl FnOnce(&str) -> Option<String>) -> Opti
     }
 }
 
+/// Effective connection-scope policy. Persisted empty arrays retain their
+/// original "unrestricted" UI meaning, while an explicitly empty environment
+/// override is fail-closed and therefore must use a distinct representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectionScope {
+    Unrestricted,
+    DenyAll,
+    AllowList(Vec<String>),
+}
+
+impl ConnectionScope {
+    fn from_persisted(entries: Vec<String>) -> Self {
+        if entries.is_empty() {
+            Self::Unrestricted
+        } else {
+            Self::AllowList(entries)
+        }
+    }
+
+    fn allows(&self, id: &str, name: Option<&str>, host: &str) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::DenyAll => false,
+            Self::AllowList(entries) => scope_allows(entries, id, name, host),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !matches!(self, Self::Unrestricted)
+    }
+
+    fn entries(&self) -> &[String] {
+        match self {
+            Self::AllowList(entries) => entries,
+            Self::Unrestricted | Self::DenyAll => &[],
+        }
+    }
+}
+
 /// Parses `DBX_SSH_MCP_CONNECTION_SCOPE` (comma-separated entries). An env
 /// var that is set but parses to zero entries still counts as an override —
 /// an operator pinning an empty list means "no connections", not "unset".
-fn scope_from_env(lookup: impl FnOnce(&str) -> Option<String>) -> Option<Vec<String>> {
+fn scope_from_env(lookup: impl FnOnce(&str) -> Option<String>) -> Option<ConnectionScope> {
     let value = lookup("DBX_SSH_MCP_CONNECTION_SCOPE")?;
-    Some(
-        value
-            .split(',')
-            .map(|entry| entry.trim().to_string())
-            .filter(|entry| !entry.is_empty())
-            .take(CONNECTION_SCOPE_MAX_ENTRIES)
-            .collect(),
-    )
+    let entries: Vec<String> = value
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .take(CONNECTION_SCOPE_MAX_ENTRIES)
+        .collect();
+    Some(if entries.is_empty() {
+        ConnectionScope::DenyAll
+    } else {
+        ConnectionScope::AllowList(entries)
+    })
 }
 
 /// Scope match rule (§1.3): an entry allows a connection when it equals the
 /// connection id, equals the connection name, or equals the host ASCII
-/// case-insensitively. An empty scope allows everything.
+/// case-insensitively. Empty entry lists are only used by callers that have
+/// already selected the unrestricted policy.
 pub fn scope_allows(scope: &[String], id: &str, name: Option<&str>, host: &str) -> bool {
-    if scope.is_empty() {
-        return true;
-    }
     scope.iter().any(|entry| {
         entry == id
             || name.map(|name| entry == name).unwrap_or(false)
@@ -290,7 +339,9 @@ pub fn scope_allows(scope: &[String], id: &str, name: Option<&str>, host: &str) 
 }
 
 /// Confirm-mode gate set (§1.3): write tools plus the exec family.
-/// Read-only tools and `ssh_close` are never intercepted.
+/// Read-only tools and `ssh_close` are never intercepted. `docker_action` is
+/// intentionally structured; the frontend shows its canonical command but
+/// keeps that confirmation field read-only, unlike ordinary SSH commands.
 fn is_confirm_gated_tool(name: &str) -> bool {
     is_write_tool(name) || matches!(name, "ssh_exec" | "ssh_multi_exec" | "ssh_terminal_input")
 }
@@ -306,6 +357,8 @@ fn is_connection_scoped_tool(name: &str) -> bool {
         name,
         "ssh_task_status"
             | "ssh_metrics"
+            | "docker_list"
+            | "docker_action"
             | "ssh_test_connection"
             | "ssh_close"
             | "sftp_list_dir"
@@ -535,6 +588,22 @@ impl McpConnection {
         self.sftp = Some(sftp.clone());
         Ok(sftp)
     }
+
+    /// 独立打开一条 sftp 子系统通道跑裸包客户端（严格串行请求/响应），与
+    /// 高层会话并存不复用：latin-1 编码模式下列表/写操作保原始字节专用
+    /// （M17，语义与 `ssh.rs::raw_sftp_client` 一致）。
+    async fn raw_sftp(&mut self) -> Result<RawSftpClient, String> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|error| format!("Failed to open SFTP channel: {error}"))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|error| format!("Failed to start SFTP: {error}"))?;
+        sftp_raw::RawSftp::init(channel.into_stream()).await
+    }
 }
 
 pub struct McpState {
@@ -619,7 +688,11 @@ impl McpState {
         let (mode, scope) = self.effective_permission();
         if let Some(object) = payload.as_object_mut() {
             object.insert("execPermissionMode".to_string(), json!(mode));
-            object.insert("connectionScope".to_string(), json!(scope));
+            object.insert("connectionScope".to_string(), json!(scope.entries()));
+            object.insert(
+                "connectionScopeDenyAll".to_string(),
+                json!(matches!(scope, ConnectionScope::DenyAll)),
+            );
             let persisted = self
                 .permission
                 .read()
@@ -718,7 +791,7 @@ impl McpState {
     /// Effective (env-overridden) permission pair: `(mode, scope)`. The env
     /// vars win when present-and-valid; the persisted values apply
     /// otherwise.
-    fn effective_permission(&self) -> (String, Vec<String>) {
+    fn effective_permission(&self) -> (String, ConnectionScope) {
         let persisted = self
             .permission
             .read()
@@ -726,8 +799,8 @@ impl McpState {
             .clone();
         let mode = permission_mode_from_env(|key| std::env::var(key).ok())
             .unwrap_or(persisted.exec_permission_mode);
-        let scope =
-            scope_from_env(|key| std::env::var(key).ok()).unwrap_or(persisted.connection_scope);
+        let scope = scope_from_env(|key| std::env::var(key).ok())
+            .unwrap_or_else(|| ConnectionScope::from_persisted(persisted.connection_scope));
         (mode, scope)
     }
 
@@ -739,7 +812,7 @@ impl McpState {
     }
 
     /// Effective scope for gate checks.
-    fn effective_scope(&self) -> Vec<String> {
+    fn effective_scope(&self) -> ConnectionScope {
         self.effective_permission().1
     }
 
@@ -952,11 +1025,10 @@ impl McpState {
         // be widened by dialing around the registry.
         {
             let scope = self.effective_scope();
-            if !scope.is_empty() && is_connection_scoped_tool(name) {
+            if scope.is_active() && is_connection_scoped_tool(name) {
                 match resolved_ref.as_ref() {
                     Some(connection) => {
-                        if !scope_allows(
-                            &scope,
+                        if !scope.allows(
                             &connection.id,
                             connection.name.as_deref(),
                             &connection.host,
@@ -1085,14 +1157,36 @@ impl McpState {
             } else {
                 "command"
             };
-            let command = required_str(arguments, command_key)?;
+            // docker_action carries no `command` argument: derive the exact
+            // approval text (`docker rm <id>`) from the validated action so
+            // the dialog shows precisely what will run, and a malformed
+            // id/action fails here instead of after approval.
+            let command: String = if name == "docker_action" {
+                let container_id = required_str(arguments, "containerId")?;
+                docker::validate_container_id(container_id)?;
+                let action = docker::parse_action(required_str(arguments, "action")?)?;
+                docker::action_command(action, container_id)
+            } else {
+                required_str(arguments, command_key)?.to_string()
+            };
             let connection_id = arguments.get("connectionId").and_then(Value::as_str);
             let approved = self
                 .runtime
-                .request_mcp_confirm(name, command, connection_id, emitter)
+                .request_mcp_confirm(name, &command, connection_id, emitter)
                 .await?;
-            // The approval dialog is editable: the confirmed text replaces
-            // the original for the actual execution.
+            // docker_action is intentionally structured: its canonical text
+            // is evidence for the action/container pair, not an alternate
+            // shell input. Refuse edits instead of displaying one action and
+            // executing another.
+            if name == "docker_action" && approved != command {
+                return Err(
+                    "Docker action confirmation text is not editable; approve the displayed canonical command or cancel"
+                        .to_string(),
+                );
+            }
+            // Other command-based tools retain the existing editable approval
+            // contract: the approved text replaces the original execution
+            // input.
             if approved != command {
                 let mut rewritten = arguments.clone();
                 if let Some(map) = rewritten.as_object_mut() {
@@ -1532,9 +1626,11 @@ impl McpState {
                         Ok(metrics)
                     }
                     "sftp_disk_usage" => {
-                        let path = required_str(arguments, "path")?;
+                        // M25：与工作台 sftp_disk_usage 同口径——远端路径
+                        // 组件归一后再进 shell 命令（df -kP）。
+                        let path = normalize_remote_path(required_str(arguments, "path")?)?;
                         let connection = self.connection(arguments).await?;
-                        let command = format!("df -kP {}", exec::shell_quote(path));
+                        let command = format!("df -kP {}", exec::shell_quote(&path));
                         // Plugin-internal plumbing: no client setEnv, keeping
                         // the df output parseable regardless of locale overrides.
                         let outcome =
@@ -1543,6 +1639,39 @@ impl McpState {
                         exec::parse_disk_usage(&outcome.output).ok_or_else(|| {
                             format!("Could not parse disk usage: {}", outcome.output)
                         })
+                    }
+                    "docker_list" => {
+                        // Read-only collection on the pooled connection; the
+                        // probe degrades to available:false instead of erroring.
+                        let connection = self.connection(arguments).await?;
+                        docker::collect_list(&connection).await
+                    }
+                    "docker_action" => {
+                        // Validation before any connection I/O (same
+                        // fail-fast shape as metrics_sections).
+                        let container_id = required_str(arguments, "containerId")?;
+                        docker::validate_container_id(container_id)?;
+                        let action = docker::parse_action(required_str(arguments, "action")?)?;
+                        let connection = self.connection(arguments).await?;
+                        // Quick Sudo credentials resolve up front from local
+                        // sources only (registry + profile store); a resolution
+                        // failure degrades to None and the fallback surfaces
+                        // the configuration guidance. No password argument
+                        // exists on this tool by contract.
+                        let stored = self
+                            .registered_connection_by_ref(arguments)
+                            .await
+                            .ok()
+                            .flatten();
+                        let sudo_auth = self.resolve_sudo_auth(arguments, None, stored).await.ok();
+                        docker::perform_action(
+                            &connection,
+                            sudo_auth.as_ref(),
+                            false,
+                            container_id,
+                            action,
+                        )
+                        .await
                     }
                     other => self.sftp_tool(other, arguments).await,
                 };
@@ -2005,13 +2134,8 @@ impl McpState {
                         .ok_or_else(|| format!("No saved connection matched '{raw}'"))?
                 }
             };
-            if !scope.is_empty()
-                && !scope_allows(
-                    &scope,
-                    &resolved.id,
-                    resolved.name.as_deref(),
-                    &resolved.host,
-                )
+            if scope.is_active()
+                && !scope.allows(&resolved.id, resolved.name.as_deref(), &resolved.host)
             {
                 return Err(format!(
                     "Connection '{}' ({} / {}) is outside this MCP server's connectionScope; \
@@ -2209,11 +2333,53 @@ impl McpState {
         let entry = guard
             .get_mut(&connection_pool_key(arguments))
             .ok_or("Connection is not established")?;
+        // 文件名编码判定（M17，连接级）：连接覆盖 > 全局偏好 > 缺省 auto。
+        // dispatch 层已把 connectionName/端点选择器归一化为显式 connectionId
+        // （见 call_tool_inner），这里只需读 connectionId；内联拨号按未覆盖
+        // 处理（跟随全局），与工作台 resolve_sftp_encoding_opt 同构。
+        let encoding = mcp_sftp_encoding(&self.runtime.data_dir(), arguments);
         match name {
             "sftp_list_dir" => {
-                let path = required_str(arguments, "path")?;
+                // M25：与工作台车道同口径——组件归一（绝对化 + 去 ./../空段）。
+                // latin-1 显示域内的 clean 名不受影响；这是纯字符级清洗，
+                // 归一在编码还原之前完成。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M17）：裸包 READDIR 保原始字节，名字口径为显示
+                    // 形式（latin-1 解码忠实可逆，AI 回传同一路径即落回原始
+                    // 字节）。裸包路径任何失败回退高层（读操作回退安全，与
+                    // 工作台 sftp_list_path 同策略）。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => match client
+                            .readdir(&sftp_name::latin1_encode_display(&path))
+                            .await
+                        {
+                            Ok(raw_entries) => {
+                                return Ok(json!({
+                                    "path": path,
+                                    "entries": raw_list_items(&path, raw_entries),
+                                }));
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[ssh] MCP sftp_list_dir: raw byte listing unavailable, falling back: {error}"
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_list_dir: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
-                let entries = sftp.lock().await.read_dir(path).await.map_err(sftp_error)?;
+                let entries = sftp
+                    .lock()
+                    .await
+                    .read_dir(&path)
+                    .await
+                    .map_err(sftp_error)?;
                 let items: Vec<Value> = entries
                     .map(|entry| {
                         let metadata = entry.metadata();
@@ -2234,9 +2400,36 @@ impl McpState {
                 Ok(json!({ "path": path, "entries": items }))
             }
             "sftp_stat" => {
-                let path = required_str(arguments, "path")?;
+                // M25：组件归一，与工作台 sftp/stat 同口径。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M18）：显示路径还原字节后走裸包 LSTAT（不跟随
+                    // 符号链接，与工作台 sftp/stat M17 同口径）。裸包 v3
+                    // attrs 不携带 uid/gid：shell 查询尽力而为补齐（M17 先例，
+                    // 非 ASCII 名的字节参数边界登记在案）。仅裸包客户端建立
+                    // 失败回退高层；操作错误原样上抛（工作台 stat 同策略）。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            let attrs = client
+                                .lstat(&sftp_name::latin1_encode_display(&path))
+                                .await?;
+                            let (uid, gid) = lookup_remote_uid_gid(&entry.handle, &path).await;
+                            return Ok(raw_stat_json(&path, attrs, uid, gid));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_stat: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
-                let metadata = sftp.lock().await.metadata(path).await.map_err(sftp_error)?;
+                let metadata = sftp
+                    .lock()
+                    .await
+                    .metadata(&path)
+                    .await
+                    .map_err(sftp_error)?;
                 Ok(json!({
                     "path": path,
                     "size": metadata.size,
@@ -2248,12 +2441,29 @@ impl McpState {
                 }))
             }
             "sftp_exists" => {
-                let path = required_str(arguments, "path")?;
+                // M25：组件归一，与工作台 sftp/exists 同口径。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M18）：裸包 LSTAT，只认 NO_SUCH_FILE 为
+                    // 「不存在」，其余错误如实上抛。仅裸包客户端建立失败回退
+                    // 高层（M17-B 写工具同策略）。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            let exists = raw_sftp_exists(&mut client, &path).await?;
+                            return Ok(json!({ "path": path, "exists": exists }));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_exists: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
                 // Only "no such file" means absent: a permission error or a
                 // dead channel must surface as an error, never as a
                 // misleading `exists: false`.
-                let exists = match sftp.lock().await.metadata(path).await {
+                let exists = match sftp.lock().await.metadata(&path).await {
                     Ok(_) => true,
                     Err(error) if is_no_such_file_error(&error) => false,
                     Err(error) => return Err(sftp_error(error)),
@@ -2271,7 +2481,8 @@ impl McpState {
                 Ok(json!({ "home": home }))
             }
             "sftp_read_file" => {
-                let path = required_str(arguments, "path")?;
+                // M25：组件归一，与工作台读取族同口径。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
                 // Settings move the default and the ceiling (down freely, up
                 // within the soft caps); the clamp itself stays as the
                 // defensive hard limit against oversized requests.
@@ -2281,8 +2492,36 @@ impl McpState {
                     .clamp(1, limits.max_download_bytes);
                 let as_base64 = arg_bool(arguments, "base64")?.unwrap_or(false);
                 let offset = arg_u64(arguments, "offset")?.unwrap_or(0);
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M18）：显示路径还原字节后 OPEN(READ)+READ 分块
+                    // （32 KiB 粒度）。大文件策略沿既有 MCP 边界：单次至多
+                    // maxBytes（上限 maxDownloadBytes），超出标记 truncated。
+                    // 读操作回退安全（M17-B readdir 同策略）：裸包路径任何
+                    // 失败回退高层重读。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            match raw_sftp_read_file(&mut client, &path, offset, max_bytes).await {
+                                Ok((data, truncated)) => {
+                                    return Ok(read_file_response(
+                                        &path, &data, truncated, as_base64,
+                                    ));
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "[ssh] MCP sftp_read_file: raw byte read unavailable, falling back: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_read_file: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
-                let mut file = sftp.lock().await.open(path).await.map_err(sftp_error)?;
+                let mut file = sftp.lock().await.open(&path).await.map_err(sftp_error)?;
                 if offset > 0 {
                     use tokio::io::AsyncSeekExt;
                     // SeekFrom::Start only moves the local read cursor; an
@@ -2298,20 +2537,11 @@ impl McpState {
                     .map_err(|error| format!("SFTP read failed: {error}"))?;
                 let truncated = data.len() as u64 > max_bytes;
                 data.truncate(max_bytes as usize);
-                if as_base64 {
-                    Ok(
-                        json!({ "path": path, "dataBase64": BASE64_STANDARD.encode(&data), "truncated": truncated }),
-                    )
-                } else {
-                    Ok(json!({
-                        "path": path,
-                        "content": String::from_utf8_lossy(&data),
-                        "truncated": truncated,
-                    }))
-                }
+                Ok(read_file_response(&path, &data, truncated, as_base64))
             }
             "sftp_write_file" => {
-                let path = required_str(arguments, "path")?;
+                // M25：远端路径组件归一（content 是本地文本参数，不归一）。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
                 let content = required_str(arguments, "content")?;
                 let upload_limit = self.size_limits().max_upload_bytes;
                 if content.len() as u64 > upload_limit {
@@ -2322,13 +2552,37 @@ impl McpState {
                     ));
                 }
                 let overwrite = arg_bool(arguments, "overwrite")?.unwrap_or(false);
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M18）：显示路径还原字节后走裸包直写（选型：MCP
+                    // 面沿既有 sftp_write_file 直写语义——OPEN(CREAT|WRITE|
+                    // TRUNC) 截断 + WRITE 32 KiB 分块，无工作台上传族的
+                    // `.dbx-part` 暂存需求）。覆盖预检与写入同一字节口径
+                    // （裸包 LSTAT）。仅裸包客户端建立失败回退高层（M17-B 写
+                    // 工具同策略）；操作错误原样上抛，不回退（不会重复执行）。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            return raw_sftp_write_file(
+                                &mut client,
+                                &path,
+                                content.as_bytes(),
+                                overwrite,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_write_file: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
-                if !overwrite && sftp.lock().await.metadata(path).await.is_ok() {
+                if !overwrite && sftp.lock().await.metadata(&path).await.is_ok() {
                     return Err(format!(
                         "Remote path already exists: {path} (pass overwrite=true to replace)"
                     ));
                 }
-                let mut file = sftp.lock().await.create(path).await.map_err(sftp_error)?;
+                let mut file = sftp.lock().await.create(&path).await.map_err(sftp_error)?;
                 tokio::io::AsyncWriteExt::write_all(&mut file, content.as_bytes())
                     .await
                     .map_err(|error| format!("SFTP write failed: {error}"))?;
@@ -2338,57 +2592,150 @@ impl McpState {
                 Ok(json!({ "path": path, "bytes": content.len() }))
             }
             "sftp_mkdir" => {
-                let path = required_str(arguments, "path")?;
+                // M25：组件归一，与工作台 sftp_create_directory 同口径。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M17）：显示路径整条按 latin1_encode_display 还原
+                    // 字节后走裸包 MKDIR。仅裸包通道建立失败回退高层（建立阶段
+                    // 尚未发出任何请求，回退不会重复执行）；操作错误原样上抛，
+                    // 不回退（与工作台 sftp_create_directory 同策略）。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            client
+                                .mkdir(&sftp_name::latin1_encode_display(&path))
+                                .await?;
+                            return Ok(json!({ "path": path, "created": true }));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_mkdir: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
                 sftp.lock()
                     .await
-                    .create_dir(path)
+                    .create_dir(&path)
                     .await
                     .map_err(sftp_error)?;
                 Ok(json!({ "path": path, "created": true }))
             }
             "sftp_remove" => {
-                let path = required_str(arguments, "path")?;
+                // M25：组件归一，与工作台删除族同口径。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
                 let recursive = arg_bool(arguments, "recursive")?.unwrap_or(false);
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M17）：显示路径还原字节后走裸包删除。LSTAT 判型
+                    // 分派与高层分支一致（symlink/文件 REMOVE、目录递归树删、
+                    // 非递归目录报错），符号链接绝不跟随。回退策略同 mkdir。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            let raw_path = sftp_name::latin1_encode_display(&path);
+                            let attrs = client.lstat(&raw_path).await?;
+                            if classify_raw_kind(attrs.permissions) == "directory" {
+                                if !recursive {
+                                    return Err(format!(
+                                        "{path} is a directory; pass recursive=true"
+                                    ));
+                                }
+                                raw_delete_tree(&mut client, &raw_path).await?;
+                            } else {
+                                client.remove(&raw_path).await?;
+                            }
+                            return Ok(json!({ "path": path, "removed": true }));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_remove: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
                 let metadata = sftp
                     .lock()
                     .await
-                    .symlink_metadata(path)
+                    .symlink_metadata(&path)
                     .await
                     .map_err(sftp_error)?;
                 if metadata.is_symlink() || !metadata.is_dir() {
                     sftp.lock()
                         .await
-                        .remove_file(path)
+                        .remove_file(&path)
                         .await
                         .map_err(sftp_error)?;
                 } else if recursive {
-                    remove_tree(&sftp, path.to_string()).await?;
+                    remove_tree(&sftp, path.clone()).await?;
                 } else {
                     return Err(format!("{path} is a directory; pass recursive=true"));
                 }
                 Ok(json!({ "path": path, "removed": true }))
             }
             "sftp_rename" => {
-                let source = required_str(arguments, "sourcePath")?;
-                let target = required_str(arguments, "targetPath")?;
+                // M25：源与目标都是远端路径，都要组件归一（M24 前例：
+                // raw_read_chunk 同期在两条车道拉齐了同一口径）。
+                let source = normalize_remote_path(required_str(arguments, "sourcePath")?)?;
+                let target = normalize_remote_path(required_str(arguments, "targetPath")?)?;
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M17）：源是列表回传的显示路径（latin1_encode_
+                    // display 精确逆变换还原字节），目标是 AI 新输入/组合的
+                    // 显示文本（latin-1 域内字符映回同值字节，域外 UTF-8 兜底，
+                    // 与工作台新输入语义一致）。裸包 RENAME 保证改名不破坏
+                    // 非 UTF-8 字节。回退策略同 mkdir。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            client
+                                .rename(
+                                    &sftp_name::latin1_encode_display(&source),
+                                    &sftp_name::latin1_encode_display(&target),
+                                )
+                                .await?;
+                            return Ok(json!({
+                                "sourcePath": source,
+                                "targetPath": target,
+                                "renamed": true,
+                            }));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_rename: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
                 sftp.lock()
                     .await
-                    .rename(source, target)
+                    .rename(&source, &target)
                     .await
                     .map_err(sftp_error)?;
                 Ok(json!({ "sourcePath": source, "targetPath": target, "renamed": true }))
             }
             "sftp_chmod" => {
-                let path = required_str(arguments, "path")?;
+                // M25：组件归一，与工作台 chmod 同口径。
+                let path = normalize_remote_path(required_str(arguments, "path")?)?;
                 let mode = arguments.get("mode").ok_or_else(|| {
                     "Missing or invalid parameter: mode (expected an octal value up to 7777, \
                      e.g. \"644\" or 0644)"
                         .to_string()
                 })?;
                 let mode = parse_chmod_mode(mode)?;
+                if encoding == sftp_name::NameEncoding::Latin1 {
+                    // latin-1（M18）：显示路径还原字节后裸包 SETSTAT（只带
+                    // permissions 子集）。仅裸包客户端建立失败回退高层；操作
+                    // 错误原样上抛（与 M17-B 写工具同策略）。
+                    match entry.raw_sftp().await {
+                        Ok(mut client) => {
+                            return raw_sftp_chmod(&mut client, &path, mode).await;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_chmod: raw byte client unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = entry.sftp().await?;
                 let metadata = russh_sftp::protocol::FileAttributes {
                     permissions: Some(mode),
@@ -2396,7 +2743,7 @@ impl McpState {
                 };
                 sftp.lock()
                     .await
-                    .set_metadata(path, metadata)
+                    .set_metadata(&path, metadata)
                     .await
                     .map_err(sftp_error)?;
                 Ok(json!({ "path": path, "mode": format!("{mode:04o}") }))
@@ -2419,7 +2766,26 @@ impl McpState {
                         None
                     }
                 };
-                Ok(sftp_copy::execute(&entry.handle, sftp, op, &request)
+                // latin-1（M18）：裸包客户端可用时，覆盖预检与同目录 move 的
+                // RENAME 快路径走字节保真（工作台 M17-A 同模式；路径口径为
+                // 显示形式）。执行层边界（登记，同工作台 M17-A）：远端
+                // `cp`/`mv` 的 exec 命令串是 UTF-8 String，服务器原始字节经
+                // shell 参数不可控，copy 与跨目录 move 的执行层保持字面量
+                // 发送（clean 名不受影响，非 ASCII 名由服务器侧报错）。
+                let raw = if encoding == sftp_name::NameEncoding::Latin1 {
+                    match entry.raw_sftp().await {
+                        Ok(client) => Some(client),
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP {name}: raw byte client unavailable, literal precheck fallback: {error}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(sftp_copy::execute(&entry.handle, sftp, raw, op, &request)
                     .await
                     .into_json())
             }
@@ -2445,7 +2811,8 @@ impl McpState {
         // Both gaps named in one error (round 6 enumeration contract).
         missing_required(arguments, &["localPath", "remotePath"])?;
         let local_path = required_str(arguments, "localPath")?;
-        let remote_path = required_str(arguments, "remotePath")?;
+        // M25：远端路径组件归一（localPath 是本地文件参数，不归一）。
+        let remote_path = normalize_remote_path(required_str(arguments, "remotePath")?)?;
         let overwrite = arg_bool(arguments, "overwrite")?.unwrap_or(false);
         let local_source = std::fs::canonicalize(local_path)
             .map_err(|error| format!("Cannot read local file {local_path}: {error}"))?;
@@ -2462,7 +2829,7 @@ impl McpState {
             ));
         }
         let outcome = self
-            .upload_via_sftp(arguments, local_path, remote_path, &data, overwrite)
+            .upload_via_sftp(arguments, local_path, &remote_path, &data, overwrite)
             .await;
         if outcome.is_err() {
             self.drop_connection(arguments).await;
@@ -2483,6 +2850,30 @@ impl McpState {
         let entry = guard
             .get_mut(&connection_pool_key(arguments))
             .ok_or("Connection is not established")?;
+        // latin-1（M19）：显示路径整条按 latin1_encode_display 还原字节后走
+        // 裸包直写（选型：沿既有 sftp_upload 直写语义，无工作台上传族的
+        // `.dbx-part` 暂存需求；覆盖预检与写入同一字节口径，复用 M18 的
+        // raw_sftp_write_bytes）。仅裸包客户端建立失败回退高层（M18 写工具
+        // 同策略）；操作错误原样上抛，不回退（不会重复执行）。
+        if mcp_sftp_encoding(&self.runtime.data_dir(), arguments) == sftp_name::NameEncoding::Latin1
+        {
+            match entry.raw_sftp().await {
+                Ok(mut client) => {
+                    let bytes =
+                        raw_sftp_write_bytes(&mut client, remote_path, data, overwrite).await?;
+                    return Ok(json!({
+                        "localPath": local_path,
+                        "remotePath": remote_path,
+                        "bytes": bytes,
+                    }));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[ssh] MCP sftp_upload: raw byte client unavailable, falling back: {error}"
+                    );
+                }
+            }
+        }
         let sftp = entry.sftp().await?;
         if !overwrite && sftp.lock().await.metadata(remote_path).await.is_ok() {
             return Err(format!(
@@ -2513,7 +2904,8 @@ impl McpState {
         // the schema's required order (remotePath before localPath).
         missing_required(arguments, &["remotePath", "localPath"])?;
         let local_path = required_str(arguments, "localPath")?;
-        let remote_path = required_str(arguments, "remotePath")?;
+        // M25：远端路径组件归一（localPath 是本地文件参数，不归一）。
+        let remote_path = normalize_remote_path(required_str(arguments, "remotePath")?)?;
         // Local-write hygiene before anything else: remote content must not
         // land on shell bootstrap / scheduled-execution paths.
         if is_sensitive_local_path(local_path) {
@@ -2563,7 +2955,7 @@ impl McpState {
         // connection untouched (same contract as the other local checks).
         self.ensure_local_transfer_allowed(&local_target)?;
         let outcome = self
-            .download_via_sftp(arguments, remote_path, local_path, &local_target)
+            .download_via_sftp(arguments, &remote_path, local_path, &local_target)
             .await;
         if outcome.is_err() {
             self.drop_connection(arguments).await;
@@ -2584,6 +2976,51 @@ impl McpState {
         let entry = guard
             .get_mut(&connection_pool_key(arguments))
             .ok_or("Connection is not established")?;
+        // latin-1（M19）：读侧沿 M18 sftp_read_file 同策略——显示路径整条
+        // latin1_encode_display 还原字节后 OPEN(READ)+READ，裸包路径任何
+        // 失败回退高层重读（读操作安全）。目录探测不单独走裸包 STAT：目录
+        // 的 OPEN 会被服务器拒绝、落入回退，由高层给出与 auto 分支一致的
+        // 「is a directory」错误；超限沿既有 post-read 口径报错（读取量以
+        // download_limit+1 探测封顶，不做无界传输）。
+        if mcp_sftp_encoding(&self.runtime.data_dir(), arguments) == sftp_name::NameEncoding::Latin1
+        {
+            match entry.raw_sftp().await {
+                Ok(mut client) => {
+                    match raw_sftp_read_file(&mut client, remote_path, 0, download_limit).await {
+                        Ok((data, truncated)) => {
+                            if truncated {
+                                return Err(format!(
+                                    "Remote file {remote_path} exceeds the MCP download limit \
+                                     of {download_limit} bytes (adjust maxDownloadBytes via \
+                                     mcp/settings/set)"
+                                ));
+                            }
+                            std::fs::write(local_target, &data).map_err(|error| {
+                                format!(
+                                    "Cannot write local file {}: {error}",
+                                    local_target.display()
+                                )
+                            })?;
+                            return Ok(json!({
+                                "remotePath": remote_path,
+                                "localPath": local_path,
+                                "bytes": data.len(),
+                            }));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh] MCP sftp_download: raw byte read unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[ssh] MCP sftp_download: raw byte client unavailable, falling back: {error}"
+                    );
+                }
+            }
+        }
         let sftp = entry.sftp().await?;
         let metadata = sftp
             .lock()
@@ -2825,6 +3262,225 @@ async fn remove_tree(sftp: &Arc<AsyncMutex<SftpSession>>, root: String) -> Resul
     Ok(())
 }
 
+/// MCP 工具面的连接级文件名编码判定（M17）：arguments 携带的 connectionId
+/// （保存连接；dispatch 层已把 connectionName/端点选择器归一化为该字段）
+/// 命中 `sftp_name_encoding_overrides` 时优先，否则跟随全局
+/// `sftp_name_encoding`，缺省 auto——与工作台
+/// `Plugin::resolve_sftp_encoding_opt` 同构（内联拨号按未覆盖处理）。
+fn mcp_sftp_encoding(data_dir: &Path, arguments: &Value) -> sftp_name::NameEncoding {
+    preferences::sftp_name_encoding_for(data_dir, non_empty_argument(arguments, "connectionId"))
+}
+
+/// latin-1 裸包列表条目 → MCP 工具响应条目（M17）。名字口径为**显示形式**：
+/// `name`/`path` 都是 latin-1 解码文本（解码输出恒在 U+0000..=U+00FF 域内，
+/// `latin1_encode_display` 是其精确逆变换——AI 把返回的 path 原样回传给
+/// sftp_mkdir/sftp_remove/sftp_rename 即落回服务器原始字节，不引入 %XX
+/// 转义噪声）。kind 按 v3 permissions 类型位归类（缺 permissions 退回
+/// file，非标准服务器不会把普通文件误渲染成目录）；`.`/`..` 跳过。
+fn raw_list_items(dir: &str, entries: Vec<sftp_raw::RawEntry>) -> Vec<Value> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.name.as_slice() != b"." && entry.name.as_slice() != b"..")
+        .map(|entry| {
+            let display =
+                sftp_name::decode_display_name(&entry.name, sftp_name::NameEncoding::Latin1);
+            // 目录 + 显示名的拼接与 join_wire_name 同形（纯字符串 join，无转
+            // 义语义），直接复用避免重复实现。
+            json!({
+                "name": display.text,
+                "path": sftp_name::join_wire_name(dir, &display.text),
+                "kind": classify_raw_kind(entry.attrs.permissions),
+                "size": entry.attrs.size,
+                "modifiedAt": entry.attrs.mtime,
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// latin-1（M18）MCP 工具面裸包辅助：显示路径整条 latin1_encode_display 还原
+// 服务器字节后走裸包操作。泛型 over `RawSftp<S>` 是为了测试能用内存双工桩
+// （`sftp_raw::test_support`）做 latin-1 往返闭环，生产调用方传入的是
+// russh 通道流上的 `RawSftpClient`。
+// ---------------------------------------------------------------------------
+
+/// `sftp_stat` 响应装配（auto 与 latin-1 共用）。口径与 auto 分支一致：
+/// permissions 四位八进制、秒级时间戳。uid/gid 由调用方尽力而为补齐（裸包
+/// v3 attrs 不携带，见 [`lookup_remote_uid_gid`]）。
+fn raw_stat_json(
+    path: &str,
+    attrs: sftp_raw::RawAttrs,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Value {
+    json!({
+        "path": path,
+        "size": attrs.size,
+        "permissions": attrs.permissions.map(|bits| format!("{:04o}", bits & 0o7777)),
+        "modifiedAt": attrs.mtime,
+        "accessedAt": attrs.atime,
+        "uid": uid,
+        "gid": gid,
+    })
+}
+
+/// latin-1（M18）裸包 attrs 无 uid/gid（工作台 `sftp/stat` M17 先例同口径）：
+/// shell `stat -c '%u %g'` 尽力而为补齐属主数字。命令串是 UTF-8 String，非
+/// ASCII 显示名的字节参数不可控（M17-A 登记边界），exec 失败/解析不出按
+/// `(None, None)` 处理，主元数据不受影响。
+async fn lookup_remote_uid_gid(
+    handle: &Handle<SshClient>,
+    path: &str,
+) -> (Option<u32>, Option<u32>) {
+    let command = format!("stat -c '%u %g' -- {}", exec::shell_quote(path));
+    let Ok(outcome) = exec::exec_plain(handle, &command, Duration::from_secs(10), &[]).await else {
+        return (None, None);
+    };
+    let mut fields = outcome.output.split_whitespace();
+    (
+        fields.next().and_then(|field| field.parse().ok()),
+        fields.next().and_then(|field| field.parse().ok()),
+    )
+}
+
+/// latin-1（M18）`sftp_exists` 裸包分支：裸包 LSTAT，只把
+/// SSH_FX_NO_SUCH_FILE 映射为「不存在」，其余错误如实上抛——与 auto 分支
+/// 「权限错误/死通道绝不误报 exists:false」的契约一致。
+async fn raw_sftp_exists<S>(client: &mut sftp_raw::RawSftp<S>, path: &str) -> Result<bool, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    match client.lstat(&sftp_name::latin1_encode_display(path)).await {
+        Ok(_) => Ok(true),
+        Err(error) => match sftp_raw::error_status(&error) {
+            Some(sftp_raw::SSH_FX_NO_SUCH_FILE) => Ok(false),
+            _ => Err(error),
+        },
+    }
+}
+
+/// latin-1（M18）`sftp_read_file` 裸包分支：显示路径还原字节后
+/// OPEN(READ) + READ 分块循环（`RawSftp::read_file`，32 KiB 粒度，v3 规范
+/// 建议口径）。大文件策略沿既有 MCP 边界：单次至多 `max_bytes`（上限
+/// maxDownloadBytes），用 `max_bytes + 1` 探测截断——与 auto 分支 `take()`
+/// 语义一致。返回 `(数据, 是否截断)`。
+async fn raw_sftp_read_file<S>(
+    client: &mut sftp_raw::RawSftp<S>,
+    path: &str,
+    offset: u64,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, bool), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    let mut data = client
+        .read_file(
+            &sftp_name::latin1_encode_display(path),
+            offset,
+            max_bytes.saturating_add(1),
+        )
+        .await?;
+    let truncated = data.len() as u64 > max_bytes;
+    if truncated {
+        data.truncate(max_bytes as usize);
+    }
+    Ok((data, truncated))
+}
+
+/// `sftp_read_file` 响应装配（auto 与 latin-1 共用）。
+fn read_file_response(path: &str, data: &[u8], truncated: bool, as_base64: bool) -> Value {
+    if as_base64 {
+        json!({
+            "path": path,
+            "dataBase64": BASE64_STANDARD.encode(data),
+            "truncated": truncated,
+        })
+    } else {
+        json!({
+            "path": path,
+            "content": String::from_utf8_lossy(data),
+            "truncated": truncated,
+        })
+    }
+}
+
+/// latin-1（M18）`sftp_write_file` 裸包分支：显示路径还原字节后
+/// OPEN(CREAT|WRITE|TRUNC) 截断直写 + WRITE 32 KiB 分块（选型：MCP 面
+/// 沿既有 sftp_write_file 直写语义，无工作台上传族的 `.dbx-part` 暂存
+/// 需求）。`overwrite=false` 的覆盖预检走裸包 LSTAT，与写入同一字节口径；
+/// 操作错误原样上抛不回退（与 M17-B 写工具同策略，避免重复执行）。
+async fn raw_sftp_write_file<S>(
+    client: &mut sftp_raw::RawSftp<S>,
+    path: &str,
+    content: &[u8],
+    overwrite: bool,
+) -> Result<Value, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    let bytes = raw_sftp_write_bytes(client, path, content, overwrite).await?;
+    Ok(json!({ "path": path, "bytes": bytes }))
+}
+
+/// latin-1（M19）`sftp_upload` 裸包车道共用核心：与 [`raw_sftp_write_file`]
+/// 同一直写语义，返回写入字节数供调用方按工具各自的响应形状组装
+/// （sftp_write_file → `{path, bytes}`；sftp_upload → `{localPath,
+/// remotePath, bytes}`）。
+async fn raw_sftp_write_bytes<S>(
+    client: &mut sftp_raw::RawSftp<S>,
+    path: &str,
+    content: &[u8],
+    overwrite: bool,
+) -> Result<usize, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    let raw_path = sftp_name::latin1_encode_display(path);
+    if !overwrite && client.lstat(&raw_path).await.is_ok() {
+        return Err(format!(
+            "Remote path already exists: {path} (pass overwrite=true to replace)"
+        ));
+    }
+    let handle = client.open_write(&raw_path).await?;
+    let result = async {
+        for (index, chunk) in content.chunks(sftp_raw::MAX_WRITE_CHUNK).enumerate() {
+            client
+                .write_chunk(&handle, (index * sftp_raw::MAX_WRITE_CHUNK) as u64, chunk)
+                .await?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    // 写失败也先 CLOSE 释放句柄，再上抛原错误。
+    let closed = client.close(&handle).await;
+    result?;
+    closed?;
+    Ok(content.len())
+}
+
+/// latin-1（M18）`sftp_chmod` 裸包分支：显示路径还原字节后 SETSTAT 只带
+/// permissions 子集（与 auto 分支 set_metadata 的 attrs 语义一致；mode 解析
+/// 复用 [`parse_chmod_mode`]，建立失败回退高层、操作错误原样上抛）。
+async fn raw_sftp_chmod<S>(
+    client: &mut sftp_raw::RawSftp<S>,
+    path: &str,
+    mode: u32,
+) -> Result<Value, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    client
+        .setstat(
+            &sftp_name::latin1_encode_display(path),
+            &sftp_raw::RawAttrs {
+                permissions: Some(mode),
+                ..sftp_raw::RawAttrs::default()
+            },
+        )
+        .await?;
+    Ok(json!({ "path": path, "mode": format!("{mode:04o}") }))
+}
+
 fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value
         .get(key)
@@ -3019,6 +3675,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "ssh_run_bg",
     "ssh_task_status",
     "ssh_metrics",
+    "docker_list",
+    "docker_action",
     "ssh_alert_triage",
     "ssh_close",
     "ssh_test_connection",
@@ -3159,6 +3817,8 @@ fn is_connection_bound_tool(name: &str) -> bool {
             | "ssh_run_bg"
             | "ssh_task_status"
             | "ssh_metrics"
+            | "docker_list"
+            | "docker_action"
             | "ssh_test_connection"
             | "sftp_list_dir"
             | "sftp_stat"
@@ -3202,22 +3862,21 @@ fn registry_connection_view(connection: &StoredConnection) -> Value {
 fn connection_list_result(
     bridge: Result<Vec<Value>, String>,
     registry: &[StoredConnection],
-    scope: &[String],
+    scope: &ConnectionScope,
 ) -> Value {
-    // §1.3: a non-empty scope hides out-of-scope entries from the list view
+    // §1.3: an active scope hides out-of-scope entries from the list view
     // (both bridge and registry sources), so discovery cannot enumerate
-    // beyond the operator's allowlist.
-    fn in_scope(entry: &Value, scope: &[String]) -> bool {
-        scope.is_empty()
-            || scope_allows(
-                scope,
-                entry.get("id").and_then(Value::as_str).unwrap_or_default(),
-                entry.get("name").and_then(Value::as_str),
-                entry
-                    .get("host")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )
+    // beyond the operator's allowlist. DenyAll intentionally produces an
+    // empty list rather than reusing the persisted unrestricted empty array.
+    fn in_scope(entry: &Value, scope: &ConnectionScope) -> bool {
+        scope.allows(
+            entry.get("id").and_then(Value::as_str).unwrap_or_default(),
+            entry.get("name").and_then(Value::as_str),
+            entry
+                .get("host")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
     }
     match bridge {
         Ok(entries) => {
@@ -3233,12 +3892,7 @@ fn connection_list_result(
                 .iter()
                 .filter(|connection| !listed.contains(&connection.id))
                 .filter(|connection| {
-                    scope_allows(
-                        scope,
-                        &connection.id,
-                        connection.name.as_deref(),
-                        &connection.host,
-                    )
+                    scope.allows(&connection.id, connection.name.as_deref(), &connection.host)
                 })
             {
                 merged.push(registry_connection_view(connection));
@@ -3249,8 +3903,7 @@ fn connection_list_result(
             "connections": registry
                 .iter()
                 .filter(|connection| {
-                    scope_allows(
-                        scope,
+                    scope.allows(
                         &connection.id,
                         connection.name.as_deref(),
                         &connection.host,
@@ -3437,6 +4090,7 @@ fn is_write_tool(name: &str) -> bool {
         name,
         "ssh_exec_sudo"
             | "ssh_run_bg"
+            | "docker_action"
             | "sftp_write_file"
             | "sftp_upload"
             | "sftp_mkdir"
@@ -3788,6 +4442,7 @@ fn stored_connection_from_arguments(arguments: &Value) -> Result<StoredConnectio
         runtime_host: host.to_string(),
         runtime_port: port,
         username: username.to_string(),
+        protocol: "ssh".to_string(),
         password,
         authentication,
         private_key_path,
@@ -4010,6 +4665,8 @@ fn tool_annotations(name: &str) -> Value {
         "sftp_pwd",
         "sftp_read_file",
         "sftp_disk_usage",
+        // Docker panel read surface: list/poll containers only.
+        "docker_list",
     ];
     // May destroy or replace existing state: the exec family (arbitrary
     // remote commands), store deletions, and remove/move/overwrite-capable
@@ -4028,6 +4685,9 @@ fn tool_annotations(name: &str) -> Value {
         "sftp_upload",
         "sftp_download",
         "sftp_write_file",
+        // Container lifecycle (rm/kill especially) is destructive; the tool
+        // description spells out the confirm-first semantics.
+        "docker_action",
     ];
     // Mutating but non-destructive, and repeating them converges to the
     // same state instead of compounding (idempotentHint).
@@ -4059,6 +4719,8 @@ fn tool_title(name: &str) -> Option<&'static str> {
         "ssh_run_bg" => "Start background SSH task",
         "ssh_task_status" => "Poll background SSH task",
         "ssh_metrics" => "Collect server metrics",
+        "docker_list" => "List Docker containers",
+        "docker_action" => "Manage Docker container",
         "ssh_alert_triage" => "SSH alert triage",
         "ssh_close" => "Close SSH connection",
         "ssh_test_connection" => "Test SSH connection",
@@ -4188,6 +4850,28 @@ pub fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "docker_list",
+            "description": "List Docker containers on a remote host (docker ps -a via read-only shell collection): name, image, state, status, ports, creation time. When the docker CLI is missing or the daemon socket is denied, available=false and containers=[] instead of an error; needsSudo=true marks the denied case, where lifecycle actions can still run through the connection's Quick Sudo credentials.",
+            "inputSchema": {
+                "type": "object",
+                "properties": connection_properties(&[]),
+                "anyOf": connection_selector_requirements(),
+            },
+        },
+        {
+            "name": "docker_action",
+            "description": "Run a lifecycle action (start | stop | restart | kill | rm) on one remote Docker container. DESTRUCTIVE for rm (removes the container) and kill (SIGKILL): get explicit human confirmation in the frontend/dialog before sending them - start/stop/restart are reversible and do not need one. containerId must be 12-64 lowercase hex characters; the tool never accepts passwords. Plain execution first; only a daemon-socket permission failure retries through the connection's Quick Sudo credentials (piped over stdin, never the command line). Read-only connections are refused.",
+            "inputSchema": {
+                "type": "object",
+                "properties": connection_properties(&[
+                    ("containerId", "string", "Container id (12-64 lowercase hex characters, as returned by docker_list)"),
+                    ("action", "string", "Lifecycle action: start | stop | restart | kill | rm. rm/kill are destructive and need explicit human confirmation"),
+                ]),
+                "required": ["containerId", "action"],
+                "anyOf": connection_selector_requirements(),
+            },
+        },
+        {
             "name": "ssh_alert_triage",
             "description": "Triage an ops alert OFFLINE (no SSH connection): normalizes a heterogeneous alert payload, classifies the intent by bilingual keyword scoring (cpu / memory / disk / oom / inode / network / service / generic), and returns a whitelist-safe diagnostic playbook. Pass the raw alert as a JSON string (fields like alertId/title/severity/source/message are recognized; unknown shapes degrade to generic). Read-only: nothing is executed and no suggestion contains sudo.",
             "inputSchema": {
@@ -4272,7 +4956,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_list_dir",
-            "description": "List a remote directory over SFTP.",
+            "description": "List a remote directory over SFTP. Names follow the connection's file-name encoding preference: on latin-1 connections entries are decoded from raw server bytes to display form, and a returned path passed back to sftp_mkdir/sftp_remove/sftp_rename addresses the same server bytes.",
             "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
@@ -4329,12 +5013,12 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_mkdir",
-            "description": "Create a remote directory.",
+            "description": "Create a remote directory. Paths follow the same display convention as sftp_list_dir responses (on latin-1 connections a display path maps back to the original server bytes).",
             "inputSchema": { "type": "object", "properties": connection_properties(&[("path", "string", "Remote directory path")]), "required": ["path"], "anyOf": connection_selector_requirements() },
         },
         {
             "name": "sftp_remove",
-            "description": "Remove a remote file or directory (directories need recursive=true).",
+            "description": "Remove a remote file or directory (directories need recursive=true). Paths follow the same display convention as sftp_list_dir responses (on latin-1 connections a display path maps back to the original server bytes).",
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("path", "string", "Remote path"),
                 ("recursive", "boolean", "Set true to remove directories recursively"),
@@ -4342,7 +5026,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sftp_rename",
-            "description": "Rename or move a remote path.",
+            "description": "Rename or move a remote path. Paths follow the same display convention as sftp_list_dir responses (on latin-1 connections display paths map back to the original server bytes).",
             "inputSchema": { "type": "object", "properties": connection_properties(&[
                 ("sourcePath", "string", "Existing remote path"),
                 ("targetPath", "string", "New remote path"),
@@ -4458,8 +5142,9 @@ mod tests {
         let scope = |entries: &[&str]| -> Vec<String> {
             entries.iter().map(|entry| entry.to_string()).collect()
         };
-        // 空作用域放行一切。
-        assert!(scope_allows(&[], "c1", Some("prod"), "db.local"));
+        // 空 entry 列表本身不授予权限；持久化空数组会在 ConnectionScope
+        // 层映射为 Unrestricted，显式空环境变量则映射为 DenyAll。
+        assert!(!scope_allows(&[], "c1", Some("prod"), "db.local"));
         let entries = scope(&["conn-9", "ops@LEGACY", "Web-01"]);
         assert!(scope_allows(&entries, "conn-9", None, "other.local"));
         assert!(scope_allows(&entries, "other-id", Some("ops@LEGACY"), "x")); // name 精确（大小写敏感）
@@ -4474,7 +5159,7 @@ mod tests {
     }
 
     #[test]
-    fn env_permission_parsers_validate_and_default() {
+    fn env_permission_parsers_distinguish_unset_allowlist_and_deny_all() {
         assert_eq!(
             permission_mode_from_env(|_| Some("confirm".to_string())).as_deref(),
             Some("confirm")
@@ -4484,11 +5169,26 @@ mod tests {
         assert!(permission_mode_from_env(|_| Some("yolo".to_string())).is_none());
         assert_eq!(
             scope_from_env(|_| Some(" a , b,,c ".to_string())),
-            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            Some(ConnectionScope::AllowList(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+            ]))
         );
-        // 显式空列表也是有效覆盖（=拒绝一切）。
-        assert_eq!(scope_from_env(|_| Some(" , ".to_string())), Some(vec![]));
+        // 显式空列表是有效的 fail-closed 覆盖，绝不能与持久化空数组
+        // （未限制）复用同一种状态。
+        assert_eq!(
+            scope_from_env(|_| Some(" , ".to_string())),
+            Some(ConnectionScope::DenyAll)
+        );
         assert!(scope_from_env(|_| None).is_none());
+    }
+
+    #[test]
+    fn connection_scope_policy_preserves_persisted_empty_as_unrestricted() {
+        assert!(ConnectionScope::from_persisted(Vec::new()).allows("id", Some("name"), "host"));
+        assert!(!ConnectionScope::DenyAll.allows("id", Some("name"), "host"));
+        assert!(ConnectionScope::AllowList(vec!["host".to_string()]).allows("id", None, "HOST"));
     }
 
     #[test]
@@ -4499,6 +5199,7 @@ mod tests {
             "ssh_run_bg",
             "ssh_multi_exec",
             "ssh_terminal_input",
+            "docker_action",
             "sftp_write_file",
             "sftp_upload",
             "sftp_remove",
@@ -4508,6 +5209,7 @@ mod tests {
         for spared in [
             "ssh_close",
             "ssh_metrics",
+            "docker_list",
             "ssh_test_connection",
             "sftp_list_dir",
             "sftp_read_file",
@@ -4581,6 +5283,7 @@ mod tests {
             "ssh_list_known_hosts",
             "ssh_quick_sudo_profiles_list",
             "ssh_metrics",
+            "docker_list",
             "ssh_alert_triage",
             "ssh_test_connection",
             "ssh_task_status",
@@ -4606,6 +5309,7 @@ mod tests {
             "ssh_multi_exec",
             "ssh_terminal_input",
             "ssh_run_bg",
+            "docker_action",
             "ssh_remove_known_host",
             "ssh_quick_sudo_profiles_delete",
             "sftp_remove",
@@ -4638,7 +5342,7 @@ mod tests {
         let tools = definitions.as_array().unwrap();
         assert_eq!(
             tools.len(),
-            31,
+            33,
             "tool count changed; revisit annotation sets"
         );
         for tool in tools {
@@ -4652,6 +5356,7 @@ mod tests {
                         | "ssh_list_known_hosts"
                         | "ssh_quick_sudo_profiles_list"
                         | "ssh_metrics"
+                        | "docker_list"
                         | "ssh_alert_triage"
                         | "ssh_test_connection"
                         | "ssh_task_status"
@@ -4764,13 +5469,13 @@ mod tests {
             }))
             .unwrap()
         };
-        // 空作用域：两来源都全量。
+        // 持久化空作用域映射为未限制：两来源都全量。
         let all = connection_list_result(
             Ok(vec![
                 json!({"id":"conn-9","name":"staging","host":"stg.local"}),
             ]),
             &[stored()],
-            &[],
+            &ConnectionScope::Unrestricted,
         );
         assert_eq!(all["connections"].as_array().unwrap().len(), 2);
         // host 作用域：bridge 条目按 host 过滤，registry 条目按 id/name/host。
@@ -4780,7 +5485,7 @@ mod tests {
                 json!({"id":"conn-1","name":"prod","host":"db.local"}),
             ]),
             &[stored()],
-            &["db.local".to_string()],
+            &ConnectionScope::AllowList(vec!["db.local".to_string()]),
         );
         let ids: Vec<&str> = filtered["connections"]
             .as_array()
@@ -4793,7 +5498,7 @@ mod tests {
         let degraded = connection_list_result(
             Err("bridge down".to_string()),
             &[stored()],
-            &["conn-9".to_string()],
+            &ConnectionScope::AllowList(vec!["conn-9".to_string()]),
         );
         assert_eq!(degraded["connections"].as_array().unwrap().len(), 0);
     }
@@ -6838,7 +7543,7 @@ mod tests {
         let degraded = connection_list_result(
             Err("bridge down".to_string()),
             std::slice::from_ref(&stored),
-            &[],
+            &ConnectionScope::Unrestricted,
         );
         assert_eq!(degraded["source"], "session-registry");
         assert!(
@@ -6878,7 +7583,11 @@ mod tests {
             }
         }))
         .unwrap();
-        let merged = connection_list_result(Ok(vec![bridge_entry]), &[stored, extra], &[]);
+        let merged = connection_list_result(
+            Ok(vec![bridge_entry]),
+            &[stored, extra],
+            &ConnectionScope::Unrestricted,
+        );
         assert_eq!(merged["source"], "dbx-app-bridge");
         assert!(merged.get("note").is_none(), "bridge hit must not degrade");
         let entries = merged["connections"].as_array().unwrap();
@@ -7547,7 +8256,7 @@ mod tests {
             .copied()
             .filter(|name| is_connection_bound_tool(name))
             .collect();
-        assert_eq!(forwarders.len(), 21, "connection-bound tool set drifted");
+        assert_eq!(forwarders.len(), 23, "connection-bound tool set drifted");
         for name in forwarders {
             let arguments = match name {
                 "ssh_exec" | "ssh_exec_sudo" | "ssh_run_bg" => {
@@ -7555,6 +8264,9 @@ mod tests {
                 }
                 "ssh_task_status" => {
                     json!({ "connectionId": "ghost", "logPath": "/tmp/.dbx-ssh-tasks/x.log" })
+                }
+                "docker_action" => {
+                    json!({ "connectionId": "ghost", "containerId": "d4a7c9f1e2b3", "action": "start" })
                 }
                 "sftp_upload" => json!({ "connectionId": "ghost",
                     "localPath": "/tmp/in", "remotePath": "/tmp/out" }),
@@ -7612,7 +8324,8 @@ mod tests {
             bridge_entry("conn-y", "other.example.test"),
         ]);
 
-        let merged = connection_list_result(bridge.clone(), &registry, &[]);
+        let merged =
+            connection_list_result(bridge.clone(), &registry, &ConnectionScope::Unrestricted);
         assert_eq!(merged["source"], "dbx-app-bridge");
         let rows = merged["connections"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "id conflict must deduplicate, not append");
@@ -7623,13 +8336,21 @@ mod tests {
         );
 
         // 作用域对桥与注册表两来源都过滤：只留 conn-y。
-        let scoped = connection_list_result(bridge, &registry, &["conn-y".to_string()]);
+        let scoped = connection_list_result(
+            bridge,
+            &registry,
+            &ConnectionScope::AllowList(vec!["conn-y".to_string()]),
+        );
         let rows = scoped["connections"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["id"], "conn-y");
 
         // 桥不可用时降级到注册表 + note（同 id 冲突无从发生）。
-        let degraded = connection_list_result(Err("bridge down".into()), &registry, &[]);
+        let degraded = connection_list_result(
+            Err("bridge down".into()),
+            &registry,
+            &ConnectionScope::Unrestricted,
+        );
         assert_eq!(degraded["source"], "session-registry");
         assert_eq!(degraded["connections"].as_array().unwrap().len(), 2);
     }
@@ -8223,6 +8944,42 @@ mod tests {
             .unwrap();
         assert_eq!(result["isError"], false);
     }
+
+    // —— M25：MCP 面远端路径组件归一（与工作台车道同口径）——
+
+    #[test]
+    fn mcp_remote_path_normalization_contract() {
+        // M25 契约：所有接受远端路径的 MCP SFTP 工具分发臂（list_dir /
+        // stat / exists / read / write / mkdir / remove / rename /
+        // chmod / disk_usage / upload / download）在拿到路径后立即
+        // `normalize_remote_path`，再进 latin-1 编码还原或 auto 直用。
+        // 归一 = 绝对化 + 去 ./../ 空段，不做 ~ 展开（工作台同口径）。
+        assert_eq!(normalize_remote_path("/a//b/../c").unwrap(), "/a/c");
+        assert_eq!(normalize_remote_path("a/b/").unwrap(), "/a/b");
+        assert_eq!(normalize_remote_path("/x/./y").unwrap(), "/x/y");
+        assert_eq!(normalize_remote_path("../etc").unwrap(), "/etc");
+        assert_eq!(normalize_remote_path("/").unwrap(), "/");
+    }
+
+    #[test]
+    fn mcp_remote_path_normalization_rejects_empty_and_nul() {
+        // 空路径与含 NUL 的路径在进入任何 SFTP 操作前被拒绝，
+        // 与工作台车道的拒绝语义一致。
+        assert!(normalize_remote_path("").is_err());
+        assert!(normalize_remote_path("/a/\0b").is_err());
+    }
+
+    #[test]
+    fn mcp_latin1_encoding_unchanged_by_normalization_for_clean_names() {
+        // 归一是纯字符级清洗：latin-1 显示域内的 clean 名经过
+        // normalize_remote_path 后字节还原结果不变（AI 回传列表路径的
+        // 往返闭环不被 M25 破坏）。
+        let display = "/data/caf\u{e9}.txt";
+        assert_eq!(
+            sftp_name::latin1_encode_display(&normalize_remote_path(display).unwrap()),
+            sftp_name::latin1_encode_display(display)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8359,5 +9116,392 @@ mod dbx_bridge_tests {
             err.contains("No connection named 'ghost'") && err.contains("ssh_list_connections"),
             "unexpected error: {err}"
         );
+    }
+
+    // —— M17：MCP 工具面文件名编码模式 ——
+
+    #[test]
+    fn mcp_encoding_prefers_connection_override_then_global() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let store = preferences::store_path(data_dir.path());
+        // 只设连接覆盖：命中覆盖 → latin-1；未命中的连接 → 全局缺省 auto。
+        std::fs::write(
+            &store,
+            r#"{"prefs":{"sftp_name_encoding_overrides":{"conn-1":"latin-1"}}}"#,
+        )
+        .expect("write prefs");
+        assert_eq!(
+            mcp_sftp_encoding(data_dir.path(), &json!({ "connectionId": "conn-1" })),
+            sftp_name::NameEncoding::Latin1
+        );
+        assert_eq!(
+            mcp_sftp_encoding(data_dir.path(), &json!({ "connectionId": "conn-2" })),
+            sftp_name::NameEncoding::Auto
+        );
+        // 全局 latin-1：内联拨号（无 connectionId，dispatch 层也无法归一化）
+        // 按未覆盖处理，跟随全局。
+        std::fs::write(&store, r#"{"prefs":{"sftp_name_encoding":"latin-1"}}"#)
+            .expect("write prefs");
+        assert_eq!(
+            mcp_sftp_encoding(data_dir.path(), &json!({})),
+            sftp_name::NameEncoding::Latin1
+        );
+        // 连接覆盖压过全局偏好（优先级链第三态）。
+        std::fs::write(
+            &store,
+            r#"{"prefs":{"sftp_name_encoding":"latin-1","sftp_name_encoding_overrides":{"conn-9":"auto"}}}"#,
+        )
+        .expect("write prefs");
+        assert_eq!(
+            mcp_sftp_encoding(data_dir.path(), &json!({ "connectionId": "conn-9" })),
+            sftp_name::NameEncoding::Auto
+        );
+    }
+
+    #[test]
+    fn raw_list_items_display_paths_round_trip_to_server_bytes() {
+        let entry = |name: &[u8], size: Option<u64>, permissions: Option<u32>| sftp_raw::RawEntry {
+            name: name.to_vec(),
+            attrs: sftp_raw::RawAttrs {
+                size,
+                permissions,
+                mtime: Some(100),
+                ..sftp_raw::RawAttrs::default()
+            },
+        };
+        let items = raw_list_items(
+            "/data",
+            vec![
+                entry(b"caf\xe9.txt", Some(12), Some(0o100644)),
+                entry(b"dir\xe9", None, Some(0o040755)),
+                entry(b".", None, Some(0o040755)),
+                entry(b"..", None, None),
+                entry(b"\xff\xfe.bin", Some(3), None),
+            ],
+        );
+        // `.`/`..` 跳过；名字口径 = 显示形式（latin-1 解码，忠实可逆）。
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["name"], json!("caf\u{e9}.txt"));
+        assert_eq!(items[0]["path"], json!("/data/caf\u{e9}.txt"));
+        assert_eq!(items[0]["kind"], json!("file"));
+        assert_eq!(items[0]["size"], json!(12));
+        assert_eq!(items[0]["modifiedAt"], json!(100));
+        assert_eq!(items[1]["name"], json!("dir\u{e9}"));
+        assert_eq!(items[1]["path"], json!("/data/dir\u{e9}"));
+        assert_eq!(items[1]["kind"], json!("directory"));
+        // attrs 缺 permissions（非标准服务器）退回 file，不误判成目录。
+        assert_eq!(items[2]["name"], json!("\u{ff}\u{fe}.bin"));
+        assert_eq!(items[2]["kind"], json!("file"));
+
+        // 往返闭环：AI 把列表返回的 path 原样回传给 sftp_remove 等写工具时，
+        // latin1_encode_display 精确还原服务器原始字节（显示 → 字节是 latin-1
+        // 解码的逆变换，目录 ASCII 前缀按字面量透传）。
+        assert_eq!(
+            sftp_name::latin1_encode_display(items[0]["path"].as_str().unwrap()),
+            b"/data/caf\xe9.txt".to_vec()
+        );
+        // 子目录导航同样闭环：父列表返回的显示目录路径进入下一次列表/
+        // rename 目标组合时还原字节。
+        assert_eq!(
+            sftp_name::latin1_encode_display(items[1]["path"].as_str().unwrap()),
+            b"/data/dir\xe9".to_vec()
+        );
+        // rename 往返：源 = 列表回传显示路径；目标 = 同目录 + 新输入显示文本
+        //（latin-1 域内字符映回同值字节）。
+        assert_eq!(
+            sftp_name::latin1_encode_display(items[0]["path"].as_str().unwrap()),
+            b"/data/caf\xe9.txt".to_vec()
+        );
+        assert_eq!(
+            sftp_name::latin1_encode_display("/data/caf\u{e9}2.txt"),
+            b"/data/caf\xe92.txt".to_vec()
+        );
+    }
+
+    // —— M18：MCP 工具面剩余 SFTP 工具的 latin-1 往返闭环 ——
+
+    /// 带请求日志的内存桩裸包客户端（复用 `sftp_raw::test_support` 的
+    /// duplex 桩服务器，不连 SSH）。请求日志记录的是去帧 payload：
+    /// `[type, id 4 字节, 包体]`。
+    async fn stub_raw_sftp(
+        replies: Vec<Vec<u8>>,
+    ) -> (
+        sftp_raw::RawSftp<tokio::io::DuplexStream>,
+        sftp_raw::test_support::RequestLog,
+    ) {
+        let log = sftp_raw::test_support::request_log();
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        tokio::spawn(sftp_raw::test_support::scripted_server(
+            server_side,
+            replies,
+            Some(log.clone()),
+        ));
+        let client = sftp_raw::RawSftp::init(client_side).await.unwrap();
+        (client, log)
+    }
+
+    #[tokio::test]
+    async fn raw_stat_maps_v3_attrs_and_lstat_carries_latin1_path_bytes() {
+        let (mut client, log) = stub_raw_sftp(vec![sftp_raw::test_support::attrs_body_full(
+            12,
+            0o100644,
+            Some(111),
+            Some(222),
+        )])
+        .await;
+        let path = "/data/caf\u{e9}.txt";
+        let attrs = client
+            .lstat(&sftp_name::latin1_encode_display(path))
+            .await
+            .unwrap();
+        // 裸包 attrs 无 uid/gid：调用方 shell 查询尽力而为（此处按缺省
+        // None 验证装配口径），主元数据不受影响。
+        let stat = raw_stat_json(path, attrs, None, None);
+        assert_eq!(stat["size"], json!(12));
+        assert_eq!(stat["permissions"], json!("0644"));
+        assert_eq!(stat["modifiedAt"], json!(222));
+        assert_eq!(stat["accessedAt"], json!(111));
+        assert_eq!(stat["uid"], Value::Null);
+        assert_eq!(stat["gid"], Value::Null);
+        // 字节级闭环：LSTAT 帧携带显示路径还原出的服务器原始字节。
+        let lstat = &sftp_raw::test_support::recorded_requests(&log)[1];
+        assert_eq!(lstat[0], 7); // FXP_LSTAT
+        assert_eq!(&lstat[9..], b"/data/caf\xe9.txt");
+        // 响应里的 path 原样回传工具面即落回原始字节（精确逆变换）。
+        assert_eq!(
+            sftp_name::latin1_encode_display(stat["path"].as_str().unwrap()),
+            b"/data/caf\xe9.txt".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_exists_maps_no_such_file_only() {
+        // 存在：LSTAT → ATTRS。
+        let (mut client, log) =
+            stub_raw_sftp(vec![sftp_raw::test_support::attrs_body(1, 0o100644)]).await;
+        assert!(raw_sftp_exists(&mut client, "/d/caf\u{e9}.txt")
+            .await
+            .unwrap());
+        let lstat = &sftp_raw::test_support::recorded_requests(&log)[1];
+        assert_eq!(lstat[0], 7); // FXP_LSTAT
+        assert_eq!(&lstat[9..], b"/d/caf\xe9.txt");
+
+        // 不存在：LSTAT → SSH_FX_NO_SUCH_FILE。
+        let (mut client, _) = stub_raw_sftp(vec![sftp_raw::test_support::status_body(2)]).await;
+        assert!(!raw_sftp_exists(&mut client, "/d/caf\u{e9}.txt")
+            .await
+            .unwrap());
+
+        // 其余错误如实上抛：绝不把权限失败误报成 exists:false（auto 分支
+        // 同契约）。
+        let (mut client, _) = stub_raw_sftp(vec![sftp_raw::test_support::status_body(3)]).await;
+        let error = raw_sftp_exists(&mut client, "/d/x").await.unwrap_err();
+        assert!(error.contains("status 3"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_read_file_round_trips_latin1_path_and_flags_truncation() {
+        // 截断：max_bytes=5，服务器回 11 字节 → truncated=true + 截到 5。
+        let (mut client, log) = stub_raw_sftp(vec![
+            sftp_raw::test_support::handle_body(b"h1"),
+            sftp_raw::test_support::data_body(b"hello world"),
+            sftp_raw::test_support::status_body(0),
+        ])
+        .await;
+        let (data, truncated) = raw_sftp_read_file(&mut client, "/d/caf\u{e9}.txt", 0, 5)
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(data, b"hello".to_vec());
+        // OPEN 帧路径字节 = 显示路径的 latin1_encode_display 逆变换
+        // （payload = type + id + path_len + path + pflags + attrs）。
+        let open = &sftp_raw::test_support::recorded_requests(&log)[1];
+        assert_eq!(open[0], 3); // FXP_OPEN
+        assert_eq!(&open[9..20], b"/d/caf\xe9.txt");
+
+        // 未截断 + offset 分页起点显式携带（READ 循环读到 EOF 收尾）。
+        let (mut client, log) = stub_raw_sftp(vec![
+            sftp_raw::test_support::handle_body(b"h1"),
+            sftp_raw::test_support::data_body(b"rld"),
+            sftp_raw::test_support::status_body(1), // SSH_FX_EOF：数据读完
+            sftp_raw::test_support::status_body(0), // CLOSE
+        ])
+        .await;
+        let (data, truncated) = raw_sftp_read_file(&mut client, "/d/f", 8, 100)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(data, b"rld".to_vec());
+        let read = &sftp_raw::test_support::recorded_requests(&log)[2];
+        assert_eq!(read[0], 5); // FXP_READ
+        assert_eq!(&read[11..19], &8_u64.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_write_file_chunks_at_32kib_and_round_trips_latin1_path() {
+        let content = vec![0xA9_u8; sftp_raw::MAX_WRITE_CHUNK + 5];
+        let (mut client, log) = stub_raw_sftp(vec![
+            sftp_raw::test_support::status_body(2), // LSTAT 预检：目标不存在
+            sftp_raw::test_support::handle_body(b"h1"),
+            sftp_raw::test_support::status_body(0), // WRITE#1
+            sftp_raw::test_support::status_body(0), // WRITE#2
+            sftp_raw::test_support::status_body(0), // CLOSE
+        ])
+        .await;
+        let written = raw_sftp_write_file(&mut client, "/d/caf\u{e9}.txt", &content, false)
+            .await
+            .unwrap();
+        assert_eq!(written["bytes"], json!(content.len()));
+        let requests = sftp_raw::test_support::recorded_requests(&log);
+        // 覆盖预检与 OPEN 同一字节口径（显示路径 → 服务器原始字节）。
+        let lstat = &requests[1];
+        assert_eq!(lstat[0], 7); // FXP_LSTAT
+        assert_eq!(&lstat[9..], b"/d/caf\xe9.txt");
+        let open = &requests[2];
+        assert_eq!(open[0], 3); // FXP_OPEN
+        assert_eq!(&open[9..20], b"/d/caf\xe9.txt");
+        // WRITE 按 32 KiB 切块、offset 显式推进（payload 坐标：type+id+
+        // handle_len+handle 之后是 offset 8 字节）。
+        let write1 = &requests[3];
+        assert_eq!(write1[0], 6); // FXP_WRITE
+        assert_eq!(&write1[11..19], &0_u64.to_be_bytes());
+        let write2 = &requests[4];
+        assert_eq!(
+            &write2[11..19],
+            &(sftp_raw::MAX_WRITE_CHUNK as u64).to_be_bytes()
+        );
+        assert_eq!(write2[23..].len(), 5);
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_write_file_refuses_existing_target_without_overwrite() {
+        let (mut client, _) =
+            stub_raw_sftp(vec![sftp_raw::test_support::attrs_body(1, 0o100644)]).await;
+        let error = raw_sftp_write_file(&mut client, "/d/caf\u{e9}.txt", b"x", false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_upload_round_trips_latin1_path_and_payload() {
+        // M19 sftp_upload 裸包车道：覆盖预检 LSTAT（NO_SUCH_FILE）→ OPEN →
+        // WRITE → CLOSE；OPEN 帧路径字节 = 显示路径 latin1_encode_display
+        // 逆变换，载荷逐字节落 WRITE 帧（与 sftp_download 的往返闭环见
+        // raw_sftp_upload_download_round_trip_closes_latin1_loop）。
+        let payload = b"mcp upload \xE9 \xA9 payload".to_vec();
+        let (mut client, log) = stub_raw_sftp(vec![
+            sftp_raw::test_support::status_body(2), // LSTAT 预检：目标不存在
+            sftp_raw::test_support::handle_body(b"h1"),
+            sftp_raw::test_support::status_body(0), // WRITE
+            sftp_raw::test_support::status_body(0), // CLOSE
+        ])
+        .await;
+        let bytes = raw_sftp_write_bytes(&mut client, "/up/caf\u{e9}.bin", &payload, false)
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload.len());
+        let requests = sftp_raw::test_support::recorded_requests(&log);
+        // 覆盖预检与 OPEN 同一字节口径（显示路径 → 服务器原始字节）。
+        let lstat = &requests[1];
+        assert_eq!(lstat[0], 7); // FXP_LSTAT
+        assert_eq!(&lstat[9..], b"/up/caf\xe9.bin");
+        let open = &requests[2];
+        assert_eq!(open[0], 3); // FXP_OPEN
+        assert_eq!(&open[9..21], b"/up/caf\xe9.bin");
+        // WRITE 帧尾部载荷逐字节一致（payload = type+id+handle_len+handle
+        // +offset+data_len 之后是 data）。
+        let write = &requests[3];
+        assert_eq!(write[0], 6); // FXP_WRITE
+        assert_eq!(&write[write.len() - payload.len()..], &payload[..]);
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_download_round_trips_latin1_path_and_payload() {
+        // M19 sftp_download 裸包车道：OPEN(READ) → READ → EOF → CLOSE；
+        // OPEN 帧路径字节 = 显示路径 latin1_encode_display 逆变换，载荷
+        // 逐字节回收（与 upload 的同路径闭环见下一条）。
+        let payload = b"mcp download \xE9 \xA9 payload".to_vec();
+        let (mut client, log) = stub_raw_sftp(vec![
+            sftp_raw::test_support::handle_body(b"h1"),
+            sftp_raw::test_support::data_body(&payload),
+            sftp_raw::test_support::status_body(1), // SSH_FX_EOF：读完
+            sftp_raw::test_support::status_body(0), // CLOSE
+        ])
+        .await;
+        let (data, truncated) = raw_sftp_read_file(&mut client, "/up/caf\u{e9}.bin", 0, 4096)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(data, payload);
+        let open = &sftp_raw::test_support::recorded_requests(&log)[1];
+        assert_eq!(open[0], 3); // FXP_OPEN
+        assert_eq!(&open[9..21], b"/up/caf\xe9.bin");
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_upload_download_round_trip_closes_latin1_loop() {
+        // M19 往返闭环：同一显示路径下，upload 的 OPEN 帧路径字节与
+        // download 的 OPEN 帧路径字节完全一致（同一 latin1_encode_display
+        // 逆变换），且上传载荷经下载侧逐字节回收——latin-1 域内显示 → 字节
+        // → 显示精确闭环（duplex 桩先例，M18 同款）。
+        let payload = b"mcp round trip \xE9 \xA9 payload".to_vec();
+        let display_path = "/up/caf\u{e9}.bin";
+        let raw_path = b"/up/caf\xe9.bin";
+
+        // 前半程：upload（LSTAT 不存在 → OPEN → WRITE → CLOSE）。
+        let (mut client, upload_log) = stub_raw_sftp(vec![
+            sftp_raw::test_support::status_body(2),
+            sftp_raw::test_support::handle_body(b"h1"),
+            sftp_raw::test_support::status_body(0),
+            sftp_raw::test_support::status_body(0),
+        ])
+        .await;
+        let bytes = raw_sftp_write_bytes(&mut client, display_path, &payload, false)
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload.len());
+        let upload_open = &sftp_raw::test_support::recorded_requests(&upload_log)[2];
+        assert_eq!(upload_open[0], 3); // FXP_OPEN
+        assert_eq!(&upload_open[9..9 + raw_path.len()], &raw_path[..]);
+
+        // 后半程：download（OPEN → READ → EOF → CLOSE），同一显示路径。
+        let (mut client, download_log) = stub_raw_sftp(vec![
+            sftp_raw::test_support::handle_body(b"h1"),
+            sftp_raw::test_support::data_body(&payload),
+            sftp_raw::test_support::status_body(1), // SSH_FX_EOF：读完
+            sftp_raw::test_support::status_body(0),
+        ])
+        .await;
+        let (data, truncated) = raw_sftp_read_file(&mut client, display_path, 0, 4096)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(data, payload);
+        let download_open = &sftp_raw::test_support::recorded_requests(&download_log)[1];
+        assert_eq!(download_open[0], 3); // FXP_OPEN
+                                         // 两侧 OPEN 帧路径字节一致：AI 把 upload 响应里的 remotePath 原样
+                                         // 回传给 sftp_download 即命中同一组服务器字节。
+
+        assert_eq!(
+            &download_open[9..9 + raw_path.len()],
+            &upload_open[9..9 + raw_path.len()]
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_sftp_chmod_sends_setstat_with_latin1_path_bytes() {
+        let (mut client, log) = stub_raw_sftp(vec![sftp_raw::test_support::status_body(0)]).await;
+        let result = raw_sftp_chmod(&mut client, "/d/caf\u{e9}.txt", 0o600)
+            .await
+            .unwrap();
+        assert_eq!(result["mode"], json!("0600"));
+        let setstat = &sftp_raw::test_support::recorded_requests(&log)[1];
+        assert_eq!(setstat[0], 9); // FXP_SETSTAT
+        assert_eq!(&setstat[9..20], b"/d/caf\xe9.txt");
+        // attrs 只带 permissions 子集：flags=ATTR_PERMISSIONS(0x4) + mode。
+        let attrs = &setstat[20..]; // path 之后紧跟编码 attrs
+        assert_eq!(&attrs[..4], &4_u32.to_be_bytes());
+        assert_eq!(&attrs[4..], &0o600_u32.to_be_bytes());
     }
 }

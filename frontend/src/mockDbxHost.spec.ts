@@ -315,4 +315,82 @@ describe("mockDbxHost fixture", () => {
     expect(ctx.restored).toBe(false);
     expect(ctx.surface).toBe("tab");
   });
+
+  // M14-C DownloadSudo: sudo/download/start 用 path 参数、返回源文件名与
+  // sudo 标记；分块循环复用 sftp/download/next 的 binary 通道；cancel 清任务。
+  it("sudo/download mock streams through the shared sftp/download chunk pipeline", async () => {
+    const plugin = await loadMock("");
+    const events: Array<{ method: string; params: Record<string, unknown> }> = [];
+    plugin.onEvent((event) => events.push(event as unknown as { method: string; params: Record<string, unknown> }));
+    const info = await plugin.invoke<{ taskId: string; fileName: string; size: number; chunkSize: number; sudo: boolean }>("sudo/download/start", { sessionId: "visual-session", path: "/etc/nginx/nginx.conf" });
+    expect(info.taskId).toMatch(/^sudo-download-/);
+    expect(info.sudo).toBe(true);
+    expect(info.chunkSize).toBe(262144);
+    let offset = 0;
+    let eof = false;
+    while (!eof) {
+      const result = await plugin.invoke<{ length: number; eof: boolean }>("sftp/download/next", { taskId: info.taskId, offset });
+      offset += result.length;
+      eof = result.eof;
+    }
+    expect(offset).toBe(info.size);
+    // start/next 的进度事件沿既有 sftp/transfer/progress 通道广播（面板复用）。
+    expect(events.some((event) => event.method === "sftp/transfer/progress" && event.params.taskId === info.taskId)).toBe(true);
+    const finish = await plugin.invoke<{ success: boolean }>("sftp/download/finish", { taskId: info.taskId });
+    expect(finish.success).toBe(true);
+    const cancel = await plugin.invoke<{ success: boolean }>("sudo/download/cancel", { taskId: "sudo-download-unknown" });
+    expect(cancel.success).toBe(true);
+  });
+
+  // M18（M13 遗留 3 之 mock 补齐）：?auth=auto 按 AUTO_AUTH_ORDER 逐方式发
+  // ssh/auth/auto 进度事件（App.vue 据此渲染 Show logs 的逐方式日志：status
+  // skipped → info、failed → warn，method+detail 走 authAuto 文案），agent 兜底
+  // 成功（成功方式不发事件），会话仍建立；渲染数据面 authMethod 回 "auto"。
+  it("?auth=auto emits per-method ssh/auth/auto progress in AUTO_AUTH_ORDER and still opens the session", async () => {
+    vi.useFakeTimers();
+    const plugin = await loadMock("?auth=auto");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+    const opened = await plugin.invoke("ssh/session/open", {}) as Record<string, unknown>;
+    expect(opened.sessionId).toBe("visual-session");
+
+    const autoEvents = events.filter((event) => event.method === "ssh/auth/auto");
+    // 顺序 = AUTO_AUTH_ORDER 的前三跳；agent 兜底成功不发事件。
+    expect(autoEvents.map((event) => event.params.method)).toEqual(["password", "private-key", "keyboard-interactive"]);
+    expect(autoEvents.map((event) => event.params.status)).toEqual(["failed", "skipped", "failed"]);
+    for (const event of autoEvents) {
+      // 事件形状镜像 backend/src/ssh.rs authenticate_auto 的 emitter.event：
+      // App 只消费 method/status/detail，operationId/connectionId 随包可诊断。
+      expect(event.params.operationId).toBe("visual-auth-auto");
+      expect(event.params.connectionId).toBe("visual-connection");
+      expect(typeof event.params.detail).toBe("string");
+      expect(String(event.params.detail).length).toBeGreaterThan(0);
+    }
+    // 逐方式日志的渲染数据：连接信息面板 authMethod（connectionInfo 翻译）。
+    const sessions = await plugin.invoke("ssh/sessions/list", {}) as { sessions: Array<{ authMethod?: string }> };
+    expect(sessions.sessions[0]?.authMethod).toBe("auto");
+  });
+
+  // ?auth=autofail：四方式全败，agent 也发 failed 事件，invoke 抛聚合错误串
+  // （auto_auth_failure_message 同构，逐方式按 try 顺序拼接 skipped/failed 原因）。
+  it("?auth=autofail reports every stage then rejects with the aggregated Auto failure message", async () => {
+    const plugin = await loadMock("?auth=autofail");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+    await expect(plugin.invoke("ssh/session/open", {})).rejects.toThrow(
+      /SSH authentication failed in Auto mode, tried in order — password \(password rejected by server\); private-key \(skipped: no private key configured for this connection\)/,
+    );
+    const autoEvents = events.filter((event) => event.method === "ssh/auth/auto");
+    expect(autoEvents.map((event) => event.params.method)).toEqual(["password", "private-key", "keyboard-interactive", "agent"]);
+    expect(autoEvents.map((event) => event.params.status)).toEqual(["failed", "skipped", "failed", "failed"]);
+  });
+
+  // 缺省（显式认证方式）：不发任何 ssh/auth/auto 事件——回退叙事仅 Auto 场景。
+  it("default fixture emits no ssh/auth/auto progress events", async () => {
+    const plugin = await loadMock("");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+    await plugin.invoke("ssh/session/open", {});
+    expect(events.filter((event) => event.method === "ssh/auth/auto")).toEqual([]);
+  });
 });

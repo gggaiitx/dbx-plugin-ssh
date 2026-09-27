@@ -16,6 +16,10 @@
  * (/tmp/dbx-ui-mock, same pattern as the A-LDAP walkthrough) — the project
  * package.json stays dependency-frozen. If playwright-core or Chrome is
  * unavailable the script SKIPs (exit 0), matching the smoke SKIP semantics.
+ * CI (and anyone who wants a hard gate) sets DBX_SMOKE_STRICT=1: a SKIP that
+ * stems from missing tooling then exits non-zero, so a broken environment can
+ * no longer share the silent-green path with a genuine pass. Assertion and
+ * timeout failures always exit non-zero, strict or not.
  *
  * Usage: node scripts/smoke_ui_mock.mjs [--port 5199]
  */
@@ -32,6 +36,12 @@ const SHOT_DIR = `${ROOT}docs/screenshots-ui-mock`;
 
 function skip(reason) {
   console.log(`SKIP: ${reason}`);
+  // DBX_SMOKE_STRICT=1（CI 门禁）：工具链缺失的 SKIP 按失败退出，环境损坏
+  // 不再与测试通过共享静默绿路径；默认（本地无依赖）保持 exit 0。
+  if (process.env.DBX_SMOKE_STRICT === "1") {
+    console.error("DBX_SMOKE_STRICT=1: dependency-missing SKIP is treated as a failure");
+    process.exit(1);
+  }
   process.exit(0);
 }
 
@@ -53,31 +63,38 @@ for (const dir of playwrightCandidates) {
   } catch { /* try next candidate */ }
 }
 if (!chromium) skip("playwright-core not available at /tmp/dbx-ui-mock (npm install --prefix /tmp/dbx-ui-mock playwright-core)");
+// Linux：launch 用 channel:"chrome"，探测装在标准路径的稳定版/发行版 Chrome
+//（ubuntu runner 自带 google-chrome-stable —— CI 门禁依赖这一点）。
 const chromeCandidates = process.platform === "win32"
   ? [
       "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
       "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
       join(process.env.LOCALAPPDATA ?? "", "Google\\Chrome\\Application\\chrome.exe"),
     ]
-  : ["/Applications/Google Chrome.app", "/Applications/Chromium.app"];
+  : process.platform === "darwin"
+    ? ["/Applications/Google Chrome.app", "/Applications/Chromium.app"]
+    : ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/usr/bin/chromium"];
 const hasChrome = chromeCandidates.some((p) => p && existsSync(p));
 if (!hasChrome) skip("no system Chrome/Chromium");
 
 // --- vite dev server ---
 console.log("==> starting vite dev server");
-const vite = spawn("pnpm", ["--dir", "frontend", "exec", "vite"], {
-  cwd: ROOT,
+// 直启 repo 内 vite 二进制（不经 pnpm exec）：CI runner 的 PATH/pnpm 包装
+// 层可能静默吞掉 stdout，导致 URL 永远匹配不上（首次 runner 观测实录）。
+const vite = spawn(process.execPath, [join(ROOT, "frontend", "node_modules", "vite", "bin", "vite.js")], {
+  cwd: join(ROOT, "frontend"),
   stdio: ["ignore", "pipe", "pipe"],
-  // Windows: pnpm 是 .cmd 包装，Node ≥18.20/20.12 起无 shell 直接 spawn 报 EINVAL。
-  shell: process.platform === "win32",
+  env: { ...process.env, NO_COLOR: "1" },
 });
+vite.on("error", (e) => process.stderr.write(`[vite spawn error] ${e}\n`));
+vite.on("exit", (code, sig) => { if (code !== 0 && code !== null) process.stderr.write(`[vite exited] code=${code} sig=${sig}\n`); });
 vite.stderr.on("data", (d) => process.stderr.write(d));
 let stdoutBuf = "";
 vite.stdout.on("data", (d) => {
   stdoutBuf += String(d);
 });
 let baseUrl = "";
-const upDeadline = Date.now() + 60_000;
+const upDeadline = Date.now() + 180_000; // 冷缓存下 vite optimizeDeps 可能远超 60s
 while (Date.now() < upDeadline) {
   const match = /(https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+)\//.exec(stdoutBuf);
   if (match) {
@@ -86,7 +103,7 @@ while (Date.now() < upDeadline) {
   }
   await sleep(500);
 }
-if (!baseUrl) skip("vite dev server did not report a URL in time");
+if (!baseUrl) skip(`vite dev server did not report a URL in time; vite stdout tail: ${stdoutBuf.slice(-400) || "(empty)"}`);
 console.log(`==> dev server up: ${baseUrl}`);
 
 const failures = [];
@@ -142,19 +159,40 @@ try {
   await page.screenshot({ path: `${SHOT_DIR}/01-workbench.png`, fullPage: false });
   console.log(`  screenshot: docs/screenshots-ui-mock/01-workbench.png`);
 
-  // --- global quick commands: add via the toolbar popover -----------------
-  console.log("==> quick commands: global store add");
+  // --- global quick commands: manage in Settings, execute in toolbar -------
+  console.log("==> quick commands: settings-managed global store add");
+  // M32-A 回归守卫：协议直开图标（Telnet/VNC/RDP/Serial）与 quick sudo
+  // profiles 管理入口已从工具条移除（连接统一走宿主连接管理；管理归设置）。
+  for (const goneTitle of ["New Telnet session", "New VNC session", "New RDP session", "New Serial session", "Global Quick Sudo profiles"]) {
+    const count = await page.locator(`button[title="${goneTitle}"]`).count();
+    check(`protocol direct-open removed ("${goneTitle}")`, count === 0, `found ${count}`);
+  }
   // 自定义 tooltip 系统（App.vue 全局接管）：首次 hover 后 title 会挪到
   // data-tooltip，此后 button[title=...] 选择器不再命中，两处点击都要兼容。
   const QUICK_BTN = 'button[title="Quick commands"], button[data-tooltip="Quick commands"]';
   await page.click(QUICK_BTN);
   await expect(page, ".quick-commands-popover", "quick commands popover");
   await expectText(page, ".quick-command-global-hint", "Stored globally", "global-store hint");
-  // 编辑器已改为子视图：先点"新建"按钮，名称 input + 命令 textarea。
-  await page.click(".quick-new-btn");
+  // M32-A3：工具条弹层只剩列表执行，"新建/导入"迁入设置·终端，footer 留指路说明。
+  await expectText(page, ".quick-command-manage-hint", "Settings → Terminal", "manage-in-settings hint");
+  const newInPopover = await page.locator(".quick-new-btn").count();
+  check("editor entry removed from popover", newInPopover === 0, `found ${newInPopover}`);
+  await page.keyboard.press("Escape");
+
+  // 管理路径：设置 → 终端 → 快速命令 → 新建（数据面 RPC 不变，全局共享）。
+  await page.evaluate(() => document.querySelector('button svg[class*="lucide-settings"]').closest("button").click());
+  await page.locator(".settings-nav-item").first().waitFor({ state: "visible", timeout: 15_000 });
+  await page.getByRole("tab", { name: "Terminal", exact: true }).click();
+  await page.locator(".quick-manage-actions .link-button", { hasText: "New snippet" }).click();
   await page.fill(".quick-command-editor input", "ui-mock cmd");
   await page.fill(".quick-command-editor textarea", "echo ui-mock-batch");
-  await page.click(".quick-command-editor .primary-button");
+  await page.click(".quick-command-editor-actions .primary-button");
+  await expectText(page, ".quick-manage-list li", "ui-mock cmd", "quick command settings row");
+  await page.locator(".settings-modal header button.icon-button").first().click();
+  await page.locator(".settings-nav-item").first().waitFor({ state: "hidden", timeout: 10_000 });
+
+  // 回到工具条弹层：全局清单同步可见（同一 App 权威态）。
+  await page.click(QUICK_BTN);
   await expectText(page, ".quick-command-row strong", "ui-mock cmd", "quick command row");
   await page.screenshot({ path: `${SHOT_DIR}/02-quick-commands.png`, fullPage: false });
   console.log(`  screenshot: docs/screenshots-ui-mock/02-quick-commands.png`);
@@ -218,12 +256,16 @@ try {
 
   // --- global quick commands: delete --------------------------------------
   console.log("==> quick commands: delete");
-  await page.click(QUICK_BTN);
-  // 动作按钮 hover 浮现（opacity 0 → 1），先悬停卡片再点删除；
+  // M32-A3：删除动作随管理视图在设置·终端（工具条卡片只剩执行）。
+  await page.evaluate(() => document.querySelector('button svg[class*="lucide-settings"]').closest("button").click());
+  await page.locator(".settings-nav-item").first().waitFor({ state: "visible", timeout: 15_000 });
+  await page.getByRole("tab", { name: "Terminal", exact: true }).click();
   // 删除有 window.confirm 确认（不可逆操作），自动接受。
-  await page.hover(".quick-command-row");
   page.once("dialog", (dialog) => void dialog.accept());
-  await page.click(".quick-command-row button.icon-button:last-child");
+  await page.click('.quick-manage-list li button[title="Delete"]');
+  await page.locator(".settings-modal header button.icon-button").first().click();
+  await page.locator(".settings-nav-item").first().waitFor({ state: "hidden", timeout: 10_000 });
+  await page.click(QUICK_BTN);
   await expectText(page, ".quick-commands-popover .empty.compact", "No quick commands yet", "quick commands empty after delete");
 
   // --- PR-A4 local-terminal anchors (written against the TARGET contract) ---

@@ -8,14 +8,34 @@ authors = ["jinpy"]
 [workspace]
 
 [dependencies]
+# Session import (connection_import.rs): the AES block cipher for the
+# WindTerm autoLogin AES-256-CBC decryption. 0.9 is the current generation
+# that shares `cipher 0.5` with the aes-gcm 0.11 tree.
+aes = "0.9"
 aes-gcm = "0.11"
 base64 = "0.23"
+# CBC mode wrapper used with `aes` above. Features are explicit: the
+# transitive cbc consumers disable defaults, which would turn off the
+# PKCS7 padding/alloc APIs the WindTerm decryptor needs.
+cbc = { version = "0.2", default-features = false, features = ["alloc", "block-padding"] }
 data-encoding = "2"
 dbx-plugin-sdk = "0.1.0"
+# GBK decoding for Xshell .xts ZIP entry names (Chinese Windows exports).
+encoding_rs = "0.8"
 getrandom = "0.4"
 hmac = "0.13"
-portable-pty = "0.9.0"
 if-addrs = "0.15.0"
+# WindTerm autoLogin KDF: PBKDF2-HMAC-SHA3-512. pbkdf2 0.13 and sha3 0.11
+# are the digest-0.11 generation matching hmac 0.13 already in the tree.
+pbkdf2 = "0.13"
+portable-pty = "0.9.0"
+# `otp/import-qr`: QR decode (rqrr 0.9) over `image` (luma8 bitmap); image is
+# pinned to the four photo formats QR screenshots actually use with default
+# features (rayon, exr/gif/hdr/tiff/avif/…) trimmed off. Both are MIT OR
+# Apache-2.0 (verified via `cargo info`). See src/otp_store.rs.
+rqrr = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+
 # Terminal trigger (expect) stage patterns — see src/triggers.rs.
 regex = "1"
 russh = { version = "0.62", features = ["des"] }
@@ -24,12 +44,56 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
 sha2 = "0.11"
+sha3 = "0.11"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+# Xshell .xts session archives; deflate is all Xshell writes (zip-bomb
+# guards live in connection_import.rs).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Local file watching for the "open in external editor" round-trip
+# (watch/start in src/file_watch.rs). Defaults stay on: v6 has no
+# linux_inotify feature (the backend is unconditional there), macos_fsevent
+# is the macOS backend and crossbeam-channel is the default event plumbing.
+notify = "6"
+# Serial-port sessions (nyaterm-parity P3-2, src/serial_session.rs). 4.x is
+# the current generation (MIT OR Apache-2.0, actively maintained); default
+# features keep the Linux udev port enumerator, which links the system
+# libudev — glibc CI needs the libudev-dev apt package (ci.yml "Install
+# native dependencies").
+serialport = "4"
+# VNC sessions (nyaterm-parity P2 2d, src/vnc_session.rs). crates.io name is
+# "vnc-rs" (lib name `vnc`), HsuJv/vnc-rs. 0.6.0 (2026-09-21, MIT OR
+# Apache-2.0) upstreamed the NyaTerm fork hardening: zero unsafe, typed
+# network errors, per-message decoder limits (8.3MP / 8192px / 64MiB
+# compressed / 1MiB clipboard / 4096B names) and handshake regression tests.
+# Plugin-side bounds stay tighter (3840x2160 framebuffer, <=8-byte classic
+# VNC password) — due diligence in docs/SPIKE_VNC_SESSION.zh-CN.md.
+vnc-rs = "0.6"
+# RDP sessions (nyaterm-parity P3-4). Umbrella re-export only for now: the
+# session/protocol implementation lands in the follow-up branch. The five
+# crates it pulls in (ironrdp-client / -connector / -tls, picky, sspi) are
+# vendored under vendor/ and pinned through [patch.crates-io] below — see
+# docs/RDP_VENDOR_FORK_PLAN.zh-CN.md (Route B) and vendor/README.md for the
+# per-crate registration. Feature set mirrors NyaTerm src-tauri/Cargo.toml:
+# password/NLA auth + TLS + text clipboard + reconnect; no audio, drive
+# redirection or keyboard capture. TLS backend follows NyaTerm's platform
+# split (rustls elsewhere, native-tls/Schannel on Windows).
+ironrdp = { version = "0.17", default-features = false, features = ["client", "client-clipboard", "cliprdr", "connector", "core", "input", "pdu"] }
+# RDP 键盘输入路径（src/rdp_session.rs）：ironrdp-input 的 Database::apply
+# 返回 SmallVec<[FastPathInputEvent; 2]>，右 Shift 直发 fast-path 事件也用
+# smallvec! 构造。已是 ironrdp 传递依赖（锁内 1.16.x），此处只声明直用。
+smallvec = "1"
 
 [target.'cfg(windows)'.dependencies]
 pageant = "0.2"
+# RDP TLS backend: Schannel via native-tls on Windows (NyaTerm's split, see
+# the ironrdp comment above and docs/RDP_VENDOR_FORK_PLAN.zh-CN.md §8-7).
+ironrdp = { version = "0.17", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# RDP TLS backend: rustls everywhere else (macOS/Linux/musl CI targets).
+ironrdp = { version = "0.17", default-features = false, features = ["rustls"] }
 
 # The OS keychain tier only ships where a native keychain exists; the Linux
 # secret-service backend pulls libdbus (absent in store build containers and
@@ -42,8 +106,21 @@ keyring = "4"
 # The DBX sidecar SDK is vendored under shared/ so a standalone checkout does
 # not depend on the source monorepo or a sibling host checkout. See
 # docs/REPOSITORY_SPLIT.zh-CN.md for the future public-package migration plan.
+#
+# The RDP fork chain (vendor/) is patched the same way. ALL SIX entries below
+# form one lockstep set — ironrdp (umbrella 0.17) must move in the same round
+# as client 0.1.0 / connector 0.10.0, and picky/sspi/ironrdp-tls ride along.
+# Never bump a single entry; scripts/check_vendor_lockstep.py fails CI on
+# drift between this list and the vendored manifests. Registration table:
+# backend/vendor/README.md.
 [patch.crates-io]
 dbx-plugin-sdk = { path = "../shared/sdk/rust/dbx-plugin-sdk" }
+ironrdp = { path = "vendor/ironrdp" }
+ironrdp-connector = { path = "vendor/ironrdp-connector" }
+ironrdp-client = { path = "vendor/ironrdp-client" }
+ironrdp-tls = { path = "vendor/ironrdp-tls" }
+picky = { path = "vendor/picky" }
+sspi = { path = "vendor/sspi" }
 
 [dev-dependencies]
 tempfile = "3"

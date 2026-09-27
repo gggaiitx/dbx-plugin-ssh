@@ -1,3 +1,6 @@
+// 键位路由与右键语义已迁往可编辑设置：键位在 terminalHotkeys.spec.ts，
+// 右键/粘贴/响铃等终端行为在 terminalBehavior.spec.ts。本文件只覆盖不可配置的
+// 门禁与搜索辅助逻辑。
 import { describe, expect, it } from "vitest";
 import { canAcceptFileDrop, canAcceptTerminalDrop, createTerminalCopyCache, isApplePlatform, isTerminalSelectAllShortcut, normalizeDropTargetDir, resolveDropTargetDir, resolveTerminalKeyAction, resolveTerminalPasteText, resolveTerminalRightClickAction, sanitizeSearchOptions, sanitizeSelectCopyEnabled, terminalSearchSeedFromSelection } from "./terminalInteraction";
 
@@ -74,25 +77,11 @@ describe("terminal keyboard shortcuts (copy/paste routing)", () => {
     expect(isTerminalSelectAllShortcut({ mod: true, shiftKey: false, metaKey: true, key: "v", applePlatform: true })).toBe(false);
   });
 
+describe("Apple platform detection", () => {
   it("detects Apple platforms from the user agent", () => {
     expect(isApplePlatform("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")).toBe(true);
     expect(isApplePlatform("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")).toBe(false);
     expect(isApplePlatform("Mozilla/5.0 (X11; Linux x86_64)")).toBe(false);
-  });
-
-  it("routes plain Ctrl/Cmd+C with a selection to copy (Windows Terminal / iTerm2 semantics)", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: true })).toBe("copy");
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "C", hasSelection: true })).toBe("copy");
-  });
-
-  it("keeps plain Ctrl/Cmd+C without a selection as shell input (SIGINT)", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "c", hasSelection: false })).toBe("none");
-  });
-
-  it("routes both Ctrl+V and Ctrl/Cmd+Shift+V to paste", () => {
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: false, key: "v", hasSelection: false })).toBe("paste");
-    expect(resolveTerminalKeyAction({ mod: true, shiftKey: true, key: "V", hasSelection: false })).toBe("paste");
-    expect(resolveTerminalKeyAction({ mod: false, shiftKey: true, key: "v", hasSelection: false })).toBe("none");
   });
 });
 
@@ -181,4 +170,5 @@ describe("terminal drop default target resolution", () => {
     expect(resolveDropTargetDir({ terminalCwd: undefined, sftpHome: undefined, fallback: "/" })).toBe("/");
     expect(resolveDropTargetDir({ terminalCwd: "", sftpHome: "/", fallback: "/" })).toBe("/");
   });
+});
 });

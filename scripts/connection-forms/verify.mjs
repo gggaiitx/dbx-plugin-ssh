@@ -130,29 +130,32 @@ const advancedFields = [
   "terminal_keepalive_secs", "set_env", "triggers_enabled",
   "remote_command", "read_only",
 ];
+const PROTOCOL_SSH = { field: "protocol", one_of: ["ssh"] };
 for (const key of advancedFields) {
-  assert.deepEqual(byKey[key].visible_when, { field: "advanced_options", one_of: ["true"] },
-    `${key}: must be gated by advanced_options`);
+  assert.deepEqual(byKey[key].visible_when, { all_of: [PROTOCOL_SSH, { field: "advanced_options", one_of: ["true"] }] },
+    `${key}: must be gated by protocol=ssh + advanced_options`);
 }
 // The passphrase command only feeds key decryption: with password or agent
 // auth it would be dead UI, so it additionally requires key-based auth.
 assert.deepEqual(byKey.passphrase_command.visible_when, {
   all_of: [
+    PROTOCOL_SSH,
     { field: "advanced_options", one_of: ["true"] },
-    { field: "authentication", one_of: ["private-key", "private-key-password"] },
+    { field: "authentication", one_of: ["private-key", "private-key-password", "auto"] },
   ],
-}, "passphrase_command must combine the advanced switch with key-based auth");
+}, "passphrase_command must combine protocol=ssh, the advanced switch and key-based auth");
 // Sudo and 2FA are first-class entry points, not advanced trivia: hiding them
 // behind the switch is what made bastion/MFA setup undiscoverable (issues #17
 // and #30 - users could not find the TOTP field and gave up). Their *detail*
 // fields still open on demand, so the default form only gains two rows.
-assert.equal(byKey.sudo_source.visible_when, undefined, "sudo_source must stay visible without the advanced switch");
+assert.deepEqual(byKey.sudo_source.visible_when, PROTOCOL_SSH, "sudo_source is SSH-only and must stay visible without the advanced switch");
 // Empty sudo password is not a no-op: the sidecar falls back to the login
 // password, so defaulting to Off would silently stop answering sudo prompts
 // for every new connection (`1a07ed3` flipped it, `de5ee09` flipped it back).
 assert.equal(byKey.sudo_source.default, "custom", "sudo_source must keep the custom default - Off would stop sudo orchestration on new connections");
-assert.deepEqual(byKey.auth_flow_mode.visible_when, { field: "sudo_source", one_of: ["custom", "off"] },
-  "auth_flow_mode (2FA) must stay visible whenever sudo does not defer to a global profile");
+assert.deepEqual(byKey.auth_flow_mode.visible_when, {
+  all_of: [PROTOCOL_SSH, { field: "sudo_source", one_of: ["custom", "off"] }],
+}, "auth_flow_mode (2FA) must stay visible whenever sudo does not defer to a global profile");
 // Field order is the form's information architecture: the switch must sit
 // *below* the always-visible sudo/2FA rows, so it reads as "the settings below
 // this switch are optional" instead of implying sudo/2FA are optional extras.
@@ -168,6 +171,7 @@ assert(fields.indexOf(byKey.advanced_options) > fields.indexOf(byKey.totp_prompt
 // the auth_flow_mode clause follow automatically there.
 assert.deepEqual(byKey.password_prompt_hint.visible_when, {
   all_of: [
+    PROTOCOL_SSH,
     { field: "sudo_source", one_of: ["custom", "off"] },
     { field: "auth_flow_mode", one_of: ["password_then_otp", "password_plus_otp"] },
   ],
@@ -184,8 +188,11 @@ for (const advanced_options of [false, true]) {
         for (const auth_flow_mode of options("auth_flow_mode")) {
           for (const read_only of [false, true]) {
             const current = state({ advanced_options, authentication, password_source, sudo_source, auth_flow_mode, read_only });
-            const passwordAuth = ["password", "private-key-password"].includes(authentication);
-            const privateKey = ["private-key", "private-key-password"].includes(authentication);
+            // Auto（M13-A）按序回退会用到全部凭据来源：password_source /
+            // password / 密钥字段 / agent_socket 全部可见，但 none 仍不可见
+            // 的字段一个不多（与 manifest one_of 门控逐项对应）。
+            const passwordAuth = ["password", "private-key-password", "auto"].includes(authentication);
+            const privateKey = ["private-key", "private-key-password", "auto"].includes(authentication);
             // The login password is an explicit either-or: "Enter in this form"
             // requires the Password field, "Local command" requires Password
             // command. The user-chosen source is what makes strict validation
@@ -202,7 +209,7 @@ for (const advanced_options of [false, true]) {
             current.visible("private_key_path", privateKey); current.required("private_key_path", false);
             current.required("private_key", false);
             current.visible("private_key_passphrase", privateKey); current.required("private_key_passphrase", false);
-            current.visible("agent_socket", authentication === "agent");
+            current.visible("agent_socket", ["agent", "auto"].includes(authentication));
             // Sudo details follow their source only. The obvious extra rule -
             // "hide them on read-only connections" - cannot be expressed while
             // `read_only` itself sits behind `advanced_options`: the host's `not`
@@ -261,9 +268,13 @@ assert.equal(byKey.password_source.binding, "config");
 assert.equal(byKey.password_source.default, "direct", "password_source: must default to the common case");
 assert.deepEqual(options("password_source").sort(), ["command", "direct"]);
 assert.deepEqual(byKey.password.required_when, { field: "password_source", one_of: ["direct"] });
-assert.deepEqual(byKey.password.visible_when, { field: "password_source", one_of: ["direct"] });
+assert.deepEqual(byKey.password.visible_when, {
+  all_of: [PROTOCOL_SSH, { field: "password_source", one_of: ["direct"] }],
+});
 assert.deepEqual(byKey.password_command.required_when, { field: "password_source", one_of: ["command"] });
-assert.deepEqual(byKey.password_command.visible_when, { field: "password_source", one_of: ["command"] });
+assert.deepEqual(byKey.password_command.visible_when, {
+  all_of: [PROTOCOL_SSH, { field: "password_source", one_of: ["command"] }],
+});
 // Every password_source option must be covered by exactly one required branch:
 // a gap means a save that the parser then rejects, an overlap means a dead end.
 assert.deepEqual(
@@ -403,10 +414,13 @@ for (const key of TRIGGER_FIELDS) {
     `${key}: must sit near set_env (before remote_command)`);
 }
 assert.equal(byKey.triggers_enabled.default, false, "triggers_enabled: must default to off");
-assert.deepEqual(byKey.triggers.visible_when, { field: "triggers_enabled", one_of: ["true"] });
+assert.deepEqual(byKey.triggers.visible_when, {
+  all_of: [PROTOCOL_SSH, { field: "triggers_enabled", one_of: ["true"] }],
+});
 for (const key of ["triggers", "trigger_answer_1", "trigger_answer_2"]) {
-  assert.deepEqual(byKey[key].visible_when, { field: "triggers_enabled", one_of: ["true"] },
-    `${key}: must be gated by triggers_enabled`);
+  assert.deepEqual(byKey[key].visible_when, {
+    all_of: [PROTOCOL_SSH, { field: "triggers_enabled", one_of: ["true"] }],
+  }, `${key}: must be gated by protocol=ssh + triggers_enabled`);
 }
 // The triggers placeholder must be a usable tssh (trzsz-ssh) text example so
 // copy-paste just works (the backend parses tssh text rules natively; the
@@ -583,6 +597,50 @@ for (const junk of [undefined, false, 0, "true"]) {
   assert.equal(reopened.query_timeout_inherit, false, `sentinel ${String(junk)} must not mean global`);
   assert.equal(reopened.connect_timeout_secs, 7, "per-connection value must survive hydrate");
   assert.equal(reopened.query_timeout_secs, 8, "per-connection value must survive hydrate");
+}
+
+// ---------------------------------------------------------------------------
+// M32-B1：serial/rdp 连接类型。协议门控矩阵——host/port 对 TCP 四协议共用
+// （serial 隐藏），SSH 专属凭据簇对 serial/rdp 整体隐藏，serial/rdp 各自的
+// 协议字段互不串扰、且不得出现在其他协议下。
+// ---------------------------------------------------------------------------
+const TCP_PROTOCOLS = ["ssh", "telnet", "vnc", "rdp"];
+assert.deepEqual(byKey.host.visible_when, { field: "protocol", one_of: TCP_PROTOCOLS },
+  "host must stay visible for every TCP protocol and hide for serial");
+assert.deepEqual(byKey.port.visible_when, { field: "protocol", one_of: TCP_PROTOCOLS },
+  "port must stay visible for every TCP protocol and hide for serial");
+assert.deepEqual(byKey.username.visible_when, { field: "protocol", one_of: ["ssh", "telnet", "rdp"] },
+  "username must serve ssh/telnet/rdp (NLA) and hide for vnc/serial");
+for (const key of ["serial_port", "serial_baud", "serial_data_bits", "serial_parity", "serial_stop_bits", "serial_backspace"]) {
+  assert.deepEqual(byKey[key].visible_when, { field: "protocol", one_of: ["serial"] },
+    `${key} must show only for serial connections`);
+}
+for (const key of ["rdp_domain", "rdp_resolution", "rdp_certificate_policy", "rdp_clipboard"]) {
+  assert.deepEqual(byKey[key].visible_when, { field: "protocol", one_of: ["rdp"] },
+    `${key} must show only for rdp connections`);
+}
+// serial_port 不设必填：设备可能尚未插上（后端连接时校验，表单不拦）。
+assert.equal(byKey.serial_port.required, undefined, "serial_port must not be form-required (device may be attached later)");
+assert.deepEqual(options("protocol"), ["ssh", "telnet", "vnc", "serial", "rdp"], "protocol options must list every routed protocol");
+for (const protocol of options("protocol")) {
+  const current = state({ protocol });
+  current.visible("display_name", true);
+  current.visible("host", TCP_PROTOCOLS.includes(protocol));
+  current.visible("port", TCP_PROTOCOLS.includes(protocol));
+  current.visible("username", ["ssh", "telnet", "rdp"].includes(protocol));
+  // SSH 凭据/调优字段只属于 ssh；serial/rdp 表单不得残留 SSH 行。
+  current.visible("sudo_source", protocol === "ssh");
+  current.visible("advanced_options", protocol === "ssh");
+  current.visible("serial_port", protocol === "serial");
+  current.visible("serial_baud", protocol === "serial");
+  current.visible("serial_data_bits", protocol === "serial");
+  current.visible("serial_parity", protocol === "serial");
+  current.visible("serial_stop_bits", protocol === "serial");
+  current.visible("serial_backspace", protocol === "serial");
+  current.visible("rdp_domain", protocol === "rdp");
+  current.visible("rdp_resolution", protocol === "rdp");
+  current.visible("rdp_certificate_policy", protocol === "rdp");
+  current.visible("rdp_clipboard", protocol === "rdp");
 }
 
 console.log(`PASS SSH connection form: ${scenarios} combinations; field ordering and seven-language labels/options`);

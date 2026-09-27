@@ -24,13 +24,16 @@ const WRITE_CHUNK_BYTES: usize = 96 * 1024;
 
 /// Wraps a path in single quotes for safe shell interpolation, replacing any
 /// embedded quote with the POSIX `'\''` escape (tiny-rdm's shQuoted).
-fn shell_quote(path: &str) -> String {
-    format!("'{}'", path.replace('\'', r"'\''"))
-}
+///
+/// Canonical implementation lives in [`crate::exec::shell_quote`]; re-exported
+/// here so the sudo family keeps its local name and `sudo_download`'s import
+/// path is unchanged.
+#[doc(hidden)]
+pub(crate) use crate::exec::shell_quote;
 
 /// Runs one command with Quick Sudo and returns its output, failing on a
 /// non-zero exit code (mirrors tiny-rdm's execSudoResultMap handling).
-async fn sudo_exec(
+pub(crate) async fn sudo_exec(
     runtime: &SshRuntime,
     session_id: &str,
     command: &str,
@@ -344,6 +347,8 @@ fn parse_ls_output(directory: &str, ls_output: &str) -> Vec<SftpEntry> {
         .map(|entry| {
             let path = format!("{}/{}", base, entry.name);
             SftpEntry {
+                // sudo 提权的 ls 输出已是文本层；没有原始字节可比对。
+                lossy: false,
                 name: entry.name,
                 uri: sftp_uri(&path),
                 kind: entry.kind,

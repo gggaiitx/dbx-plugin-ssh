@@ -49,3 +49,267 @@ i18n 七语全量对齐断言、终端标记条运行中时长 tick、sudo 保�
 （smoke_sudo_otp_test.py 10 用例）。
 依赖宿主/CI（单列）：宿主管线集成回归（test.sh 全量 + plugin_tools_bridge）、DBX Web/Docker
 浏览器兜底 e2e、长稳与大文件 100 MiB/1 GiB、五平台包矩阵、多会话语义与端口转发归属决策。
+
+
+## M1（nyaterm-parity W1，2026-09-23）
+
+单测：cargo **595/595**（基线 575 + 20：metrics_gpu 13 / preferences 7）、vitest **792/792**（基线 698 + 94：matcher 24 / gutter 18 / suggestions+guard+queue 42 / gpu 视图与组件 10）、vue-tsc 0 错、`pnpm build` 过（ui/ 已重生成）；`validate_repo.py`、`connection-forms/verify.mjs` 全过。
+
+e2e（headless Chrome，`mock.html?fresh=1&slow=2`，Playwright + 系统 Chrome）：连接流程 → 设置 Terminal 分类（Action links / Line numbers & timestamps 区渲染、开关→Save 持久化）→ 终端行号+时间戳双列 gutter 对齐 → 命令条造历史后输入 "ec" 建议浮层（匹配高亮 + History 来源标签）→ Downloads 分类（重复策略单选 + 并发输入）→ Server metrics GPU/NPU 卡片（双 A100 P0/P8 + 910B4/310P3 + CANN 徽标 + 空进程态 + 警戒色）→ 动作链接 host:port 下划线（与 IP 关键词高亮共存）。截图经 visual-judge 终审 **7/7 pass**（备注项：Downloads 路径说明行位置、窄卡显存 title 兜底截断，均非阻断）。
+
+仍保持未验收（依赖真机/CI）：NVIDIA/Ascend 真机采集冒烟（无卡主机，TEST_MATRIX 待补跑记录）、Windows ConPTY 下 gutter 渲染、DBX 桌面宿主端到端手测（M1 里程碑 PR 合入前人工执行）。
+
+## M5（nyaterm-parity，2026-09-24）
+
+单测：cargo **719/719**（M4 基线 696，只增不减；vnc_session 11）、vitest **874/874**（基线 861，只增不减；vncFrame 帧编解码 9）、vue-tsc 0 错、`pnpm build` 过（ui/ 已重生成）；clippy `-D warnings` 0、fmt 干净。
+
+新增可测面：`vnc/start|input|resize|reconnect|set-clipboard|close|list` 协议、44 字节 RGBA patch 帧编解码（3840×2160 / 64MiB / 步长上界）、VNC-Auth 密码长度拒绝、Tight/JPEG 矩形显式失败、generation 重连语义；前端 VNC 画布与连接对话框、Docker"在终端打开"fill 通道、x11_spike 编译示例（不参与运行）。
+
+仍保持未验收（依赖真机/CI）：VNC 真机 server（None/VNC-Auth）端到端、X server 转发真机联调、串口硬件、GPU/NPU 主机、Windows ConPTY、DBX 桌面宿主端到端；RDP 维持人工评审门（vendored fork 链 + CredSSP）。
+
+
+## M5.5（main 同步 + 三会话并行线，2026-09-24）
+
+单测：cargo **735/735**（M5 基线 719，只增不减；串口 ports 规范化/行参数校验 + main 侧 MFA、传输复用、pluginStorage、sessionTransportReuse、terminalModeQueries 等 spec 并入）、vitest **886/886**（基线 874，只增不减）、vue-tsc 0 错、`pnpm build` 过（ui/ 重生成）、clippy `-D warnings` 0、fmt 干净。
+
+新增可测面：serial ports 路径/描述规范化分离与 start 行参数严格校验（纯逻辑）；main 同步带入的交互式 MFA、重复会话认证传输复用、右键粘贴插件视图副本降级链（createTerminalCopyCache/resolveTerminalPasteText）、kitty/XTVERSION/DECRQM 能力探测应答、randomUUID shim 的既有 spec；RDP 立项材料两份与串口协议升级设计稿（评审门文档，无代码面）。
+
+仍保持未验收（依赖真机/CI）：VNC server、X server 转发、串口硬件、GPU/NPU 主机、Windows ConPTY、DBX 桌面端到端；RDP 评审执行（材料已备）。新增回归面：App.vue 结构化偏好新键（终端行为/快捷键/传输并发/命令建议）在真机 opaque origin 下的持久化——pluginStore 全量迁移待下轮（PROGRESS 遗留 3）。
+
+
+## M6（pluginStore 全量迁移，2026-09-24）
+
+单测：vitest **891/891**（基线 886，只增不减；terminalBehavior×2 / terminalHotkeys×2 / terminalAppearance×1 默认 pluginStore 回环与不抛用例，pluginStorage.spec 键清单断言扩展至 15 键并固化 transfer/suggestions 排除项）、vue-tsc 0 错、`pnpm build` 过（ui/ 重生成）。backend 零改动（无 cargo 面变化）。
+
+新增可测面：三结构化偏好键（terminal-behavior/hotkeys/appearance）经 host.storage 通道持久化、web 直连降级 guarded localStorage、键清单锁定断言。
+
+仍保持未验收（依赖真机/CI）：三键真机首装迁移（localStorage 旧值经惰性搬家入 host.storage）与跨重启持久化；老宿主降级行为抽查。VNC/X server/串口/GPU-NPU/ConPTY/DBX 桌面端到端与 RDP 评审执行等既有人工门不变。
+
+
+## M7（并发验证轮：P0 回归修复 + 三线矩阵，2026-09-25）
+
+单测：vitest **891/891**（基线持平；terminalModeQueries.spec 加固——fake parser 镜像 xterm prefix/intermediates/final 区间校验，XTVERSION query/Ps=0/非零放行三形态）、vue-tsc 0 错、`pnpm build` 过（ui/ 重生成）。backend 零改动。
+
+新增可测面（实例/模拟层）：smoke 家族 8 项矩阵全绿（含 forward 容器复验 6 用例）；干净容器首装挑战流 PASS；浏览器场景矩阵 13 场景（10 PASS + 3 FAIL 已随 P0 修复转绿，等价覆盖见 walkthrough）。P0 修复：XTVERSION CSI 注册参数（`{prefix:">",final:"q"}` + params 校验），同类注册形态从此被 vitest 锁定。
+
+仍保持未验收（依赖真机/人工）：DBX 桌面端到端、VNC/X server/串口硬件/GPU-NPU/ConPTY、pluginStore 真机持久化、S3 visual.html 修复后补录、前端 walkthrough 纳入 CI 的人工排期。
+
+
+## M7-Warp（结构化补全 spec 下拉，2026-09-25）
+
+单测：vitest **934/934**（spec 纯函数 23 + CompletionMenu 组件 5 + M7 三线增量）、cargo **766/766**（含 M7 startup-commands/import-formats backend 增量）、vue-tsc 0、build 过（ui/ 重生成）。
+
+新增可测面：spec token 切分（引号内空格/`--` terminator/`--flag=v` 内联值）、三层判定（flag/value/sub）、评分截断 20、菜单键盘导航；12 个 CLI spec 数据静态校验。
+
+已知限制：动态值（分支/文件/pod 名）只出占位 hint 不向远端枚举；spec 未覆盖的命令回落历史浮层；菜单 Enter=接受 token（fig 语义）非执行。
+
+
+## M8（Warp 对齐 + np9 并发轮，2026-09-25）
+
+单测：vitest **960/960**（95 文件；ghost 状态机 26 + completion spec/menu + telnet-autologin + startup_commands 134 行 spec + import 四解析器，基线 901 只增不减）、vue-tsc 0 错、`pnpm build` 过（ui/ 重生成）；backend cargo **745**（基线 735 只增不减：startup_commands 偏好解析/桶上限/注入器）、clippy `-D warnings` 0、fmt 干净。
+
+新增可测面：行内 ghost 建议（字节分类/门闩/前缀扩展/接受注入，Warp/fish 对标）；结构化补全三级下拉（spec 优先/历史回落）；telnet 声明式自动登录；四格式会话导入；连接级启动命令（<=20 行/<=4KiB/<=30s 延迟上限、按 connectionId 分桶、完成事件不含命令内容）。
+
+仍保持未验收（依赖真机/人工）：serial-xymodem 线在途（模块已落盘，验证中）；ghost/spec 真机输入法与宿主渲染联调；DBX 桌面端到端；RDP 评审执行。
+
+- 补录：serial-xymodem 合入（backend 801 / 前端 975 终值），XMODEM/YMODEM/ZMODEM 上传协议状态机与 serialUpload 前端为新增可测面；smoke_serial_upload.py 入实例测试家族。np9 排期清零。
+
+
+## M10（评审修复批次，2026-09-25）
+
+单测：cargo **823/823**（811 → +12：x11 gate 6 + watch/otp 5 + vnc golden 向量 1）、vitest **990/990**（980 → +10：terminalAnchor 5 + ghost 互斥 2 + vncFrame 向量等）、vue-tsc 0 错、build 过（ui/ 重生成）、clippy -D warnings 0、fmt 干净。
+
+新增可测面：X11 反向通道 fail-closed 准入（上限/cookie/替换/disarm）、watch 本地路径来源校验（remote-edit 前缀/穿越/symlink 逃逸）、ghost 锚点 scrollback 语义（可见行/绝对行）、ghost×补全互斥、vnc/frame 跨端 golden 向量；CI 新增 UI walkthrough strict 门。
+
+仍保持未验收（依赖真机/CI）：X server 真机联调、CI walkthrough job 首跑观测；其余人工门不变（真机矩阵、RDP 评审、PR 合入）。
+
+- RDP 实施链（2026-09-25）：rdpFrame 21 用例（golden/坏帧/扫描码/状态机/证书）+ RDP-2 rdp_session 30 用例（分类器/上界/策略状态机/NTLMv2 断言）= 新增 51；cargo 854 / vitest 1019 终值。未验收：真机 RDP server 端到端、WKWebView 位图光标、CBT 端到端核对。
+
+
+## M13（对标差距批次，2026-09-25）
+
+单测：cargo **894/894**（887+7：auto_auth 编排顺序/全失败汇总/挑战流中立）、vitest **1031/1031**（1029+10：quickCommandImport 9 + 进程排序 1 + auth 展示 2 [102 文件]）、vue-tsc 0、build 过、clippy 0、fmt 0、connection-forms verify 598 组合 PASS（含 Auto 场景）。
+
+新增可测面：Auto 编排顺序不变式与逐方式汇总；quickCommandImport 双格式解析/去重/上限；/proc fd 计数与监听端口解析（容错）；进程表 fd/ports 排序。
+
+仍保持未验收（依赖真机/人工）：Auto 真机多方式回退联调（含 agent 转发环境）、导入文件对话框真机、句柄数/端口在真实服务器的覆盖度、既有真机门（RDP/X server/串口/GPU-NPU/ConPTY/DBX 桌面）不变。
+
+
+## M14（对标差距批次二，2026-09-25）
+
+单测：cargo **925/925**（894+31：transcript/搜索/auto_record 5 + sftpName/raw SFTPv3 解析/深度 clamp 20 + sudo_download staging/清理/命令构造 6）、vitest **1047/1047**（104 文件，1031+16：transcript 10 + sftpName/transferQueue/mock sudo-download 6）、vue-tsc 0、build 过、clippy 0、fmt 0。
+
+新增可测面：transcript ANSI/OSC/CR 剥离与时间戳；录制搜索命中摘录；transfer_max_active clamp 1-8；sftpName latin-1 解码与 %XX 转义往返；sudo_download staging/清理命令构造与 0600+chown 语义。
+
+仍保持未验收（依赖真机/人工）：raw SFTPv3 async 回环、非 UTF-8 真实服务器联调、sudo/download 真容器 smoke（smoke_fs_test.py 新用例）、兼容模式老服务器实测、既有真机门不变。
+
+
+## M15（遗留消化批次，2026-09-25）
+
+单测：cargo **929/929**（Windows 基线 920+9；macOS 口径基线 925——平台差异注记见 PROGRESS：A 线并行 watcher 3 + B 线 raw 路径保真 6 净增）、vitest **1057/1057**（105 文件，1047+10：watchEdits 注册表/队列 10）、vue-tsc 0、build 过、clippy 0、fmt 0。
+
+新增可测面：同会话双文件 watcher 互不顶替/各自触发/事件按 watchId+remotePath 区分；modified 队列（未知 id 丢弃/同文件去重/队头出队/过期决议拒绝）；64 并发回传暂存名全不重名；FXP RENAME/REMOVE/MKDIR/RMDIR/LSTAT 帧编解码与 STATUS 错误映射；write_path_bytes 目录前缀 %XX 还原 + 末段显示编码（字面 %XX 不二次转义）；join_raw_path 字节级拼接；latin-1 树删 LSTAT 判型/symlink 不跟随；tokio duplex 内存桩 raw 往返。
+
+仍保持未验收（依赖真机/人工）：多文件 watcher 外部编辑器全链路真机手测；latin-1 真实服务器 rename/delete/mkdir/rmdir/树下载联调；既有真机门不变。
+
+
+## M16（候选缺口消化批次，2026-09-25）
+
+单测：cargo **937/937**（M15 后基线 929+8：A 线 raw 写侧/暂存提交/路径分工 6 + B 线 overrides sanitize/resolve 优先级 2）、vitest **1061/1061**（106 文件，1057+4：connectionNameEncoding 三态解析/白名单回退/merge 上限 4）、vue-tsc 0、build 过、clippy 0、fmt 0。
+
+新增可测面：OPEN/WRITE/SETSTAT/READLINK/SYMLINK 帧编解码与 OpenSSH wire 次序；暂存→SETSTAT→原子 rename 提交语义与失败清理；rename-unique 候选名编码探测闭环；resolve_sftp_name_encoding 三态（连接覆盖/全局/缺省）与白名单外回退；overrides 桶清洗（上限 512、非法值丢弃）；connectionNameEncoding 控件纯函数。
+
+仍保持未验收（依赖真机/人工）：latin-1 真实服务器上传写族/exists/rename-unique 联调；连接级覆盖切换即时生效的手工走查；既有真机门不变。
+
+
+## M17（工程面收官批次，2026-09-25）
+
+单测：cargo **940/940**（M16 后基线 937+3：A 线 wire 还原 1 + B 线 MCP 判定优先链/往返闭环 2）、vitest **1064/1064**（106 文件，1061+3：displayPathToWire 等价性/% 自转义/UTF-8 兜底）、vue-tsc 0、build 过、clippy 0、fmt 0。
+
+新增可测面：exists form:"wire" 整条还原；copy/move 覆盖预检 LSTAT 与同目录 RENAME 快路径；displayPathToWire 与 sidecar 组合逐字符等价；MCP 连接级判定优先链三态；MCP 列表显示路径→写工具往返闭环（含 rename）。
+
+仍保持未验收（依赖真机/人工）：latin-1 真机全链联调（粘贴/copy/move/拖入/MCP 工具往返）、多文件 watcher 外部编辑全链路真机手测、既有真机门不变。
+
+
+## M18（欠账清理批次，2026-09-25）
+
+单测：cargo **950/950**（M17 后基线 940+10：MCP 七工具 latin-1 往返闭环 6 + 收编模块修复配平）、vitest **1067/1067**（106 文件，1064+3：mock auth=auto 场景 3）、vue-tsc 0、build 过、clippy 0、fmt 0。smoke_fs_test.py +9 用例（CI ssh-smoke job 执行）。
+
+新增可测面：MCP stat/exists/read/write/chmod latin-1 裸包分支往返；exists 仅 NO_SUCH_FILE 判不存在的契约；write_file 直写语义；copy/move 预检 LSTAT 与同目录 RENAME 快路径；smoke latin-1 全链（含 exists wire 双形态交叉反例、覆盖回退后 auto 高层删 0xE9 名的清理路径）；mock auth=auto 逐方式事件序列与全败聚合。
+
+仍保持未验收（依赖真机/人工）：latin-1 真机全链联调（工作台+MCP 面）、多文件 watcher 全链路、既有真机门不变。
+
+
+## M19（编码保真收尾批次，2026-09-25）
+
+单测：cargo 基线 950 → **953**（+3：MCP upload/download latin-1 裸包分支往返闭环）、vitest 基线 1067 无前端改动。clippy 0、fmt 0。smoke_fs_test.py latin-1 组 +1 用例（sftp/symlink-create/read/update 往返）。
+
+新增可测面：MCP sftp_upload 直写帧序（LSTAT 预检 + OPEN + WRITE 载荷逐字节）与 sftp_download OPEN(READ) 帧路径字节；同显示路径 upload/download OPEN 帧字节一致 + 载荷回收的往返闭环；smoke 符号链接三命令 latin-1 路径（0xE9 字节链接名 + 显示指向读写回环）。
+
+仍保持未验收（依赖真机/人工）：latin-1 真机全链联调（工作台+MCP 面，含传输工具）、既有真机门不变。
+
+
+## M19.5（真机复验轮，2026-09-25，Mac linuxserver/openssh-server 容器实测）
+
+单测：cargo 基线（win 957）→ mac 口径 **963/963**（+1：`request_type_codes_match_draft02_literals` 全部 23 个 SFTP 类型码对 draft-02 字面值逐一对表 + READDIR 帧字节直读断言）、vitest **1067/1067**、vue-tsc 0、build 过、clippy 0、fmt 0。真机：smoke_fs_test **79/79 全组通过**（修复前 71 过/5 SKIP/2 FAIL）。
+
+修复面：`FXP_READDIR` 常量错值（16=REALPATH → 12）引发的 raw 列表通道 EOF；`sftp/read` latin-1 wire 车道补齐（raw_read_chunk，多读 1 字节 truncated 语义）；树下载 latin-1 逐文件裸包读取（`TreeDownloadState.latin1`）。三者均为「离线桩自洽通过、真容器才爆」的字节级缺口——字面值对表测试专门封堵常量自洽盲区。
+
+仍保持未验收（依赖真机/人工）：latin-1 真机全链联调在 CI 容器口径已过（本轮 79/79），工作台 GUI 手测与既有真机门不变。
+
+
+## M20（watcher 真容器批次，2026-09-26，Mac linuxserver/openssh-server 容器实测）
+
+smoke_fs_test.py +3 用例（watcher external-edit 组，PASS 82 / SKIP 0 / FAIL 0）：`watch/start` 双文件并发注册（watchId 互异、localPath 落 `<下载目录>/remote-edit/<stamp>/` 域）；外部编辑按 watchId 精确路由事件（payload 的 sessionId/remotePath 逐项断言）+ `watch/upload` 回写后 `sftp/read` 字节级一致 + 同内容重复保存 sha256 去重不再触发；`watch/stop` 精确移除单个 watch（被停者静默、其余照常）+ `watch/stop-all` 全清。backend 代码零改动（本轮纯 smoke 收口"多文件 watcher 外部编辑真机门"的可自动化部分）。
+
+用例自洽设计：进组显式 `sftp_name_encoding=auto`（不依赖持久档历史值——此前多轮 FAIL 轮的偏好残留会让 auto 语义的用例误走 latin-1 裸包分支）；外部编辑前越过 pump 启动抑制窗（SUPPRESS_WINDOW=2s）；事件经 sidecar_client 事件池以无害请求泵出。
+
+仍保持未验收（依赖真机/人工）：watcher 工作台 GUI 手测（编辑器打开/确认弹窗/always-upload 流）、latin-1 连接下的 watcher 回写（write_bytes latin-1 分支已有单测与 MCP 往返覆盖）、既有真机门不变。
+
+
+## M21（latin-1 watcher 回写批次，2026-09-26，Mac linuxserver/openssh-server 容器实测）
+
+smoke_fs_test.py +1 用例（PASS **83** / SKIP 0 / FAIL 0）：latin-1 连接口径下 wire 路径的 watcher 全链——`watch/start` 注册 `caf%E9.txt` wire 目标、外部保存事件路由、`watch/upload` 经 `write_bytes` latin-1 分支裸包回写、`sftp/read` wire 车道字节级校验；用例自愈（趁 latin-1 偏好在位删 0xE9 残留再归位 auto）。
+
+**真机曝露并修复第五层 wire 缺口**：`sftp/download/start` 对转义路径的 size 探测直接 `remote_path.as_bytes()` 发 raw LSTAT（字面 `%XX` 当路径 → NO_SUCH_FILE）——读侧 `raw_read_chunk` 早已 `unescape_wire`，唯独探测点漏了。修复后与下载分片/树扫描口径一致。此前未爆的原因：wire 单文件下载此前无真容器用例（树下载的 size 来自 raw READDIR 扫描，不经此探测点）。
+
+单测：cargo **963/963** / clippy 0 / fmt 0（修复为 ssh.rs 一处探测调用 + 注释）。
+
+仍保持未验收（依赖真机/人工）：watcher 工作台 GUI 手测、既有真机门不变。
+
+
+## WT-2 终端应答矩阵（2026-09-27，协议应答矩阵审计批）
+
+> WezTerm 把 DA/DSR/OSC 的应答、忽略、故意不支持逐项写成活文档；本节为同水位成文。
+> 实测方法：`frontend/src/lib/terminalProtocolMatrix.spec.ts` 用真实 xterm 内核
+> （`@xterm/xterm` **6.1.0-beta.304**，package.json 锁定）驱动 parser——内核行为一变
+> 该 spec 先红，文档不至于悄悄失真。插件层应答在 `terminalModeQueries.ts`（CSI 查询）、
+> `terminalOsc.ts`（OSC 10/11/52）、`terminalOscChannels.ts`（OSC 9/777/1337 白名单，
+> WT-2 新增）。「应答」的应答字节均以 spec 断言锁定。
+
+### CSI 查询（DSR / DA / DECRQM）
+
+| 序列 | 行为 | 应答字节 / 理由 | 落点 |
+| --- | --- | --- | --- |
+| DSR 5（`CSI 5n`，状态报告） | **应答**（内核已答） | `ESC[0n`（无故障）。vim/tmux 等以它探活终端 | xterm 内核 |
+| DSR 6（`CSI 6n`，光标位置） | **应答**（内核已答） | `ESC[<row>;<col>R`（1 起真实行列，实测 `ESC[3;5H` 后答 `ESC[3;5R`） | xterm 内核 |
+| Primary DA（`CSI c` / `CSI 0c`） | **应答**（内核已答） | `ESC[?1;2c`（VT100+AVO）。WezTerm 答 `?6c`（VT102）——两者同属「基础 VT 级」，无应用据此分流功能，不补 | xterm 内核 |
+| Secondary DA（`CSI >c`） | **应答**（内核已答） | `ESC[>0;<version>;0c`（版本号随内核演进，spec 锁形状不锁值） | xterm 内核 |
+| Tertiary DA（`CSI =c`，DECRPTUI） | **忽略**（内核静默） | 仅 VT 级单元识别用，应用面无消费方 | xterm 内核 |
+| kitty 键盘协议（`CSI ?u`） | **应答**（内核吞、插件补） | `ESC[?0u`：声明「协议在、flags 0」，调用方维持 legacy 编码。内核对 `?u` 静默（实测锚点），不补则 claude code/neovim 卡 raw-mode 初始化 | 插件 `terminalModeQueries.ts`；set/pop 形态交回内核 |
+| XTVERSION（`CSI >0q`） | **应答**（内核无、插件补） | DCS `>|dbx 1.0`。串保持通用，不诱导调用方启用本终端不支持的私有 escape | 插件 `terminalModeQueries.ts` |
+| DECRQM（`CSI ?<mode>$p`） | **应答**（插件统一答） | `ESC[?<mode>;2$y`（2=不支持）。**2026（同步渲染）自 WT-1 落地后为支持**：应答翻转为「1=支持」并配批次内缓冲/整体提交的帧同步语义（并行分支实施中，以该分支为准）；其余私模式维持「不支持」，防调用方重试循环 | 插件 `terminalModeQueries.ts`（WT-1 翻转 2026） |
+
+### OSC 白名单
+
+| 序列 | 行为 | 理由 / 语义 | 落点 |
+| --- | --- | --- | --- |
+| OSC 10/11（前景/背景色查询 `?`） | **应答**（内核吞、插件补） | 按生效主题色答 `rgb:rr/gg/bb`；设置分支不拦截交回内核 | 插件 `terminalOsc.ts` |
+| OSC 52（剪贴板） | **写支持 / 读不响应**（故意） | 写方向 1 MiB 防御上限；读查询（`?`）与清空静默吞掉——回传用户剪贴板属隐私泄漏，主流终端同样默认不回应 | 插件 `terminalOsc.ts` |
+| OSC 7（cwd 上报） | **消费**（目录跟随回落通道） | 后端经提示符注入安装；与 SetUserVar cwd 并存时按「更晚事件为准」裁决（见下） | 插件 `terminalDirectoryTracking.ts` + App.vue |
+| OSC 9（通知，iTerm2 growl 风格） | **消费**（WT-2 起接工作台通知；此前内核静默忽略） | payload 即正文；空正文不弹。正文压单行、超 600 字符截断 | 插件 `terminalOscChannels.ts` + App.vue（`registerOscHandler(9)`） |
+| OSC 777（通知，kitty/urxvt 约定） | **仅消费 `notify;TITLE;BODY` 类**；其余类（进度上报等）不消费 | 白名单语义：不认识的种类返回 false 交回内核忽略，不误弹 | 插件 `terminalOscChannels.ts` + App.vue（`registerOscHandler(777)`） |
+| OSC 1337 `File=…`（内联图像） | **消费**（既有能力） | iTerm2 内联图像 + sixel 同走 ImageAddon，32 MiB 像素上限 | `@xterm/addon-image` |
+| OSC 1337 `SetUserVar=name=<base64>` | **消费**（WT-2 起接；此前内核静默忽略） | WezTerm `user-var-changed` 等价消费面：`cwd`/`CurrentDir` 名下的 cwd 元数据接目录跟随**优先通道**（cd 即刻跟随，不等提示符时刻的 OSC 7；分歧时以更晚事件为准，OSC 7 回落保留、行为不变）；坏 base64/超名限（64）/超载限（base64 16 KiB、解码后 8 KiB）降级忽略。xterm parser 本身对单条 OSC 有 10 MB 载荷上限，超限直接丢弃 | 插件 `terminalOscChannels.ts` + App.vue（`registerOscHandler(1337)`） |
+| OSC 1337 其余 payload（`CurrentDir=…` 直通等） | **忽略** | 非白名单形态返回 false；多 handler 按注册逆序派发（xterm 6 实测语义），SetUserVar handler 先执行、false 落回 ImageAddon，互不抢占 | xterm 内核静默 |
+| OSC 633（VS Code shell 集成命令标记） | **消费** | 命令/退出码/时长/cwd 标记；未知 payload 原样留在可见输出（同 tiny-rdm） | 插件 `terminalCommandMarkers.ts` |
+| 未挂 handler 的 OSC（9/777/1337 等） | **忽略**（内核静默） | 实测锚点：无 handler 时 `ESC]9;…` / `ESC]777;…` / `ESC]1337;…` 不渲染、不回显、不产生 onData | xterm 内核 |
+
+### SGR 冒号形式与自研绘制路径
+
+| 形式 | 行为 | 实测结论 |
+| --- | --- | --- |
+| `SGR 4:3`（curly 下划线） | 内核入属性 | 字节入 cell 下划线属性（`4:` 系冒号子参同路），**零宽不占列**；`translateToString` 纯文本不含任何残留 |
+| `SGR 38:2::r:g:b`（ITU 冒号真彩，含 colorspace 空段） | 内核入属性 | 与 legacy `38;2;r;g;b` 存进同一种 RGB 单元属性（getFgColor 打包值一致、色彩模式一致），零宽不占列 |
+| 与自研 decoration（关键词高亮 / 动作链接 / gutter）的交互 | **无相互作用** | 自研绘制路径按 `buffer.getLine(row).translateToString()` 的纯文本列偏移定位（`keywordHighlight.ts` 的 `matchesInLine` / `toAbsoluteRowRange`），SGR 已被内核在 parse 阶段消费为 cell 属性，冒号形式不改变文本列——装饰 `registerDecoration({ x, width })` 的偏移天然对齐；着色为装饰层半透明填充画在文字层上方，与内核画的下划线/真彩字色叠加显示，互不覆写。前提「冒号 SGR 零宽」一旦被内核破坏会整体错位，已锁进 spec |
+| 与命令标记路径（`terminalCommandMarkers.ts` OSC 633 解析）的交互 | **无相互作用** | 633 解析只识别自己的帧（`ESC]633;…`），SGR 冒号序列原样透传内核；流中夹带的 SGR 不影响 carry/帧边界判定 |
+
+### 8 位 C1 控制码（GBK 堡垒机场景）
+
+- **设计立场：UTF-8-only，不启用 8 位 C1**（与「排期外明确不做」清单一致，维持现状）。
+- 实测（本仓内核口径，非真机）：裸 `0x9B` 字节在 UTF-8 模式下被 xterm 内核按 **C1-CSI 引导** 解释——`A <0x9B> 4m B` 渲染为 `AB` 且 B 带下划线（`4m` 被整段吞掉），即内核对 C1 区间字节不做 UTF-8 非法字节回退。对 GBK 堡垒机的推论：GBK 双字节首字节落在 0x81–0x9F 的字符，在未转码直入本终端时存在被误读为 C1 控制码、吞掉后续字节的风险面（表现为乱码形态异常，而非纯 mojibake）。
+- **待真机补充实测**：无真实 GBK 堡垒机环境，本行不落真机数据；后续有环境时补「GBK 流直入 / sidecar 转码后直入」两口径的渲染对照。
+
+### WT-2 批次验证记录（2026-09-27）
+
+- 新增 spec：`terminalOscChannels.spec.ts`（15 用例：通知解析/白名单、SetUserVar 解析与防御上限、cwd 元数据接受集、OSC 7 优先级裁决）+ `terminalProtocolMatrix.spec.ts`（10 用例：上表全部实测锚点）。
+- 回归：两新 spec 25/25 过；i18n 护栏 `workbench.spec.ts` + `i18nKeyReferences.spec.ts` **68/68** 过（新增 `terminalOsc.defaultTitle` 七语对齐且被 App.vue 真实引用）；相关既有 spec（`terminalModeQueries` / `terminalOsc` 等）44/44 过。
+- `pnpm vue-tsc --noEmit` 0 错误。
+
+
+## 协议矩阵 Docker 真机层（2026-09-27，telnet/serial/X-Y-ZMODEM）
+
+> 覆盖 nyaterm parity 新协议会话的"真机式"端到端缺口：现有 telnet 冒烟只测
+> start 校验（无网络），串口 PTY 回环在 macOS 上被 serialport-rs ENOTTY 跳过。
+> 本批用 Docker 补位：真实 telnetd 服务器 + Linux 虚拟串口（serialport Linux
+> 后端走真实 termios/baud 路径）。资产：`scripts/smoke_telnet_docker.py`、
+> `scripts/smoke_serial_docker.py`、`scripts/docker/protocol-matrix/`
+> （run_matrix.sh 一键编排，`test.sh` 以 `DBX_PROTOCOL_MATRIX=1` opt-in）。
+
+| 层 | 套件 | 结果 |
+| --- | --- | --- |
+| 宿主机（darwin-arm64 sidecar） | smoke_telnet_docker × busybox telnetd shell 型（IAC 协商/无 0xFF 泄漏/NAWS+二进制键入+inputAck/JSON 兜底/resize/replay/close/list/写后关） | **6/6** PASS（5.2s） |
+| 宿主机（darwin-arm64 sidecar） | smoke_telnet_docker × busybox telnetd login 型（声明式自动登录真实 login 口令流程、成功后 whoami、**密码字节零回显**） | **4/4** PASS（1.7s） |
+| 宿主机（darwin-arm64 sidecar） | smoke_telnet_docker login-fail（错密码 → failureRegex 观测 → 预算耗尽关会话，reason=`auto-login failed: host rejected the login after 2 attempt(s)`） | **1/1** PASS（6.3s） |
+| Linux 容器（linux/arm64 sidecar） | 同 smoke_telnet_docker shell / login 两味道（docker 网络内直连 telnetd 容器） | **6/6 + 4/4** PASS（5.1s + 1.6s） |
+| Linux 容器（linux/arm64 sidecar） | smoke_serial_docker × socat 虚拟空解调线 + 路由器控制台模拟器：枚举语义注记、serial/start（snake_case 线上字段）+ binaryInput 能力、回车重打提示符出帧、二进制键入 show version 回显+应答+inputAck、serial/write JSON 兜底、parity "mark" 严格拒绝、**XMODEM 全传**（'C' 邀约 → CRC 块 → EOT 先 NAK 再 ACK 双确认 → 300B 字节级比对）、**ZMODEM 起传 ZRQINIT + 取消 ZDLE×5+BS×5 → failed(`cancelled by user`)**、replay、list/close/写后关 | **10/10** PASS（3.7s） |
+| Windows | CI `windows-regression`（windows-2022：connection-forms 协议门控矩阵、`cargo test --locked` 原生全量、release 构建、smoke_mcp 对 Windows sidecar exe）+ `Package candidate (windows-x64)` 打包 | run 36262285893 @ 3c1a9275 双 job **success** |
+
+### 过程注记（对后续排障有用）
+
+- **serial/start 线上字段为 snake_case**（`SerialStartRequest` 未启用
+  camelCase rename；响应由 sidecar 手拼 `json!` 为 camelCase）——前端
+  App.vue 已有注释，冒烟按此对齐；`#[serde(default)]` 会把错误键名静默
+  吞成空串再报 "portName is required"，排障时先怀疑键名。
+- **串口会话无 connected 状态事件**：sidecar 只发 `closed`/`error`，前端
+  start 后本地置 running，连通性靠输出帧（banner/提示符）。
+- **serialport Linux 后端不枚举 /dev/pts**（只列 ttyS/ttyUSB/ttyACM），
+  PTY 回环里 `serial/ports/list` 为空属后端语义，非缺陷。
+- **上电 banner 可能早于 sidecar 打开端口而丢失**（PTY 缓冲语义），冒烟
+  用"回车重打提示符"验证读路径出帧。
+- 跳过的部分：inetutils-telnetd（in.telnetd 在 bookworm-slim 容器内
+  execv 后 exit 100，未深究，busybox telnetd 的真实 IAC 协商已覆盖同一
+  断言面）；真 USB 串口 / RFC2217 / GBK 堡垒机维持人工门。
+- Windows 容器不可在 macOS Docker 上运行，Windows 层以 CI 原生 job 为
+  证据；真机 COM 口 + DBX 安装链路验收按仓库约定属人工步骤（install.cmd
+  + 双冒烟）。

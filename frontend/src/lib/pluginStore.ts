@@ -10,8 +10,14 @@
 //   ssh-download-conflict-policy：权威在 sidecar preferences.json
 //   （local/preferences/*），localStorage 仅作 web 直连场景的同步缓存
 //   （App.vue cachePrefs/hydratePrefs）。
+// - ssh-transfer-concurrency / ssh-transfer-duplicate-policy /
+//   ssh-history-suggestions-enabled / ssh-history-suggestion-min-chars /
+//   ssh-history-suggestion-max-chars：同上，sidecar preferences 权威 +
+//   localStorage 同步缓存（App.vue cachePrefs/hydratePrefs），迁走即双权威。
 // - ssh-quick-commands：已迁 sidecar 全局存储，localStorage 旧键仅作一次性
 //   迁移种子（App.vue hydrateQuickCommands），不再作为活键。
+// - dbx-term-diag（App.vue）：控制台手动开启的诊断开关，非用户偏好，
+//   沙箱内本就不可写，guarded 直读保持原状。
 
 import { createPluginKvStore } from "../../../shared/frontend/pluginStorage";
 
@@ -30,6 +36,20 @@ export const PLUGIN_STORE_KEYS: readonly string[] = [
   "ssh-terminal-webgl",
   "ssh-terminal-font-size",
   "ssh-terminal-font-family",
+  "ssh-terminal-behavior",
+  "ssh-terminal-hotkeys",
+  "ssh-terminal-appearance",
+  // 结构化补全开关（对标 Warp/fig 线 2）：SettingsDialog 开关行自治读写，
+  // App 弹出浮层前直读（"false" = 关，默认开）。
+  "ssh-completion-spec",
+  // 会话连接弹窗的上次参数记忆（Telnet/Serial/VNC）：弹窗打开时回填、
+  // 提交时写穿；凭据类字段不落盘。
+  "telnet-connect-last",
+  "serial-connect-last",
+  "vnc-connect-last",
+  // 行内 ghost 自动建议（对标 Warp 线 1）：SettingsDialog 开关行自治读写，
+  // 默认开。
+  "ssh-terminal-ghost-suggest",
 ];
 
 export const pluginStore = createPluginKvStore([...PLUGIN_STORE_KEYS]);

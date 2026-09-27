@@ -1,0 +1,14 @@
+# Telnet 真机测试服务器（协议矩阵 Docker 层）。
+#
+# 纯 busybox applet 提供一台真实的 telnet 服务器：真实 IAC 协商
+# （DO ECHO / DO NAWS / WILL ECHO / WILL SGA）、真实 login 提示与口令校验。
+# 凭据只属于这个一次性测试容器（与 CI 的 DbxTest2026 同级，不入任何真实环境）。
+#
+# 两个容器复用同一镜像（见 run_matrix.sh）：
+#   login 型：telnetd -F -p 2323 -l /bin/login   （auto-login 引擎真机层）
+#   shell 型：telnetd -F -p 2324 -l /bin/sh      （IAC/NAWS/键入/回放/关闭）
+FROM busybox:1.36
+RUN adduser -D dbxuser && echo "dbxuser:DbxTelnet2026" | chpasswd \
+ && printf 'export PS1="DBXSHELL> "\n' > /etc/profile \
+ && printf 'DBX telnetd test device\n' > /etc/issue
+EXPOSE 2323 2324

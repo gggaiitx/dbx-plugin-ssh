@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use russh::keys::agent::{client::AgentClient, AgentIdentity};
 use russh::keys::ssh_key::HashAlg;
 use russh::keys::{decode_secret_key, key::PrivateKeyWithHashAlg};
 use russh::{ChannelMsg, Disconnect, MethodKind};
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use russh_sftp::protocol::FileType;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -43,15 +43,24 @@ use crate::model::{
     SftpEntry, StoredConnection, SudoSource, TerminalFrame, TerminalStream, MAX_TRANSFER_SIZE,
     TERMINAL_REPLAY_LIMIT, TRANSFER_CHUNK_SIZE,
 };
+use crate::otp;
+use crate::otp_store;
 use crate::quick_commands;
 use crate::session_recording;
+use crate::sftp_ext;
+use crate::sftp_name::{self, NameEncoding};
+use crate::sftp_raw;
 use crate::sftp_tree;
 use crate::ssh_algorithms;
+use crate::startup_commands;
+use crate::sudo_download;
 use crate::sudo_profiles;
 use crate::transfer_history;
+use crate::transfer_throttle::Throttle;
 use crate::triggers;
 
-/// Resolves the Quick Sudo / 2FA orchestration settings for a connection.
+/// 绑定的 OTP 库条目（经共享防重放缓存，同窗口码不重复发出）→ 既有
+/// Quick Sudo 全局/自定义链（完全不动，见 `login_sudo_auth`/`apply_profile`）。
 fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
     let mut auth = SudoAuth::new(
         &connection.sudo_password,
@@ -66,7 +75,30 @@ fn sudo_auth_for(connection: &StoredConnection) -> SudoAuth {
     );
     auth.otp_ledger_scope =
         exec::otp_ledger_scope_for(&connection.username, &connection.host, connection.port);
+    if auth.totp_secrets.is_empty() && auth.flow_mode != Some(AuthFlowMode::Off) {
+        // 本窗口码已被 otp/generate（或一次应答）发出时 take 返回 None：
+        // 等下一周期，期间保持现状链（不追加、不报错）。
+        if let Some(bound) = otp_store::data_dir()
+            .and_then(|dir| otp_store::take_connection_totp_key(&dir, &connection.id))
+        {
+            auth.totp_secrets.push(otp_bound_as_totp_secret(bound));
+        }
+    }
     auth
+}
+
+/// 把绑定条目的解析结果映射为 exec 编排的 TOTP 密钥（算法/位数/周期原样）。
+fn otp_bound_as_totp_secret(bound: otp_store::BoundTotp) -> exec::TotpSecret {
+    exec::TotpSecret::Key {
+        key: bound.key,
+        digits: u32::from(bound.digits),
+        period: bound.period,
+        algorithm: match bound.algorithm {
+            otp::OtpAlgorithm::Sha1 => exec::TotpAlgorithm::Sha1,
+            otp::OtpAlgorithm::Sha256 => exec::TotpAlgorithm::Sha256,
+            otp::OtpAlgorithm::Sha512 => exec::TotpAlgorithm::Sha512,
+        },
+    }
 }
 
 /// Builds the client negotiation config for one connection. The connection
@@ -880,6 +912,82 @@ impl client::Handler for SshClient {
         }
         Ok(())
     }
+
+    /// Incoming `x11` channel: the server accepted the `x11-req` sent when
+    /// the shell opened and a remote X client connected. russh's default
+    /// handler accepts unconditionally, so this override is the fail-closed
+    /// boundary (docs/SPIKE_X11_FORWARDING.zh-CN.md §3.4): the armed-session
+    /// gate must admit the channel and the X setup block must carry the
+    /// issued fake cookie before a single byte is relayed to the local
+    /// display. SSH delivers channel data only after the open is confirmed,
+    /// so the channel is accepted first and then held (nothing relayed)
+    /// until the setup block validates; a mismatch closes it immediately.
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let _ = (originator_address, originator_port, session);
+        // Admission first: no armed gate (X11 off or the last session
+        // closed) or the armed gate's bridge cap exhausted -> reject, never
+        // accept.
+        let Some((cookie, permit)) = crate::x11::try_admit_active() else {
+            eprintln!("[x11] channel refused: no armed gate or the bridge cap is exhausted");
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        reply.accept().await;
+        // The relay runs detached so the SSH reader is never blocked by X
+        // traffic; the admission permit travels with the task and frees its
+        // cap slot whenever the task ends.
+        tokio::spawn(async move {
+            // Keeping the admission permit alive for the bridge's lifetime
+            // holds the cap slot; its Drop frees the slot whenever this
+            // task ends (bridge finished, setup rejected, or channel gone).
+            let _bridge_permit = permit;
+            let mut channel = channel;
+            let mut buffer = crate::x11::SetupBuffer::default();
+            let verdict = loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { data }) => match buffer.push(&data, &cookie) {
+                        crate::x11::SetupInspection::Incomplete => continue,
+                        verdict => break verdict,
+                    },
+                    Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                        break crate::x11::SetupInspection::Reject(
+                            "x11 channel closed before the X setup block arrived",
+                        );
+                    }
+                    Some(_) => continue,
+                }
+            };
+            match verdict {
+                crate::x11::SetupInspection::Accept { cookie_offset } => {
+                    let mut setup = buffer.into_bytes();
+                    let target = crate::x11::current_display_target();
+                    crate::x11::substitute_cookie(
+                        &mut setup,
+                        cookie_offset,
+                        crate::x11::load_real_cookie(&target).as_deref(),
+                    );
+                    if let Err(error) = crate::x11::bridge_channel(channel, &target, setup).await {
+                        eprintln!("[x11] {error}");
+                    }
+                }
+                crate::x11::SetupInspection::Reject(reason) => {
+                    eprintln!("[x11] x11 channel rejected: {reason}");
+                    let _ = channel.close().await;
+                }
+                crate::x11::SetupInspection::Incomplete => {
+                    unreachable!("the setup loop only breaks on a final verdict")
+                }
+            }
+        });
+        Ok(())
+    }
 }
 
 /// Verdict of a key-exchange-only host-key probe against the known_hosts
@@ -1132,15 +1240,32 @@ impl DirectoryHandshakeFilter {
 
 /// Monotonic terminal output journal shared by the SSH and local-terminal
 /// session loops: assigns each chunk a sequence, keeps a bounded tail for
-/// `replay`, and survives transport gaps.
-#[derive(Default)]
+/// `replay`, and survives transport gaps. The byte budget defaults to the
+/// shared 2 MiB terminal limit; serial sessions build a smaller buffer via
+/// [`ReplayBuffer::with_byte_limit`] (128 KiB, design doc §3).
 pub(crate) struct ReplayBuffer {
     frames: VecDeque<TerminalFrame>,
     bytes: usize,
     sequence: u64,
+    byte_limit: usize,
+}
+
+impl Default for ReplayBuffer {
+    fn default() -> Self {
+        Self::with_byte_limit(TERMINAL_REPLAY_LIMIT)
+    }
 }
 
 impl ReplayBuffer {
+    pub(crate) fn with_byte_limit(byte_limit: usize) -> Self {
+        Self {
+            frames: VecDeque::new(),
+            bytes: 0,
+            sequence: 0,
+            byte_limit,
+        }
+    }
+
     pub(crate) fn push(&mut self, stream: TerminalStream, data: Vec<u8>) -> TerminalFrame {
         self.sequence += 1;
         let frame = TerminalFrame {
@@ -1150,7 +1275,7 @@ impl ReplayBuffer {
         };
         self.bytes += frame.data.len();
         self.frames.push_back(frame.clone());
-        while self.bytes > TERMINAL_REPLAY_LIMIT {
+        while self.bytes > self.byte_limit {
             let Some(removed) = self.frames.pop_front() else {
                 break;
             };
@@ -1347,6 +1472,20 @@ struct DownloadState {
     /// the chunk/finish/cancel paths branch on it while sharing the registry,
     /// progress events and cancel plumbing with plain file downloads.
     tree: Option<TreeDownloadState>,
+    /// Present only for sudo-backed downloads (`sudo/download/start`): the
+    /// remote staging temp file that must be removed on finish, cancel,
+    /// error and session close (`sudo_download::discard_tmp`).
+    sudo_tmp: Option<String>,
+    /// 单文件下载生效编码为 latin-1（M28-B）：size 探测与分块读取按
+    /// `has_wire_lane` 判裸包车道——latin-1 的 wire 域字面 `%` 已自转义，
+    /// `%XX` 唯一解读是转义还原；auto 车道列表 uri 字面 `%` 未自转义
+    /// （D-7），一律走高层客户端（字面量语义与列表一致）。树/sudo 任务
+    /// 不经此字段分支（树按 `TreeDownloadState.latin1`，sudo 走独立车道）。
+    latin1: bool,
+    /// 下载限速（issue #66）：start 时对偏好 `transfer_download_limit_kib`
+    /// 的一次性快照（0=不限速）。整个任务沿用快照值——改动对下一个下载
+    /// 任务生效，进行中的任务不受中途修改影响。sudo 下载车道本期不限速。
+    throttle: Throttle,
 }
 
 /// Live state of one recursive folder download. Files stream through the same
@@ -1366,6 +1505,10 @@ struct TreeDownloadState {
     files_done: u64,
     skipped: u64,
     failures: Vec<Value>,
+    /// latin-1 连接标记：files 的 remote_path 是 wire 形式（raw 扫描），
+    /// 逐文件读取必须走裸包车道——高层客户端按 UTF-8 open 字节名路径必
+    /// NO_SUCH_FILE（真机 smoke 曝露的第四层 wire 缺口）。
+    latin1: bool,
 }
 
 struct FinishingUpload {
@@ -1428,7 +1571,7 @@ fn upload_progress_payload(
 /// Error text for a cancelled upload. The optional reason slug comes from the
 /// workbench so "Upload cancelled by user" reads differently from an
 /// error-triggered cleanup ("Upload cancelled (ack-timeout)").
-fn upload_cancel_error(reason: Option<&str>) -> String {
+pub(crate) fn upload_cancel_error(reason: Option<&str>) -> String {
     match reason.map(str::trim).filter(|value| !value.is_empty()) {
         Some("user") => "Upload cancelled by user".to_string(),
         Some(reason) => format!("Upload cancelled ({reason})"),
@@ -1590,6 +1733,9 @@ pub struct SshRuntime {
     remote_tables: Mutex<HashMap<String, Arc<RemoteForwardTable>>>,
     /// Trust-on-first-use for unknown host keys (MCP stdio mode).
     auto_trust: bool,
+    /// 会话维度的「建议开启兼容模式」一次性提示标记（M14-B）：SFTP 探测
+    /// 失败时提示一次，之后同一会话静默。
+    compat_hinted: Mutex<HashSet<String>>,
     pub prompts: PromptBroker,
     data_dir: PathBuf,
     known_hosts_path: PathBuf,
@@ -1628,6 +1774,7 @@ impl SshRuntime {
             agent_modes: Mutex::new(agent_terminal::load_modes(&data_dir)),
             agent_challenges: Mutex::new(HashMap::new()),
             auto_trust: false,
+            compat_hinted: Mutex::new(HashSet::new()),
             prompts: PromptBroker::default(),
             data_dir,
             known_hosts_path,
@@ -1700,6 +1847,13 @@ impl SshRuntime {
         operation_id: &str,
         emitter: PluginEmitter,
     ) -> Result<Value, String> {
+        // WT-4 (WezTerm `spawn` parity): resolve the optional command-session
+        // request BEFORE any dial or transport lease, so a malformed command
+        // fails closed without touching the shared transport at all. The
+        // normalized command is wrapped as `sh -c '<escaped>'` here so the
+        // exec branch stays a single `Some`/`None` decision.
+        let spawn_exec = normalized_spawn_command(request.spawn_command.as_deref())?
+            .map(|command| spawn_exec_payload(&command));
         let connection_id = request.connection_id.as_str();
         let workbench_id = request.workbench_id.as_str();
         let reuse_authenticated_transport = request.reuse_authenticated_transport;
@@ -1819,7 +1973,31 @@ impl SshRuntime {
             // Client-specified SetEnv rides on the interactive session too,
             // in ssh(1) order: PTY first, env next, shell/exec last.
             exec::apply_connection_env(&mut channel, &connection.set_env).await?;
-            if connection.remote_command.is_empty() {
+            // X11 forwarding (OpenSSH -X parity): gated on the connection-scoped
+            // preference; a refused request only disables X11, never the shell.
+            if crate::x11::enabled_from(&self.data_dir) {
+                match crate::x11::arm_session() {
+                    Ok(cookie_hex) => {
+                        if let Err(error) = channel
+                            .request_x11(true, false, crate::x11::X11_AUTH_PROTOCOL, cookie_hex, 0)
+                            .await
+                        {
+                            eprintln!("[x11] x11-req refused by server: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("[x11] cannot arm the forwarding gate: {error}"),
+                }
+            }
+            if let Some(command) = spawn_exec.as_deref() {
+                // WT-4 (command session): exec `sh -c '<escaped command>'`
+                // instead of a shell — see docs/PROTOCOL.zh-CN.md「同
+                // transport 命令会话」. Explicit per-open request wins over
+                // the connection-level remote_command.
+                channel
+                    .exec(true, command.as_bytes())
+                    .await
+                    .map_err(|error| format!("Failed to start remote command: {error}"))?;
+            } else if connection.remote_command.is_empty() {
                 channel
                     .request_shell(true)
                     .await
@@ -1916,19 +2094,75 @@ impl SshRuntime {
             });
         }
 
+        // Startup commands (Tabby "Login scripts" parity, M7 P0-4): after the
+        // shell is up, type the connection's pre-configured command sequence
+        // through the same input channel the keepalive uses. Only for real
+        // shell sessions — a RemoteCommand or WT-4 spawn exec replaces the
+        // shell, so typing into it is a semantic conflict (documented in
+        // PROTOCOL.zh-CN.md). The event reports only the count and completion:
+        // command contents can carry secrets and never reach logs or events.
+        if spawn_exec.is_none() && startup_commands::executes_for(&connection.remote_command) {
+            let plan = startup_commands::load_plan(&self.data_dir, &connection.id);
+            if !plan.is_empty() {
+                let terminal_tx = entry.terminal_tx.clone();
+                let startup_emitter = emitter.clone();
+                let startup_session_id = session_id.clone();
+                let startup_count = plan.len();
+                tokio::spawn(async move {
+                    let completed = startup_commands::inject_sequence(&plan, |payload| {
+                        let terminal_tx = terminal_tx.clone();
+                        async move {
+                            terminal_tx
+                                .send(TerminalCommand::Input(payload))
+                                .await
+                                .is_ok()
+                        }
+                    })
+                    .await;
+                    let _ = startup_emitter.event(
+                        "ssh/startup",
+                        json!({
+                            "sessionId": startup_session_id,
+                            "count": startup_count,
+                            "completed": completed,
+                        }),
+                    );
+                });
+            }
+        }
+
         let task_id = session_id.clone();
         let directory_marker_id = session_id.clone();
         let sessions = self.sessions.clone();
+        // Auto-record 提示事件在 spawn 之后仍要用 emitter（主闭包已 move 走
+        // 原值），提前留一个克隆；录制器槽同理（entry 已 move 进读循环任务）。
+        let auto_record_emitter = emitter.clone();
+        let auto_record_slot = Arc::clone(&entry.session_recorder);
+        let auto_record_connection_id = entry.connection_id.clone();
         tokio::spawn(async move {
             let mut directory_filter = DirectoryHandshakeFilter::default();
             let mut directory_tracking_enabled = false;
+            // #90：ZMODEM 触发检测（远端 sz 发起的 ZRQINIT）。状态随会话存续，
+            // 抑制窗口超时后自动回到透传（详见 zmodem_detect 模块注释）。
+            let mut zmodem_detector = crate::zmodem_detect::Detector::new();
             let mut directory_timeout = tokio::time::interval(Duration::from_millis(250));
             directory_timeout.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = directory_timeout.tick() => {
                         if let Some(data) = directory_filter.flush_if_timed_out() {
-                            publish_terminal(&task_id, TerminalStream::Stdout, data, &replay, &emitter).await;
+                            // 与主数据路径同一检测器：标记握手窗口里冲刷的
+                            // 字节同样不能绕过 ZMODEM 触发检测（#90）。
+                            let outcome = zmodem_detector.feed(&data, unix_now_ms());
+                            if outcome.detected {
+                                let _ = emitter.event(
+                                    "ssh/zmodem",
+                                    json!({ "sessionId": task_id, "kind": "zrqinit" }),
+                                );
+                            }
+                            if !outcome.clean.is_empty() {
+                                publish_terminal(&task_id, TerminalStream::Stdout, outcome.clean, &replay, &emitter).await;
+                            }
                         }
                         if directory_filter.take_failed() {
                             directory_tracking_enabled = false;
@@ -2121,17 +2355,41 @@ impl SshRuntime {
                             }
                         }
                         let Some(data) = directory_filter.filter(&data) else { continue; };
-                        // Session recording capture: everything the terminal
-                        // shows (stdout + stderr, post-filter) lands in the
-                        // cast file when a recording is active.
-                        if stream != TerminalStream::State {
-                            if let Ok(mut slot) = entry.session_recorder.lock() {
-                                if let Some(recorder) = slot.as_mut() {
-                                    recorder.observe(&data);
+                        // #90 ZMODEM 触发检测：远端 `sz` 用 ZRQINIT 开启下载会
+                        // 话，本插件不实现 ZMODEM 接收——帧若照发，前端 sentry
+                        // 只会静默 deny（issue #90 的"没有任何反馈"），拦截后
+                        // 改发 ssh/zmodem 事件由前端给出可见提示。检测器只吃
+                        // Stdout（sz 的协议帧走 stdout；stderr 原样直通），且
+                        // 必须在录制/发布之前：终端展示与录制文件都不该混入
+                        // 协议乱码。ZRINIT（rz 上传）不触发，前端上传流程不受
+                        // 影响；抑制窗口超时后自动复位。
+                        let mut zmodem_detected = false;
+                        let data = if stream == TerminalStream::Stdout {
+                            let outcome = zmodem_detector.feed(&data, unix_now_ms());
+                            zmodem_detected = outcome.detected;
+                            outcome.clean
+                        } else {
+                            data
+                        };
+                        if zmodem_detected {
+                            let _ = emitter.event(
+                                "ssh/zmodem",
+                                json!({ "sessionId": task_id, "kind": "zrqinit" }),
+                            );
+                        }
+                        if !data.is_empty() {
+                            // Session recording capture: everything the terminal
+                            // shows (stdout + stderr, post-filter) lands in the
+                            // cast file when a recording is active.
+                            if stream != TerminalStream::State {
+                                if let Ok(mut slot) = entry.session_recorder.lock() {
+                                    if let Some(recorder) = slot.as_mut() {
+                                        recorder.observe(&data);
+                                    }
                                 }
                             }
+                            publish_terminal(&task_id, stream, data, &replay, &emitter).await;
                         }
-                        publish_terminal(&task_id, stream, data, &replay, &emitter).await;
                         if directory_filter.take_failed() {
                             directory_tracking_enabled = false;
                             publish_terminal(
@@ -2176,6 +2434,50 @@ impl SshRuntime {
                 removed.transport_lease.release().await;
             }
         });
+
+        // Auto-record（M14）：偏好开启时对每个新会话自动挂录制器。只读连接
+        // 不禁用（录制是被动输出捕获）；已有录制进行中则跳过——两种情形都
+        // 经 `ssh/recording/auto` 事件提示一次，负载只带 id 不带内容。
+        let emitter = auto_record_emitter;
+        if session_recording::auto_record_enabled() {
+            let mut slot = auto_record_slot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if slot.is_some() {
+                let _ = emitter.event(
+                    "ssh/recording/auto",
+                    json!({
+                        "sessionId": session_id,
+                        "skipped": true,
+                    }),
+                );
+            } else {
+                let recording_id = Uuid::new_v4().to_string();
+                match session_recording::SessionRecorder::start(
+                    &self.data_dir,
+                    &recording_id,
+                    &auto_record_connection_id,
+                    &connection.host,
+                    &session_id,
+                    80,
+                    24,
+                ) {
+                    Ok(recorder) => {
+                        *slot = Some(recorder);
+                        let _ = emitter.event(
+                            "ssh/recording/auto",
+                            json!({
+                                "sessionId": session_id,
+                                "recordingId": recording_id,
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("[ssh-trace] auto-record start failed: {error}");
+                    }
+                }
+            }
+        }
 
         Ok(json!({
             "sessionId": session_id,
@@ -2397,6 +2699,10 @@ impl SshRuntime {
         // remote forwards registered later on this connection insert into the
         // same Arc, and the table dies with the connection's last session.
         let remote_forwards = self.remote_table_for(&connection.id);
+        // Auto 回退编排也要逐方式发日志事件：emitter 主体随 handler 移走，
+        // 这里先留一份克隆给认证分派用（Option<PluginEmitter>，headless 为
+        // None 时事件自然省略）。
+        let auth_emitter = emitter.clone();
         let handler = SshClient {
             verifier,
             prompts: self.prompts.clone(),
@@ -2554,6 +2860,18 @@ impl SshRuntime {
                         return Err("No SSH Agent identity was accepted".to_string());
                     }
                 }
+            }
+            AuthenticationMethod::Auto => {
+                authenticate_auto(
+                    &mut session,
+                    connection,
+                    &orchestration,
+                    &none,
+                    &self.prompts,
+                    auth_emitter.as_ref(),
+                    operation_id,
+                )
+                .await?;
             }
             AuthenticationMethod::None => unreachable!(),
         }
@@ -2788,6 +3106,28 @@ impl SshRuntime {
         // Teardown runs while the session is still registered so remote
         // listener cancellation can ride the (still open) SSH handle.
         self.stop_session_forwards(session_id).await;
+        // sudo 下载远端临时件的会话级清理（finally 语义）：趁 SSH handle 还
+        // 活着 best-effort 删除；失败只落提示——本地 .part 由
+        // cleanup_session_transfers 删除，远端残留只能等下次同路径暂存或
+        // 管理员清理（mktemp 名字带前缀，不会顶替任何现有文件）。
+        let staged_tmps: Vec<(String, String)> = match self.downloads.lock() {
+            Ok(downloads) => downloads
+                .iter()
+                .filter(|(_, download)| download.session_id == session_id)
+                .filter_map(|(_, download)| {
+                    download
+                        .sudo_tmp
+                        .clone()
+                        .map(|tmp| (download.session_id.clone(), tmp))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for (owner_session, tmp) in staged_tmps {
+            if let Err(error) = sudo_download::discard_tmp(self, &owner_session, &tmp).await {
+                eprintln!("[sudo-download] session-close temp cleanup failed ({tmp}): {error}");
+            }
+        }
         let session = self
             .sessions
             .write()
@@ -2799,6 +3139,13 @@ impl SshRuntime {
         self.cleanup_session_transfers(session_id)?;
         if let Ok(mut cache) = self.metrics_cache.lock() {
             cache.remove(session_id);
+        }
+        // X11 gate lifecycle: the armed gate is the sidecar-wide slot (see
+        // x11::ACTIVE_GATE) serving the most recently armed session. With
+        // the last session gone no admission can be legitimate, so release
+        // the cookie and fail closed until a session arms again.
+        if self.sessions.read().await.is_empty() {
+            crate::x11::disarm_active();
         }
         let connection_id = session.connection_id.clone();
         let connection_has_sessions = self
@@ -3154,6 +3501,19 @@ impl SshRuntime {
         &self,
         session_id: &str,
     ) -> Result<Arc<AsyncMutex<SftpSession>>, String> {
+        self.sftp_with_compat(session_id)
+            .await
+            .map_err(|error| self.compat_hint(session_id, error))
+    }
+
+    /// SFTP 会话建立。老旧服务器兼容模式（M14-B，偏好 `sftp_compat_mode`）
+    /// 生效时：请求/响应不做流水线并发（读写各 1 路），并避免依赖服务器端
+    /// 扩展协商的路径。偏好改动对尚未建立的 SFTP 会话即时生效；已缓存的
+    /// 会话复用旧配置（重连后按新值建立）。
+    async fn sftp_with_compat(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<AsyncMutex<SftpSession>>, String> {
         let session = self.session(session_id).await?;
         let mut current = session.sftp.lock().await;
         if let Some(sftp) = current.as_ref() {
@@ -3168,13 +3528,43 @@ impl SshRuntime {
             .request_subsystem(true, "sftp")
             .await
             .map_err(|error| format!("Failed to start SFTP: {error}"))?;
-        let sftp = Arc::new(AsyncMutex::new(
+        let compat = crate::preferences::sftp_compat_mode(&self.data_dir);
+        let sftp = Arc::new(AsyncMutex::new(if compat {
+            SftpSession::new_with_config(
+                channel.into_stream(),
+                SftpConfig {
+                    max_concurrent_reads: 1,
+                    max_concurrent_writes: 1,
+                    ..SftpConfig::default()
+                },
+            )
+            .await
+            .map_err(sftp_error)?
+        } else {
             SftpSession::new(channel.into_stream())
                 .await
-                .map_err(sftp_error)?,
-        ));
+                .map_err(sftp_error)?
+        }));
         *current = Some(sftp.clone());
-        Ok(sftp)
+        Ok(sftp.clone())
+    }
+
+    /// 探测/建立失败的一次性兼容建议（M14-B）：每个会话只提示一次，避免
+    /// 重复打扰；连接老旧 OpenSSH/嵌入式 sftp-server 的用户可按提示到
+    /// 设置 → 传输里打开兼容模式。
+    fn compat_hint(&self, session_id: &str, error: String) -> String {
+        let fresh = self
+            .compat_hinted
+            .lock()
+            .map(|mut hinted| hinted.insert(session_id.to_string()))
+            .unwrap_or(false);
+        if fresh {
+            format!(
+                "{error} (hint: if this server is legacy, enable legacy server compatibility in Settings → Transfer)"
+            )
+        } else {
+            error
+        }
     }
 
     pub async fn sftp_home(&self, session_id: &str) -> Result<String, String> {
@@ -3186,6 +3576,17 @@ impl SshRuntime {
             .await
             .map_err(sftp_error)?;
         Ok(home)
+    }
+
+    /// sessionId → connectionId（M16 连接级 SFTP 文件名编码判定用）：只查
+    /// 会话注册表，未知/已摘除的会话返回 None，由调用方按「未覆盖（跟随
+    /// 全局）」兜底——编码判定绝不因会话状态未知而失败。
+    pub async fn connection_id_for_session(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.connection_id.clone())
     }
 
     pub async fn session_id_for_connection(&self, connection_id: &str) -> Result<String, String> {
@@ -3946,21 +4347,66 @@ impl SshRuntime {
         }
     }
 
+    /// `sftp/list`：目录列表。编码偏好为 latin-1（M14-B）时改走裸包客户端
+    /// 拿原始文件名字节（russh-sftp 的反序列化层对文件名做 lossy UTF-8 解码，
+    /// 原始字节只能由 raw 路径取得），显示名按 latin-1 解码、传输路径用
+    /// `%XX` 转义形式；raw 不可用时回退高层客户端。auto 模式保持原路径
+    /// （字节往返无损），仅按 wire 名是否含 U+FFFD 标记 `lossy`。
     pub async fn sftp_list_path(
+        &self,
+        session_id: &str,
+        path: &str,
+        include_owner: bool,
+        encoding: NameEncoding,
+    ) -> Result<Vec<SftpEntry>, String> {
+        let path = normalize_remote_path(path)?;
+        let mut result = if encoding == NameEncoding::Latin1 {
+            match self.raw_list_entries(session_id, &path, encoding).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] raw byte listing unavailable, falling back: {error}"
+                    );
+                    self.crate_list_entries(session_id, &path, include_owner)
+                        .await?
+                }
+            }
+        } else {
+            self.crate_list_entries(session_id, &path, include_owner)
+                .await?
+        };
+        if include_owner {
+            // One extra read-only round trip upgrades numeric ids to names on
+            // SFTPv3 servers (OpenSSH): `ls -l` puts owner/group in fields 3/4.
+            // Any failure (no shell, no `ls`, timeout) keeps the numeric or
+            // absent values, never the listing itself.
+            enrich_owner_names(self, session_id, &path, &mut result).await;
+        }
+        result.sort_by(|left, right| {
+            let left_dir = left.kind == "directory";
+            let right_dir = right.kind == "directory";
+            right_dir
+                .cmp(&left_dir)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        Ok(result)
+    }
+
+    /// 高层客户端（russh-sftp）路径：合法 UTF-8 服务器下字节往返无损。
+    async fn crate_list_entries(
         &self,
         session_id: &str,
         path: &str,
         include_owner: bool,
     ) -> Result<Vec<SftpEntry>, String> {
         let sftp = self.sftp(session_id).await?;
-        let path = normalize_remote_path(path)?;
         let entries = sftp
             .lock()
             .await
-            .read_dir(path.clone())
+            .read_dir(path.to_string())
             .await
             .map_err(sftp_error)?;
-        let mut result = entries
+        Ok(entries
             .map(|entry| {
                 let metadata = entry.metadata();
                 let kind = classify_entry_kind(entry.file_type());
@@ -3979,8 +4425,10 @@ impl SshRuntime {
                 } else {
                     (None, None)
                 };
+                let name = entry.file_name();
                 SftpEntry {
-                    name: entry.file_name(),
+                    lossy: sftp_name::is_lossy_wire(&name),
+                    name,
                     uri: sftp_uri(&entry.path()),
                     kind,
                     size: metadata.size,
@@ -3991,22 +4439,77 @@ impl SshRuntime {
                     group,
                 }
             })
-            .collect::<Vec<_>>();
-        if include_owner {
-            // One extra read-only round trip upgrades numeric ids to names on
-            // SFTPv3 servers (OpenSSH): `ls -l` puts owner/group in fields 3/4.
-            // Any failure (no shell, no `ls`, timeout) keeps the numeric or
-            // absent values, never the listing itself.
-            enrich_owner_names(self, session_id, &path, &mut result).await;
+            .collect())
+    }
+
+    /// latin-1 路径：裸包客户端取原始字节。显示名 = latin-1 解码（忠实）；
+    /// 传输名 = `%XX` 转义的 wire 形式（合法 UTF-8 字节按字符透传，与高层
+    /// 路径完全一致）。属主增强不做（exec 通道对转义名不可靠），保持空值。
+    async fn raw_list_entries(
+        &self,
+        session_id: &str,
+        path: &str,
+        encoding: NameEncoding,
+    ) -> Result<Vec<SftpEntry>, String> {
+        let mut client = self.raw_sftp_client(session_id).await?;
+        let raw_entries = client.readdir(path.as_bytes()).await?;
+        Ok(raw_entries
+            .into_iter()
+            .filter(|entry| entry.name.as_slice() != b"." && entry.name.as_slice() != b"..")
+            .map(|entry| {
+                let display = sftp_name::decode_display_name(&entry.name, encoding);
+                let wire_name = sftp_name::escape_wire(&entry.name);
+                let wire_path = sftp_name::join_wire_name(path, &wire_name);
+                SftpEntry {
+                    lossy: display.lossy,
+                    name: display.text,
+                    uri: sftp_uri(&wire_path),
+                    kind: classify_raw_kind(entry.attrs.permissions),
+                    size: entry.attrs.size,
+                    modified_at: entry.attrs.mtime.map(u64::from),
+                    permissions: entry.attrs.permissions.map(format_permissions),
+                    content_type: content_type_for_path(&wire_path),
+                    owner: None,
+                    group: None,
+                }
+            })
+            .collect())
+    }
+
+    /// 打开一条独立 sftp 子系统通道并跑裸包客户端（严格串行请求/响应）。
+    pub(crate) async fn raw_sftp_client(&self, session_id: &str) -> Result<RawSftpClient, String> {
+        let session = self.session(session_id).await?;
+        let channel = session
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|error| format!("Failed to open SFTP channel: {error}"))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|error| format!("Failed to start SFTP: {error}"))?;
+        sftp_raw::RawSftp::init(channel.into_stream()).await
+    }
+
+    /// 裸包读一个下载分片（转义路径专用）：wire 路径先在字符串域归一
+    /// （绝对化 + 去 `.`/`..`/空段，与 auto 车道的 normalize_remote_path 同一
+    /// 口径——M24-R3 拉齐；`%2E%2E` 这类转义名还原出字面 `..` 的场景不受
+    /// 影响，归一只作用于还原前的 wire 字符串组件），再还原为服务器原始
+    /// 字节交给 SFTP READ。requested=0 直接回空（EOF 语义）。
+    pub(crate) async fn raw_read_chunk(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+        offset: u64,
+        requested: u32,
+    ) -> Result<Vec<u8>, String> {
+        if requested == 0 {
+            return Ok(Vec::new());
         }
-        result.sort_by(|left, right| {
-            let left_dir = left.kind == "directory";
-            let right_dir = right.kind == "directory";
-            right_dir
-                .cmp(&left_dir)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        });
-        Ok(result)
+        let normalized = normalize_remote_path(remote_path)?;
+        let raw_path = sftp_name::unescape_wire(&normalized);
+        let mut client = self.raw_sftp_client(session_id).await?;
+        client.read_chunk(&raw_path, offset, requested).await
     }
 
     pub async fn sftp_read_path(
@@ -4037,15 +4540,33 @@ impl SshRuntime {
         Ok((data, truncated))
     }
 
-    pub async fn sftp_create_directory(&self, session_id: &str, path: &str) -> Result<(), String> {
+    pub async fn sftp_create_directory(
+        &self,
+        session_id: &str,
+        path: &str,
+        encoding: NameEncoding,
+    ) -> Result<(), String> {
         self.ensure_writable(session_id).await?;
+        let path = normalize_remote_path(path)?;
+        if encoding == NameEncoding::Latin1 {
+            // latin-1：目录前缀是列表回传的 wire 形式、最后一段是用户新输入
+            // 的显示文本，write_path_bytes 组装出服务器字节后走裸包 MKDIR。
+            // 客户端建立失败（尚未发出任何请求）回退高层路径；操作本身的
+            // 错误原样上抛——写操作失败后回退可能重复执行，不做。
+            match self.raw_sftp_client(session_id).await {
+                Ok(mut client) => {
+                    let raw_path = sftp_name::write_path_bytes(&path);
+                    return client.mkdir(&raw_path).await;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] raw byte mkdir unavailable, falling back: {error}"
+                    );
+                }
+            }
+        }
         let sftp = self.sftp(session_id).await?;
-        let result = sftp
-            .lock()
-            .await
-            .create_dir(normalize_remote_path(path)?)
-            .await
-            .map_err(sftp_error);
+        let result = sftp.lock().await.create_dir(path).await.map_err(sftp_error);
         result
     }
 
@@ -4098,16 +4619,33 @@ impl SshRuntime {
         session_id: &str,
         source: &str,
         target: &str,
+        encoding: NameEncoding,
     ) -> Result<(), String> {
         self.ensure_writable(session_id).await?;
+        let source = normalize_remote_path(source)?;
+        let target = normalize_remote_path(target)?;
+        if encoding == NameEncoding::Latin1 {
+            // latin-1：源是列表回传的 wire 路径（整条还原为原始字节）；目标
+            // 最后一段是用户新输入的显示文本（write_path_bytes 按 latin-1 编
+            // 码回字节）。裸包 RENAME 保证改名不破坏非 UTF-8 字节。
+            match self.raw_sftp_client(session_id).await {
+                Ok(mut client) => {
+                    let raw_source = sftp_name::unescape_wire(&source);
+                    let raw_target = sftp_name::write_path_bytes(&target);
+                    return client.rename(&raw_source, &raw_target).await;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] raw byte rename unavailable, falling back: {error}"
+                    );
+                }
+            }
+        }
         let sftp = self.sftp(session_id).await?;
         let result = sftp
             .lock()
             .await
-            .rename(
-                normalize_remote_path(source)?,
-                normalize_remote_path(target)?,
-            )
+            .rename(source, target)
             .await
             .map_err(sftp_error);
         result
@@ -4118,10 +4656,27 @@ impl SshRuntime {
         session_id: &str,
         path: &str,
         recursive: bool,
+        encoding: NameEncoding,
     ) -> Result<(), String> {
         self.ensure_writable(session_id).await?;
-        let sftp = self.sftp(session_id).await?;
         let path = normalize_remote_path(path)?;
+        if encoding == NameEncoding::Latin1 {
+            // latin-1：wire 路径整条还原为原始字节后走裸包删除（LSTAT 判型
+            // → REMOVE/RMDIR/递归树删，symlink 绝不跟随）。回退策略与
+            // mkdir/rename 相同：仅客户端建立失败时回退高层路径。
+            match self.raw_sftp_client(session_id).await {
+                Ok(mut client) => {
+                    let raw_path = sftp_name::unescape_wire(&path);
+                    return raw_delete_path(&mut client, &raw_path, recursive).await;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] raw byte delete unavailable, falling back: {error}"
+                    );
+                }
+            }
+        }
+        let sftp = self.sftp(session_id).await?;
         let metadata = sftp
             .lock()
             .await
@@ -4149,18 +4704,47 @@ impl SshRuntime {
     }
 
     /// Changes the permission bits of a remote path (`sftp/chmod`).
-    pub async fn sftp_chmod(&self, session_id: &str, path: &str, mode: u32) -> Result<(), String> {
+    ///
+    /// 路径来源（M17 增量③迁移）：前端传来的整条 wire 路径（`pathFromUri`），
+    /// latin-1 模式整条按 [`sftp_name::unescape_wire`] 还原后走裸包 SETSTAT
+    /// （此前高层客户端按字面量发送，转义名探不到）；裸包客户端**建立**失败
+    /// 回退高层路径（M15 先例），SETSTAT 已发出后的失败原样上抛，不回退
+    /// （写操作不重复执行）。
+    pub async fn sftp_chmod(
+        &self,
+        session_id: &str,
+        path: &str,
+        mode: u32,
+        encoding: NameEncoding,
+    ) -> Result<(), String> {
         self.ensure_writable(session_id).await?;
+        let path = normalize_remote_path(path)?;
+        if encoding == NameEncoding::Latin1 {
+            match self.raw_sftp_client(session_id).await {
+                Ok(mut client) => {
+                    return client
+                        .setstat(
+                            &sftp_name::unescape_wire(&path),
+                            &sftp_raw::RawAttrs {
+                                permissions: Some(mode),
+                                ..sftp_raw::RawAttrs::default()
+                            },
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] raw byte chmod unavailable, falling back: {error}"
+                    );
+                }
+            }
+        }
         let sftp = self.sftp(session_id).await?;
         let metadata = russh_sftp::protocol::FileAttributes {
             permissions: Some(mode),
             ..Default::default()
         };
-        let result = sftp
-            .lock()
-            .await
-            .set_metadata(normalize_remote_path(path)?, metadata)
-            .await;
+        let result = sftp.lock().await.set_metadata(path, metadata).await;
         result.map_err(sftp_error)
     }
 
@@ -4851,8 +5435,11 @@ impl SshRuntime {
                 "Transfers are limited to {MAX_TRANSFER_SIZE} bytes"
             ));
         }
-        if self.active_transfer_count(&session_id)? >= 3 {
-            return Err("This SSH session already has three active transfers".to_string());
+        if self.active_transfer_count(&session_id)? as u64 >= self.transfer_depth_limit() {
+            return Err(format!(
+                "This SSH session already has {} active transfers",
+                self.transfer_depth_limit()
+            ));
         }
         let remote_path = normalize_remote_path(&remote_path)?;
         // Resume path: re-register a previously interrupted upload job. The
@@ -4998,6 +5585,17 @@ impl SshRuntime {
         Ok((spool, spool_len))
     }
 
+    /// taskId → 所属 sessionId（连接级 SFTP 编码判定用，M16 集成）。
+    /// 任务不存在返回 None，调用方按未覆盖（跟随全局）处理。
+    pub fn upload_session_id(&self, task_id: &str) -> Option<String> {
+        self.uploads
+            .lock()
+            .map_err(|_| "Upload registry is poisoned".to_string())
+            .ok()?
+            .get(task_id)
+            .map(|upload| upload.session_id.clone())
+    }
+
     /// `sftp/transfer/resumable`: interrupted uploads (spool + meta still on
     /// disk, job no longer live) the workbench can offer to resume. Pure
     /// scan over local state, so it answers without any active connection.
@@ -5085,6 +5683,7 @@ impl SshRuntime {
     pub async fn finish_upload(
         self: &Arc<Self>,
         task_id: &str,
+        encoding: NameEncoding,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         let upload = self
@@ -5138,6 +5737,51 @@ impl SshRuntime {
         let response_task_id = task_id.clone();
         tokio::spawn(async move {
             let result: Result<(), String> = async {
+                // latin-1（M16）：上传族的远端路径是「wire 目录前缀 + 用户新
+                // 输入的显示末段」，write_path_bytes 还原为服务器字节后走裸包
+                // 暂存 + 原子提交。裸包客户端**建立**失败回退高层路径（此时
+                // 远端尚无任何动作）；操作发出后的失败原样上抛，不回退。
+                if encoding == NameEncoding::Latin1 {
+                    match this.raw_sftp_client(&session_id).await {
+                        Ok(mut client) => {
+                            let progress = |bytes: u64| {
+                                transferred_bytes.store(bytes, Ordering::Release);
+                                emitter
+                                    .event(
+                                        "sftp/transfer/progress",
+                                        upload_progress_payload(
+                                            &task_id,
+                                            &session_id,
+                                            None,
+                                            bytes,
+                                            expected_size,
+                                            UploadPhase::Uploading,
+                                            "running",
+                                        ),
+                                    )
+                                    .map_err(plugin_error)
+                            };
+                            return sftp_ext::raw_push_upload_file(
+                                &mut client,
+                                &local_path,
+                                &remote_path,
+                                &task_id,
+                                TRANSFER_CHUNK_SIZE,
+                                sftp_ext::RawUploadContext {
+                                    cancelled: &cancelled,
+                                    cancel_reason: &cancel_reason,
+                                    progress: Box::new(progress),
+                                },
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[ssh-sftp-plugin] raw byte upload unavailable, falling back: {error}"
+                            );
+                        }
+                    }
+                }
                 let sftp = this.sftp(&session_id).await?;
                 let (temporary, backup) = remote_transfer_paths(&remote_path, &task_id)?;
                 let mut source = tokio::fs::File::open(&local_path)
@@ -5254,6 +5898,168 @@ impl SshRuntime {
         )
     }
 
+    /// Creates the optional local sink (staging `.part` file) shared by
+    /// `sftp/download/start` and `sudo/download/start`.
+    async fn build_download_sink(
+        &self,
+        task_id: &str,
+        download_dir: Option<&str>,
+        conflict: Option<&str>,
+    ) -> Result<Option<Arc<DownloadSink>>, String> {
+        let staging = self.transfer_dir.join("downloads");
+        std::fs::create_dir_all(&staging)
+            .map_err(|error| format!("Failed to create download staging directory: {error}"))?;
+        let part_path = staging.join(format!("download-{task_id}.part"));
+        let final_dir = download_dir
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir)
+            });
+        if !final_dir.is_absolute() {
+            return Err("Download directory must be an absolute path".to_string());
+        }
+        std::fs::create_dir_all(&final_dir).map_err(|error| {
+            format!(
+                "Failed to create download directory '{}': {error}",
+                final_dir.display()
+            )
+        })?;
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to create local download file '{}': {error}",
+                    part_path.display()
+                )
+            })?;
+        Ok(Some(Arc::new(DownloadSink {
+            part_path,
+            final_dir,
+            overwrite: matches!(conflict, Some("overwrite")),
+            file: AsyncMutex::new(file),
+        })))
+    }
+
+    /// `sudo/download/start`: root-owned files streamed through the regular
+    /// SFTP download pipeline (M14-C DownloadSudo). The source is staged into
+    /// a same-directory sudo temp file (`sudo_download::stage_source`) which
+    /// is registered as the task's read source; `sftp/download/next`,
+    /// `sftp/download/finish` and the progress events are reused unchanged.
+    /// The temp file is removed on finish, cancel, error and session close
+    /// (finally semantics; cleanup failures surface as a non-fatal warning).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_sudo_download(
+        &self,
+        session_id: &str,
+        path: &str,
+        save_to_local: bool,
+        download_dir: Option<&str>,
+        conflict: Option<&str>,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        if self.active_transfer_count(session_id)? >= 3 {
+            return Err("This SSH session already has three active transfers".to_string());
+        }
+        let staged = sudo_download::stage_source(self, session_id, path).await?;
+        let outcome = self
+            .start_sudo_download_staged(
+                session_id,
+                &staged,
+                save_to_local,
+                download_dir,
+                conflict,
+                emitter,
+            )
+            .await;
+        if outcome.is_err() {
+            // 注册失败也要把远端临时件收掉，不能等下载循环来清。
+            if let Err(error) = sudo_download::discard_tmp(self, session_id, &staged.tmp_path).await
+            {
+                eprintln!(
+                    "[sudo-download] staging temp cleanup failed ({}): {error}",
+                    staged.tmp_path
+                );
+            }
+        }
+        outcome
+    }
+
+    async fn start_sudo_download_staged(
+        &self,
+        session_id: &str,
+        staged: &sudo_download::StagedSource,
+        save_to_local: bool,
+        download_dir: Option<&str>,
+        conflict: Option<&str>,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        if staged.size > MAX_TRANSFER_SIZE {
+            return Err(format!(
+                "Transfers are limited to {MAX_TRANSFER_SIZE} bytes"
+            ));
+        }
+        // SFTP 提前探测：源目录对登录用户不可穿越（如 /root 0700）时，普通
+        // SFTP 读不到临时件——在这里给出明确错误，而不是第一块分块才失败。
+        let sftp = self.sftp(session_id).await?;
+        sftp.lock()
+            .await
+            .metadata(staged.tmp_path.clone())
+            .await
+            .map_err(sftp_error)?;
+        let task_id = Uuid::new_v4().to_string();
+        let sink = if save_to_local {
+            self.build_download_sink(&task_id, download_dir, conflict)
+                .await?
+        } else {
+            None
+        };
+        self.downloads
+            .lock()
+            .map_err(|_| "Download registry is poisoned".to_string())?
+            .insert(
+                task_id.clone(),
+                DownloadState {
+                    session_id: session_id.to_string(),
+                    remote_path: staged.tmp_path.clone(),
+                    file_name: staged.file_name.clone(),
+                    size: staged.size,
+                    next_offset: 0,
+                    sink,
+                    tree: None,
+                    sudo_tmp: Some(staged.tmp_path.clone()),
+                    // sudo 下载走独立车道（sudo_download.rs），读侧不经
+                    // has_wire_lane 判分支；字面 false 只做字段填充。
+                    latin1: false,
+                    // sudo 车道本期不在限速范围（issue #66 收敛在 SFTP
+                    // 下载），字段照常填充但快照取 0（不限速）。
+                    throttle: Throttle::new(0),
+                },
+            );
+        emitter
+            .event(
+                "sftp/transfer/progress",
+                json!({ "taskId": task_id, "sessionId": session_id, "direction": "download", "transferred": 0, "size": staged.size, "status": "queued" }),
+            )
+            .map_err(plugin_error)?;
+        let connection_id = self.session_connection_id(session_id).await;
+        self.record_transfer_start(
+            &task_id,
+            session_id,
+            &connection_id,
+            "download",
+            &staged.file_name,
+            staged.size,
+        );
+        Ok(
+            json!({ "taskId": task_id, "fileName": staged.file_name, "size": staged.size, "chunkSize": TRANSFER_CHUNK_SIZE, "resumeOffset": 0_u64, "saveToLocal": save_to_local, "sudo": true }),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn start_download(
         &self,
@@ -5263,26 +6069,51 @@ impl SshRuntime {
         save_to_local: bool,
         download_dir: Option<&str>,
         conflict: Option<&str>,
+        encoding: NameEncoding,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
         let remote_path = normalize_remote_path(remote_path)?;
-        if self.active_transfer_count(session_id)? >= 3 {
-            return Err("This SSH session already has three active transfers".to_string());
+        if self.active_transfer_count(session_id)? as u64 >= self.transfer_depth_limit() {
+            return Err(format!(
+                "This SSH session already has {} active transfers",
+                self.transfer_depth_limit()
+            ));
         }
         // Resume re-attaches with bytes the caller already holds locally, which
         // the staging file would be missing — only fresh downloads may sink.
         if save_to_local && offset > 0 {
             return Err("Local save downloads cannot resume from an offset".to_string());
         }
-        let sftp = self.sftp(session_id).await?;
-        let size = sftp
-            .lock()
-            .await
-            .metadata(remote_path.clone())
-            .await
-            .map_err(sftp_error)?
-            .size
-            .unwrap_or(0);
+        // latin-1 生效且 wire 含 `%XX` 转义（latin-1 列表产出的非 UTF-8
+        // 名字）时，走裸包 STAT 取真实字节数——高层客户端会把转义串按字
+        // 面量发出去，命中不了远端文件（M14-B：传输用服务器原始字节）。
+        // auto 一律走高层（M28-B 修 D-7）：auto 列表 uri 字面 `%` 未经
+        // `%25` 自转义，wire 串里的 `%XX` 是文件名字面量而非转义，不能
+        // 还原；车道判定统一收口在 `has_wire_lane`。
+        let latin1 = encoding == NameEncoding::Latin1;
+        let size = if sftp_name::has_wire_lane(&remote_path, encoding) {
+            let mut client = self.raw_sftp_client(session_id).await?;
+            // 整条 wire 还原为服务器字节再 LSTAT——探测点曾漏掉这一步（把
+            // 字面 "%XX" 字节当路径，转义名单文件下载 start 即 NO_SUCH_FILE；
+            // M21 smoke 的 latin-1 watcher 用例真机曝露）。
+            client
+                .stat(&sftp_name::unescape_wire(&remote_path))
+                .await
+                .map_err(sftp_error)?
+                .size
+                .unwrap_or(0)
+        } else {
+            let sftp = self.sftp(session_id).await?;
+            let size = sftp
+                .lock()
+                .await
+                .metadata(remote_path.clone())
+                .await
+                .map_err(sftp_error)?
+                .size
+                .unwrap_or(0);
+            size
+        };
         if size > MAX_TRANSFER_SIZE {
             return Err(format!(
                 "Transfers are limited to {MAX_TRANSFER_SIZE} bytes"
@@ -5304,47 +6135,14 @@ impl SshRuntime {
             .unwrap_or("download")
             .to_string();
         let task_id = Uuid::new_v4().to_string();
-        let sink = if save_to_local {
-            let staging = self.transfer_dir.join("downloads");
-            std::fs::create_dir_all(&staging)
-                .map_err(|error| format!("Failed to create download staging directory: {error}"))?;
-            let part_path = staging.join(format!("download-{task_id}.part"));
-            let final_dir = download_dir
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    local_downloads::downloads_base_dir(|key| std::env::var_os(key), &self.data_dir)
-                });
-            if !final_dir.is_absolute() {
-                return Err("Download directory must be an absolute path".to_string());
-            }
-            std::fs::create_dir_all(&final_dir).map_err(|error| {
-                format!(
-                    "Failed to create download directory '{}': {error}",
-                    final_dir.display()
-                )
-            })?;
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&part_path)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Failed to create local download file '{}': {error}",
-                        part_path.display()
-                    )
-                })?;
-            Some(Arc::new(DownloadSink {
-                part_path,
-                final_dir,
-                overwrite: matches!(conflict, Some("overwrite")),
-                file: AsyncMutex::new(file),
-            }))
-        } else {
-            None
-        };
+        let sink = self
+            .build_download_sink(&task_id, download_dir, conflict)
+            .await?;
+        // 限速快照（issue #66）：偏好现值只在任务启动时读一次，整个任务
+        // 沿用——设置改动对下一个下载任务生效，进行中任务节奏不抖动。
+        let throttle = Throttle::new(crate::preferences::transfer_download_limit_kib(
+            &self.data_dir,
+        ));
         self.downloads
             .lock()
             .map_err(|_| "Download registry is poisoned".to_string())?
@@ -5358,6 +6156,9 @@ impl SshRuntime {
                     next_offset: offset,
                     sink,
                     tree: None,
+                    sudo_tmp: None,
+                    latin1,
+                    throttle,
                 },
             );
         emitter
@@ -5393,28 +6194,17 @@ impl SshRuntime {
         session_id: &str,
         remote_path: &str,
         download_dir: Option<&str>,
+        encoding: NameEncoding,
         emitter: &PluginEmitter,
     ) -> Result<Value, String> {
-        if self.active_transfer_count(session_id)? >= 3 {
-            return Err("This SSH session already has three active transfers".to_string());
+        if self.active_transfer_count(session_id)? as u64 >= self.transfer_depth_limit() {
+            return Err(format!(
+                "This SSH session already has {} active transfers",
+                self.transfer_depth_limit()
+            ));
         }
         let root_remote = normalize_remote_path(remote_path)?;
         let sftp = self.sftp(session_id).await?;
-        let metadata = sftp
-            .lock()
-            .await
-            .symlink_metadata(root_remote.clone())
-            .await
-            .map_err(sftp_error)?;
-        if metadata.is_symlink() {
-            return Err(
-                "Refusing to download a symlink as a folder; download its target instead"
-                    .to_string(),
-            );
-        }
-        if !metadata.is_dir() {
-            return Err("Folder download needs a remote directory".to_string());
-        }
         // 本地根目录：与单文件下载共用目录语义（偏好下载目录 / 自定义绝对
         // 目录），根名撞车让位 " (n)"。落点在 start 时定死，任务取消或未完成
         // 时整树删除，所以提前占名不会留下悬空目录。
@@ -5434,19 +6224,48 @@ impl SshRuntime {
                 base_dir.display()
             )
         })?;
-        let root_name = root_remote
-            .rsplit('/')
-            .next()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("download");
-        let root_local = local_downloads::final_download_path(&base_dir, root_name, false);
+        // latin-1：本地根名用原始字节的 latin-1 解码显示名（wire 转义名按
+        // 字面量落盘会变成 "%E9" 这类乱名）；auto 维持 wire 字符串。
+        let root_raw = sftp_name::unescape_wire(&root_remote);
+        let root_name = if encoding == NameEncoding::Latin1 {
+            root_raw
+                .split(|&byte| byte == b'/')
+                .rev()
+                .find(|part| !part.is_empty())
+                .map(|part| sftp_name::decode_display_name(part, encoding).text)
+                .unwrap_or_else(|| "download".to_string())
+        } else {
+            root_remote
+                .rsplit('/')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("download")
+                .to_string()
+        };
+        let root_local = local_downloads::final_download_path(&base_dir, &root_name, false);
         std::fs::create_dir_all(&root_local).map_err(|error| {
             format!(
                 "Failed to create download folder '{}': {error}",
                 root_local.display()
             )
         })?;
-        let scan = match scan_remote_tree(&sftp, &root_remote).await {
+        // latin-1：远端遍历走裸包 READDIR（同一通道 LSTAT 预检 + 递归），
+        // 整树路径字节保真；裸包通道建立失败回退高层遍历（只读，安全）。
+        // auto 维持高层客户端（合法 UTF-8 服务器字节往返无损）。
+        let scan = if encoding == NameEncoding::Latin1 {
+            match self.raw_sftp_client(session_id).await {
+                Ok(mut client) => scan_tree_with_raw(&mut client, &root_remote).await,
+                Err(error) => {
+                    eprintln!(
+                        "[ssh-sftp-plugin] raw byte tree scan unavailable, falling back: {error}"
+                    );
+                    scan_remote_tree(&sftp, &root_remote).await
+                }
+            }
+        } else {
+            scan_remote_tree(&sftp, &root_remote).await
+        };
+        let scan = match scan {
             Ok(scan) => scan,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&root_local);
@@ -5475,6 +6294,11 @@ impl SshRuntime {
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| root_name.to_string());
         let task_id = Uuid::new_v4().to_string();
+        // 限速快照（issue #66）：树下载与单文件同口径——偏好现值只在启动
+        // 时读一次，逐文件分块循环共用同一限速器。
+        let throttle = Throttle::new(crate::preferences::transfer_download_limit_kib(
+            &self.data_dir,
+        ));
         self.downloads
             .lock()
             .map_err(|_| "Download registry is poisoned".to_string())?
@@ -5497,7 +6321,12 @@ impl SshRuntime {
                         files_done: 0,
                         skipped,
                         failures: scan.failures,
+                        latin1: encoding == NameEncoding::Latin1,
                     }),
+                    sudo_tmp: None,
+                    // 树任务的逐文件读取按 TreeDownloadState.latin1 判分支。
+                    latin1: false,
+                    throttle,
                 },
             );
         emitter
@@ -5592,32 +6421,62 @@ impl SshRuntime {
                 finalize_tree_current(self, &mut tree).await;
                 continue;
             }
-            let mut source = match sftp.lock().await.open(file.remote_path.clone()).await {
-                Ok(source) => source,
-                Err(error) => {
-                    tree.failures
-                        .push(json!({ "path": file.relative, "error": sftp_error(error) }));
-                    discard_tree_current(&mut tree);
-                    continue;
-                }
-            };
-            if let Err(error) = source
-                .seek(std::io::SeekFrom::Start(tree.current_offset))
-                .await
-            {
-                tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download seek failed: {error}") }));
-                discard_tree_current(&mut tree);
-                continue;
-            }
             let requested = remaining.min(TRANSFER_CHUNK_SIZE as u64) as usize;
-            let mut chunk = vec![0_u8; requested];
-            let length = match source.read(&mut chunk).await {
-                Ok(length) => length,
-                Err(error) => {
-                    tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download failed: {error}") }));
+            // 限速节奏（issue #66）：树下载逐文件分块循环与单文件同口径——
+            // 块耗时从读开始计量，读毕由 limiter 补足差额；缺省 0 零开销。
+            let chunk_started = download.throttle.enabled().then(std::time::Instant::now);
+            let (mut chunk, length) = if tree.latin1 {
+                // latin-1：远端路径是 wire 形式（raw 扫描），高层 open 按
+                // UTF-8 找不到字节名文件——走裸包 READ（download 分片的
+                // raw_read_chunk 同款：整条 unescape 后裸包 OPEN/READ）。
+                match self
+                    .raw_read_chunk(
+                        &download.session_id,
+                        &file.remote_path,
+                        tree.current_offset,
+                        requested as u32,
+                    )
+                    .await
+                {
+                    Ok(data) => {
+                        let length = data.len();
+                        (data, length)
+                    }
+                    Err(error) => {
+                        tree.failures
+                            .push(json!({ "path": file.relative, "error": error }));
+                        discard_tree_current(&mut tree);
+                        continue;
+                    }
+                }
+            } else {
+                let mut source = match sftp.lock().await.open(file.remote_path.clone()).await {
+                    Ok(source) => source,
+                    Err(error) => {
+                        tree.failures
+                            .push(json!({ "path": file.relative, "error": sftp_error(error) }));
+                        discard_tree_current(&mut tree);
+                        continue;
+                    }
+                };
+                if let Err(error) = source
+                    .seek(std::io::SeekFrom::Start(tree.current_offset))
+                    .await
+                {
+                    tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download seek failed: {error}") }));
                     discard_tree_current(&mut tree);
                     continue;
                 }
+                let mut chunk = vec![0_u8; requested];
+                let length = match source.read(&mut chunk).await {
+                    Ok(length) => length,
+                    Err(error) => {
+                        tree.failures.push(json!({ "path": file.relative, "error": format!("SFTP download failed: {error}") }));
+                        discard_tree_current(&mut tree);
+                        continue;
+                    }
+                };
+                (chunk, length)
             };
             if length == 0 {
                 // 远端文件比扫描时短：只记失败，不把半成品留在本地。
@@ -5628,6 +6487,12 @@ impl SshRuntime {
                 continue;
             }
             chunk.truncate(length);
+            // 限速等待读毕即执行（本地写之前），与单文件路径同口径。
+            if download.throttle.enabled() {
+                if let Some(started) = chunk_started {
+                    download.throttle.pace(length, started.elapsed()).await;
+                }
+            }
             // 克隆 Arc 而非借用，写失败的清理路径需要 &mut tree。
             if let Some(sink) = tree.sink.clone() {
                 if let Err(error) = sink.file.lock().await.write_all(&chunk).await {
@@ -5710,25 +6575,52 @@ impl SshRuntime {
                 download.next_offset
             ));
         }
-        let sftp = self.sftp(&download.session_id).await?;
-        let mut source = sftp
-            .lock()
-            .await
-            .open(download.remote_path.clone())
-            .await
-            .map_err(sftp_error)?;
-        source
-            .seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|error| format!("SFTP download seek failed: {error}"))?;
         let remaining = download.size.saturating_sub(offset);
         let requested = remaining.min(TRANSFER_CHUNK_SIZE as u64) as usize;
-        let mut chunk = vec![0_u8; requested];
-        let length = source
-            .read(&mut chunk)
-            .await
-            .map_err(|error| format!("SFTP download failed: {error}"))?;
-        chunk.truncate(length);
+        // 限速节奏（issue #66）：块耗时从读开始计量（含网络/磁盘），读毕
+        // 由 limiter 补足差额等待。限速关闭时 Throttle::pace 是纯即时调用，
+        // 热路径零开销。
+        let chunk_started = download.throttle.enabled().then(std::time::Instant::now);
+        // latin-1 转义路径走裸包 READ（raw 字节打开远端文件）；普通路径
+        // 保持高层客户端的 seek+read。车道判定按 start 登记的生效编码
+        // （M28-B 修 D-7）：auto 一律走高层——auto 列表 uri 字面 `%` 未
+        // 未经 `%25` 自转义，wire 串里的 `%XX` 是文件名字面量，不能还原。
+        // 每 chunk 独立 open/close：转义名是极少数派，简单性优先。raw EOF
+        // 回空 chunk，与高层路径的 eof 语义一致。
+        let chunk = if download.latin1 && sftp_name::has_wire_escapes(&download.remote_path) {
+            self.raw_read_chunk(
+                &download.session_id,
+                &download.remote_path,
+                offset,
+                requested as u32,
+            )
+            .await?
+        } else {
+            let sftp = self.sftp(&download.session_id).await?;
+            let mut source = sftp
+                .lock()
+                .await
+                .open(download.remote_path.clone())
+                .await
+                .map_err(sftp_error)?;
+            source
+                .seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|error| format!("SFTP download seek failed: {error}"))?;
+            let mut chunk = vec![0_u8; requested];
+            let length = source
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("SFTP download failed: {error}"))?;
+            chunk.truncate(length);
+            chunk
+        };
+        // 限速等待在读毕、本地落盘之前：等待本身计入下一块之前的墙钟，
+        // 且不会推迟本地写完成的应答语义（前端循环按块等待）。
+        if let (true, Some(started)) = (download.throttle.enabled(), chunk_started) {
+            download.throttle.pace(chunk.len(), started.elapsed()).await;
+        }
+        let length = chunk.len();
         if let Some(sink) = download.sink.as_ref() {
             sink.file
                 .lock()
@@ -5822,6 +6714,14 @@ impl SshRuntime {
             if let Some(tree) = download.tree.as_ref() {
                 let _ = std::fs::remove_dir_all(&tree.root_local);
             }
+            // sudo 下载取消：远端临时件同样属于本任务，best-effort 删除。
+            if let Some(tmp) = download.sudo_tmp.as_ref() {
+                if let Err(error) =
+                    sudo_download::discard_tmp(self, &download.session_id, tmp).await
+                {
+                    eprintln!("[sudo-download] temp cleanup failed ({tmp}): {error}");
+                }
+            }
         }
         if upload.is_none() && download.is_none() && finishing.is_none() {
             return Err("Transfer task was not found".to_string());
@@ -5891,6 +6791,39 @@ impl SshRuntime {
                 .complete_tree_download(download, task_id, emitter)
                 .await;
         }
+        let sudo_tmp = download.sudo_tmp.clone();
+        let session_id = download.session_id.clone();
+        let result = self
+            .complete_single_file_download(download, task_id, emitter)
+            .await;
+        // finally 语义：sudo 下载的远端临时件在完成/失败两条路径上都要清理；
+        // 清理失败不吞掉原结果，只在成功响应上附加 warning 兜底提示。
+        if let Some(tmp) = sudo_tmp {
+            match sudo_download::discard_tmp(self, &session_id, &tmp).await {
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!("[sudo-download] temp cleanup failed ({tmp}): {error}");
+                    let mut result = result;
+                    if let Ok(response) = result.as_mut() {
+                        response["warning"] = json!(format!(
+                            "Remote sudo temp file cleanup failed: {tmp} ({error})"
+                        ));
+                    }
+                    return result;
+                }
+            }
+        }
+        result
+    }
+
+    /// Single-file half of `sftp/download/finish`, extracted so the sudo
+    /// variant can run its remote temp cleanup around it.
+    async fn complete_single_file_download(
+        &self,
+        download: DownloadState,
+        task_id: &str,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
         let record_failed = |error: &str| {
             self.record_transfer(json!({ "taskId": task_id, "sessionId": download.session_id, "direction": "download", "fileName": download.file_name, "size": download.size, "transferred": download.next_offset, "status": "failed", "error": error }));
         };
@@ -6345,6 +7278,16 @@ impl SshRuntime {
             .unwrap_or_default()
     }
 
+    /// 会话级传输并发深度（M14-B）：偏好 `transfer_max_active` 可配
+    /// （1..=8，缺省 3 = 历史硬编码值）；老旧服务器兼容模式下强制 1。
+    /// 每次任务启动现读现用——改动即时生效，进行中的任务按原深度自然完成。
+    fn transfer_depth_limit(&self) -> u64 {
+        if crate::preferences::sftp_compat_mode(&self.data_dir) {
+            return 1;
+        }
+        crate::preferences::transfer_max_active(&self.data_dir)
+    }
+
     fn active_transfer_count(&self, session_id: &str) -> Result<usize, String> {
         let uploads = self
             .uploads
@@ -6474,6 +7417,253 @@ fn auth_partial_success(result: &AuthResult) -> bool {
         } => *partial_success,
         _ => false,
     }
+}
+
+/// Fixed Auto try order — the public contract of the fallback chain. Method
+/// names use the `external_config.authentication` spellings so log lines stay
+/// greppable against connection configs.
+const AUTO_AUTH_ORDER: [&str; 4] = ["password", "private-key", "keyboard-interactive", "agent"];
+
+/// Pure stage gate for the Auto chain: `None` means "attempt the stage",
+/// `Some(reason)` means "record a skipped attempt". Credential presence is
+/// configuration (known before dialing); whether the server advertises the
+/// password method is the runtime fact captured by the auth-none probe.
+/// keyboard-interactive and agent have no local prerequisites — the user can
+/// still answer prompts interactively and the agent socket comes from the
+/// environment — so they are never skipped.
+fn auto_stage_skip(
+    method: &str,
+    has_password: bool,
+    password_offered: bool,
+    has_key: bool,
+) -> Option<String> {
+    match method {
+        "password" if !has_password => {
+            Some("no password configured for this connection".to_string())
+        }
+        "password" if !password_offered => {
+            Some("server does not advertise password authentication".to_string())
+        }
+        "private-key" if !has_key => {
+            Some("no private key configured for this connection".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// One recorded Auto-fallback attempt: the method plus why it was skipped or
+/// why it failed. The name must stay aligned with `AUTO_AUTH_ORDER`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoAuthAttempt {
+    method: &'static str,
+    skipped: bool,
+    detail: String,
+}
+
+fn auto_auth_attempt(method: &'static str, detail: String) -> AutoAuthAttempt {
+    AutoAuthAttempt {
+        method,
+        skipped: false,
+        detail,
+    }
+}
+
+fn auto_auth_skip(method: &'static str, detail: String) -> AutoAuthAttempt {
+    AutoAuthAttempt {
+        method,
+        skipped: true,
+        detail,
+    }
+}
+
+/// Aggregated failure message for the Auto chain: every attempted (or
+/// skipped) method with its reason, in the fixed try order, so a total
+/// failure explains itself instead of surfacing only the last error.
+fn auto_auth_failure_message(attempts: &[AutoAuthAttempt]) -> String {
+    if attempts.is_empty() {
+        return "SSH authentication failed in Auto mode: no method could be attempted".to_string();
+    }
+    let summary = attempts
+        .iter()
+        .map(|attempt| {
+            if attempt.skipped {
+                format!("{} (skipped: {})", attempt.method, attempt.detail)
+            } else {
+                format!("{} ({})", attempt.method, attempt.detail)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("SSH authentication failed in Auto mode, tried in order — {summary}")
+}
+
+/// Auto authentication, Tabby-style ordered fallback: password → private key
+/// → interactive keyboard-interactive (incl. TOTP) → ssh-agent, in that fixed
+/// order (`AUTO_AUTH_ORDER`), until one succeeds or every attempt failed.
+///
+/// Deliberately a thin orchestrator: every credential flow reuses the exact
+/// helper of the explicit method it mirrors (`try_password`,
+/// `authenticate_private_key_result`, `authenticate_keyboard_interactive`,
+/// `authenticate_agent`), including the Quick Sudo OTP orchestration and the
+/// host-key challenge path, which stay untouched under Auto. A private-key or
+/// agent partial success continues into the same MFA keyboard-interactive
+/// continuation as the explicit paths; that continuation counts as the KI
+/// stage so a later failure does not ask the user the same questions twice.
+///
+/// Each non-successful stage is reported as a sidecar log event
+/// (`ssh/auth/auto`, best-effort — skipped in MCP headless mode without an
+/// emitter) and recorded for the aggregated failure message.
+async fn authenticate_auto(
+    session: &mut Handle<SshClient>,
+    connection: &StoredConnection,
+    orchestration: &SudoAuth,
+    offered: &AuthResult,
+    prompts: &PromptBroker,
+    emitter: Option<&PluginEmitter>,
+    operation_id: &str,
+) -> Result<(), String> {
+    let has_password = !connection.password.is_empty();
+    let password_offered = method_offered(offered, MethodKind::Password);
+    let has_key = !connection.private_key.is_empty() || !connection.private_key_path.is_empty();
+    let mut attempts: Vec<AutoAuthAttempt> = Vec::new();
+    // 私钥/agent 的 partial-success 续答就是 KI 阶段本身：再跑一轮全新 KI
+    // 会把同样的提问（验证码）重复问一遍。
+    let mut ki_attempted = false;
+    let report = |attempt: &AutoAuthAttempt| {
+        if let Some(emitter) = emitter {
+            let _ = emitter.event(
+                "ssh/auth/auto",
+                json!({
+                    "operationId": operation_id,
+                    "connectionId": connection.id,
+                    "method": attempt.method,
+                    "status": if attempt.skipped { "skipped" } else { "failed" },
+                    "detail": attempt.detail,
+                }),
+            );
+        }
+    };
+    let mut record = |attempt: AutoAuthAttempt| {
+        eprintln!(
+            "[ssh-trace] auth auto: {} {} ({})",
+            attempt.method,
+            if attempt.skipped { "skipped" } else { "failed" },
+            attempt.detail
+        );
+        report(&attempt);
+        attempts.push(attempt);
+    };
+
+    // Stage 1: password.
+    if let Some(reason) = auto_stage_skip("password", has_password, password_offered, has_key) {
+        record(auto_auth_skip("password", reason));
+    } else {
+        match try_password(session, connection).await {
+            Ok(result) if result.success() => return Ok(()),
+            Ok(result) => record(auto_auth_attempt(
+                "password",
+                format!(
+                    "rejected by the server (partial_success={})",
+                    auth_partial_success(&result)
+                ),
+            )),
+            Err(error) => record(auto_auth_attempt("password", error)),
+        }
+    }
+
+    // Stage 2: private key.
+    if let Some(reason) = auto_stage_skip("private-key", has_password, password_offered, has_key) {
+        record(auto_auth_skip("private-key", reason));
+    } else {
+        match authenticate_private_key_result(session, connection).await {
+            Ok(result) if result.success() => return Ok(()),
+            Ok(result)
+                if auth_partial_success(&result)
+                    && method_offered(&result, MethodKind::KeyboardInteractive) =>
+            {
+                eprintln!(
+                    "[ssh-trace] auth auto: publickey partial success, continuing with keyboard-interactive"
+                );
+                ki_attempted = true;
+                match authenticate_keyboard_interactive(
+                    session,
+                    connection,
+                    orchestration,
+                    true,
+                    prompts,
+                )
+                .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(error) => record(auto_auth_attempt("keyboard-interactive", error)),
+                }
+            }
+            Ok(_) => record(auto_auth_attempt(
+                "private-key",
+                "rejected by the server".to_string(),
+            )),
+            Err(error) => record(auto_auth_attempt("private-key", error)),
+        }
+    }
+
+    // Stage 3: interactive keyboard-interactive (incl. TOTP).
+    if ki_attempted {
+        record(auto_auth_skip(
+            "keyboard-interactive",
+            "already answered as the MFA follow-up of an earlier stage".to_string(),
+        ));
+    } else {
+        match authenticate_keyboard_interactive(session, connection, orchestration, false, prompts)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => record(auto_auth_attempt("keyboard-interactive", error)),
+        }
+    }
+
+    // Stage 4: ssh-agent.
+    match authenticate_agent(session, connection).await {
+        Ok(AgentAuthOutcome::Accepted) => return Ok(()),
+        Ok(AgentAuthOutcome::NeedsKeyboardInteractive) => {
+            eprintln!(
+                "[ssh-trace] auth auto: agent partial success, continuing with keyboard-interactive"
+            );
+            match authenticate_keyboard_interactive(
+                session,
+                connection,
+                orchestration,
+                true,
+                prompts,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => record(auto_auth_attempt("keyboard-interactive", error)),
+            }
+        }
+        Ok(AgentAuthOutcome::Rejected) => record(auto_auth_attempt(
+            "agent",
+            "no SSH Agent identity was accepted".to_string(),
+        )),
+        Err(error) => record(auto_auth_attempt("agent", error)),
+    }
+
+    // Order invariant: attempts (skips included) must appear in the fixed try
+    // order of `AUTO_AUTH_ORDER` — filtering the contract list by the methods
+    // actually attempted must reproduce the record exactly.
+    debug_assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.method)
+            .collect::<Vec<_>>(),
+        AUTO_AUTH_ORDER
+            .iter()
+            .filter(|method| attempts.iter().any(|attempt| attempt.method == **method))
+            .copied()
+            .collect::<Vec<_>>(),
+        "Auto authentication attempts must follow the fixed try order"
+    );
+    Err(auto_auth_failure_message(&attempts))
 }
 
 /// Tries password authentication first, then keyboard-interactive. The
@@ -7199,10 +8389,34 @@ async fn delete_directory_tree(
 /// Recursively walks a remote directory over SFTP and collects the folder
 /// download plan (breadth-first, so parents are read before children):
 /// regular files in download order, the directory layout, symlink/special
-/// skips and per-path failures. Only root-level problems (not a readable
-/// directory) abort; a failing subdirectory is recorded and the walk goes on.
+/// skips and per-path failures. The root itself is pre-checked first
+/// (symlinks are refused, non-directories rejected). Only root-level
+/// problems (not a readable directory) abort; a failing subdirectory is
+/// recorded and the walk goes on.
 /// Symlinks are never followed, so server-side cycles cannot loop the walk.
 async fn scan_remote_tree(
+    sftp: &Arc<AsyncMutex<SftpSession>>,
+    root: &str,
+) -> Result<sftp_tree::TreeScan, String> {
+    let metadata = sftp
+        .lock()
+        .await
+        .symlink_metadata(root.to_string())
+        .await
+        .map_err(sftp_error)?;
+    if metadata.is_symlink() {
+        return Err(
+            "Refusing to download a symlink as a folder; download its target instead".to_string(),
+        );
+    }
+    if !metadata.is_dir() {
+        return Err("Folder download needs a remote directory".to_string());
+    }
+    scan_remote_tree_walk(sftp, root).await
+}
+
+/// 高层客户端的树遍历主体（根预检已由 [`scan_remote_tree`] 完成）。
+async fn scan_remote_tree_walk(
     sftp: &Arc<AsyncMutex<SftpSession>>,
     root: &str,
 ) -> Result<sftp_tree::TreeScan, String> {
@@ -7274,6 +8488,139 @@ async fn scan_remote_tree(
         }
     }
     Ok(scan)
+}
+
+/// 裸包树扫描（latin-1 模式）：同一通道内 LSTAT 根预检 + READDIR 递归，
+/// 整树路径字节保真——远端路径用 wire 转义形式（分块下载按转义自动走
+/// raw READ），本地落盘名用 latin-1 解码的显示名。symlink/特殊条目跳过
+/// 不跟随（与高层路径同语义），根预检失败整个下载拒绝，子目录失败记录
+/// 后继续走。
+async fn scan_tree_with_raw(
+    client: &mut RawSftpClient,
+    root_wire: &str,
+) -> Result<sftp_tree::TreeScan, String> {
+    let root_raw = sftp_name::unescape_wire(root_wire);
+    let attrs = client.lstat(&root_raw).await?;
+    let kind = classify_raw_kind(attrs.permissions);
+    if kind == "symlink" {
+        return Err(
+            "Refusing to download a symlink as a folder; download its target instead".to_string(),
+        );
+    }
+    if kind != "directory" {
+        return Err("Folder download needs a remote directory".to_string());
+    }
+    let mut scan = sftp_tree::TreeScan::new();
+    // 队列元素：(远端目录原始字节, 远端目录 wire 形式, 本地相对显示路径)。
+    let mut pending: VecDeque<(Vec<u8>, String, String)> = VecDeque::new();
+    pending.push_back((root_raw, root_wire.to_string(), String::new()));
+    while let Some((dir_raw, dir_wire, dir_relative)) = pending.pop_front() {
+        let entries = match client.readdir(&dir_raw).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                if dir_relative.is_empty() {
+                    return Err(error);
+                }
+                scan.record_failure(&dir_relative, format!("directory is not readable: {error}"));
+                continue;
+            }
+        };
+        for entry in entries {
+            if entry.name.as_slice() == b"." || entry.name.as_slice() == b".." {
+                continue;
+            }
+            // 显示相对路径（本地落盘布局）与 wire 远端路径严格分离。
+            let display = sftp_name::decode_display_name(&entry.name, NameEncoding::Latin1);
+            let child_relative = if dir_relative.is_empty() {
+                display.text
+            } else {
+                format!("{dir_relative}/{}", display.text)
+            };
+            let child_wire =
+                sftp_name::join_wire_name(&dir_wire, &sftp_name::escape_wire(&entry.name));
+            match classify_raw_kind(entry.attrs.permissions) {
+                "directory" => {
+                    let Some(relative) = sftp_tree::sanitize_relative(&child_relative) else {
+                        scan.record_failure(
+                            &child_relative,
+                            "directory name is not usable on the local filesystem",
+                        );
+                        continue;
+                    };
+                    match scan.push_dir(&relative) {
+                        Ok(true) => pending.push_back((
+                            sftp_name::join_raw_path(&dir_raw, &entry.name),
+                            child_wire,
+                            relative,
+                        )),
+                        Ok(false) => {}
+                        Err(capacity) => return Err(capacity.to_string()),
+                    }
+                }
+                "file" => {
+                    let Some(relative) = sftp_tree::sanitize_relative(&child_relative) else {
+                        scan.record_failure(
+                            &child_relative,
+                            "file name is not usable on the local filesystem",
+                        );
+                        continue;
+                    };
+                    let Some(size) = entry.attrs.size else {
+                        scan.record_failure(
+                            &child_relative,
+                            "directory listing did not report the file size",
+                        );
+                        continue;
+                    };
+                    if let Err(capacity) = scan.push_file(relative, child_wire, size) {
+                        return Err(capacity.to_string());
+                    }
+                }
+                _ => scan.skip(),
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// 裸包删除单个路径：LSTAT 判型后分派 REMOVE/RMDIR/递归树删（分派语义与
+/// 高层 `sftp_delete` 一致；READDIR attrs 是 lstat 语义，目录里的符号链接
+/// 按 REMOVE 处理，绝不跟随）。
+async fn raw_delete_path(
+    client: &mut RawSftpClient,
+    raw_path: &[u8],
+    recursive: bool,
+) -> Result<(), String> {
+    let attrs = client.lstat(raw_path).await?;
+    match classify_raw_kind(attrs.permissions) {
+        "directory" if recursive => raw_delete_tree(client, raw_path).await,
+        "directory" => client.rmdir(raw_path).await,
+        _ => client.remove(raw_path).await,
+    }
+}
+
+/// 裸包递归删除：后序遍历（先文件后目录），单通道串行，`.`/`..` 跳过。
+/// pub(crate)：MCP 工具面 sftp_remove 的 latin-1 递归分支复用（M17）。
+pub(crate) async fn raw_delete_tree(client: &mut RawSftpClient, root: &[u8]) -> Result<(), String> {
+    let mut pending = vec![root.to_vec()];
+    let mut directories = Vec::new();
+    while let Some(directory) = pending.pop() {
+        directories.push(directory.clone());
+        for entry in client.readdir(&directory).await? {
+            if entry.name.as_slice() == b"." || entry.name.as_slice() == b".." {
+                continue;
+            }
+            let child = sftp_name::join_raw_path(&directory, &entry.name);
+            match classify_raw_kind(entry.attrs.permissions) {
+                "directory" => pending.push(child),
+                _ => client.remove(&child).await?,
+            }
+        }
+    }
+    for directory in directories.into_iter().rev() {
+        client.rmdir(&directory).await?;
+    }
+    Ok(())
 }
 
 /// Creates the parent directories for one queued tree file and opens its
@@ -7563,6 +8910,24 @@ fn classify_entry_kind(file_type: FileType) -> &'static str {
     }
 }
 
+/// 裸包客户端具体类型：每次操作独占一条 sftp 子系统通道，发一收一。
+pub(crate) type RawSftpClient = sftp_raw::RawSftp<russh::ChannelStream<russh::client::Msg>>;
+
+/// 裸包客户端路径的 kind 判定：按 v3 permissions 的 POSIX 类型位归类；
+/// attrs 缺 permissions（非标准服务器）时退回 file（与高层路径的 Other
+/// 语义一致），避免把普通文件误渲染成目录。pub(crate)：MCP 工具面
+/// latin-1 裸包列表/删除判型复用（M17）。
+pub(crate) fn classify_raw_kind(permissions: Option<u32>) -> &'static str {
+    let Some(mode) = permissions else {
+        return "file";
+    };
+    match mode & 0o170000 {
+        0o040000 => "directory",
+        0o120000 => "symlink",
+        _ => "file",
+    }
+}
+
 fn content_type_for_path(path: &str) -> Option<String> {
     let extension = path.rsplit('.').next()?.to_ascii_lowercase();
     let content_type = match extension.as_str() {
@@ -7578,7 +8943,7 @@ fn content_type_for_path(path: &str) -> Option<String> {
     Some(content_type.to_string())
 }
 
-fn format_permissions(value: u32) -> String {
+pub(crate) fn format_permissions(value: u32) -> String {
     format!("{:04o}", value & 0o7777)
 }
 
@@ -7780,6 +9145,45 @@ fn valid_requested_session_id(id: &str) -> bool {
     !id.is_empty() && !id.contains('/') && id.len() <= 128
 }
 
+/// WT-4 (command session) command size cap, same magnitude as the per-command
+/// cap of startup commands (`startup_commands::MAX_COMMAND_BYTES`).
+const SPAWN_COMMAND_MAX_BYTES: usize = 4 * 1024;
+
+/// Normalizes the WT-4 `spawnCommand` request into the exec payload, or `None`
+/// when the caller did not ask for a command session (absent or blank keeps
+/// the ordinary shell / connection `remote_command` semantics). Fails closed
+/// on NUL bytes (exec strings cannot carry them) and over-cap commands
+/// instead of silently truncating. Pure so tests can exercise the contract
+/// without a server.
+fn normalized_spawn_command(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains('\0') {
+        return Err("spawnCommand must not contain NUL bytes".to_string());
+    }
+    if trimmed.len() > SPAWN_COMMAND_MAX_BYTES {
+        return Err(format!(
+            "spawnCommand exceeds the {SPAWN_COMMAND_MAX_BYTES} byte limit"
+        ));
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+/// Wraps a normalized command session command as the exec payload:
+/// `sh -c '<single-quote escaped command>'` (repo hard rule: remote commands
+/// are single-quote escaped). The outer login shell receives exactly one safe
+/// argument so metacharacters cannot escape the quoting, while the inner
+/// `sh -c` keeps full shell semantics (pipes/redirects work as typed).
+/// Reuses the existing `exec::shell_quote` escaper.
+fn spawn_exec_payload(command: &str) -> String {
+    format!("sh -c {}", exec::shell_quote(command))
+}
+
 async fn detect_remote_shell(handle: &Handle<SshClient>) -> RemoteShell {
     remote_shell_or_timeout(
         detect_remote_shell_inner(handle),
@@ -7860,6 +9264,71 @@ fn plugin_error(error: PluginError) -> String {
 mod tests {
     use super::*;
     use russh::{cipher, kex, mac};
+
+    #[test]
+    fn normalized_spawn_command_treats_absent_and_blank_as_no_command() {
+        assert_eq!(normalized_spawn_command(None).unwrap(), None);
+        assert_eq!(normalized_spawn_command(Some("")).unwrap(), None);
+        assert_eq!(normalized_spawn_command(Some("   ")).unwrap(), None);
+        assert_eq!(normalized_spawn_command(Some(" \t\r\n ")).unwrap(), None);
+    }
+
+    #[test]
+    fn normalized_spawn_command_trims_and_keeps_inner_whitespace() {
+        assert_eq!(
+            normalized_spawn_command(Some("  htop  "))
+                .unwrap()
+                .as_deref(),
+            Some("htop")
+        );
+        assert_eq!(
+            normalized_spawn_command(Some("tail -f /var/log/syslog"))
+                .unwrap()
+                .as_deref(),
+            Some("tail -f /var/log/syslog")
+        );
+    }
+
+    #[test]
+    fn normalized_spawn_command_fails_closed_on_nul_and_oversize() {
+        let nul_error = normalized_spawn_command(Some("echo a\0b")).unwrap_err();
+        assert_eq!(nul_error, "spawnCommand must not contain NUL bytes");
+
+        let oversized = "x".repeat(SPAWN_COMMAND_MAX_BYTES + 1);
+        let error = normalized_spawn_command(Some(&oversized)).unwrap_err();
+        assert_eq!(
+            error,
+            format!("spawnCommand exceeds the {SPAWN_COMMAND_MAX_BYTES} byte limit")
+        );
+        // At-cap commands are accepted; the cap counts UTF-8 bytes.
+        let at_cap = "x".repeat(SPAWN_COMMAND_MAX_BYTES);
+        assert!(normalized_spawn_command(Some(&at_cap)).unwrap().is_some());
+        let at_cap_multibyte = "中".repeat(SPAWN_COMMAND_MAX_BYTES / 3);
+        assert!(normalized_spawn_command(Some(&at_cap_multibyte))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn spawn_exec_payload_single_quote_escapes_and_preserves_shell_semantics() {
+        // Repo hard rule: remote commands are single-quote escaped. The
+        // payload is one `sh -c '<escaped>'` argument for the outer shell;
+        // the inner sh keeps pipes and redirects intact.
+        assert_eq!(spawn_exec_payload("htop"), "sh -c 'htop'");
+        assert_eq!(
+            spawn_exec_payload("it's"),
+            "sh -c 'it'\\''s'",
+            "embedded single quotes use the '\\'' escape (exec::shell_quote)"
+        );
+        assert_eq!(
+            spawn_exec_payload("echo a && cat /etc/passwd | wc -l > /tmp/x; rm -rf '$(pwd)'"),
+            "sh -c 'echo a && cat /etc/passwd | wc -l > /tmp/x; rm -rf '\\''$(pwd)'\\'''"
+        );
+        // The metacharacters stay inside the quoted payload: nothing outside
+        // the single quotes except the fixed `sh -c ` prefix.
+        let payload = spawn_exec_payload("a; b | c & d");
+        assert!(payload.starts_with("sh -c '") && payload.ends_with("'"));
+    }
 
     #[test]
     fn upload_progress_payload_marks_the_phase() {
@@ -8065,6 +9534,27 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
         let frames = replay.after(1);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].sequence, 2);
+    }
+
+    #[test]
+    fn replay_buffer_honours_a_custom_byte_budget() {
+        // 串口会话的 128 KiB 预算（设计稿 §3）：绕回后 first_sequence 前移，
+        // after() 只回可得的尾部，complete 语义随 first_available 变化。
+        let mut replay = ReplayBuffer::with_byte_limit(8);
+        replay.push(TerminalStream::Stdout, b"12345".to_vec());
+        replay.push(TerminalStream::Stdout, b"67890".to_vec());
+        assert_eq!(replay.first_sequence(), 2, "frame 1 was evicted");
+        assert_eq!(replay.tail_sequence(), 2);
+        assert!(replay.after(0).iter().all(|frame| frame.sequence >= 2));
+        // afterSequence+1 >= first_available → complete。
+        assert!(
+            replay.after(1).len() == 1,
+            "replaying from 1 yields the surviving frame"
+        );
+        // 默认预算仍是共享的 2 MiB 上限。
+        let replay = ReplayBuffer::default();
+        let serialized = format!("{:?}", replay.byte_limit);
+        assert_eq!(serialized, format!("{TERMINAL_REPLAY_LIMIT}"));
     }
 
     #[test]
@@ -9419,6 +10909,9 @@ matrix-ed25519";
                 next_offset: 5,
                 sink: None,
                 tree: None,
+                sudo_tmp: None,
+                latin1: false,
+                throttle: Throttle::new(0),
             },
         );
         let no_connection = |_: &str| String::new();
@@ -9514,6 +11007,9 @@ matrix-ed25519";
                     next_offset: 0,
                     sink: None,
                     tree: None,
+                    sudo_tmp: None,
+                    latin1: false,
+                    throttle: Throttle::new(0),
                 },
             );
         }
@@ -9528,6 +11024,104 @@ matrix-ed25519";
             .map(|task| task["taskId"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["t-alpha", "t-mike", "t-zulu"]);
+    }
+
+    /// Auto 按序回退的纯逻辑契约：固定顺序、阶段门控、全失败汇总。真实
+    /// 凭据流（密码/私钥/KI/agent）复用既有 helper，端到端由既有认证测试
+    /// 覆盖；这里只锁定编排器自身的决策面。
+    mod auto_auth {
+        use super::*;
+
+        #[test]
+        fn auto_order_contract_lists_methods_in_fallback_order() {
+            // 对标 Tabby 的认证依序回退：密码 → 私钥 → 交互式 KI → agent。
+            assert_eq!(
+                AUTO_AUTH_ORDER,
+                ["password", "private-key", "keyboard-interactive", "agent"]
+            );
+        }
+
+        #[test]
+        fn auto_stage_skip_gates_password_on_config_and_advertised_methods() {
+            // 无密码配置：跳过，无论服务器是否广告 password 方法。
+            assert_eq!(
+                auto_stage_skip("password", false, true, true).as_deref(),
+                Some("no password configured for this connection")
+            );
+            // 有密码但服务器未广告 password 方法：不发送密码，跳过。
+            assert_eq!(
+                auto_stage_skip("password", true, false, true).as_deref(),
+                Some("server does not advertise password authentication")
+            );
+            // 有密码且已广告：尝试。
+            assert_eq!(auto_stage_skip("password", true, true, true), None);
+        }
+
+        #[test]
+        fn auto_stage_skip_gates_private_key_on_configured_material() {
+            assert_eq!(
+                auto_stage_skip("private-key", true, true, false).as_deref(),
+                Some("no private key configured for this connection")
+            );
+            // 路径或粘贴内容任一存在即算已配置。
+            assert_eq!(auto_stage_skip("private-key", false, false, true), None);
+        }
+
+        #[test]
+        fn auto_stage_skip_never_gates_interactive_or_agent_stages() {
+            // KI 与 agent 没有本地前置凭据：提问可交互作答，agent 套接字
+            // 来自环境（挑战流中立——Auto 不改变 host key / 2FA 交互行为）。
+            for method in ["keyboard-interactive", "agent"] {
+                assert_eq!(
+                    auto_stage_skip(method, false, false, false),
+                    None,
+                    "{method} must never be skipped by local prerequisites"
+                );
+            }
+        }
+
+        #[test]
+        fn auto_auth_failure_message_aggregates_attempts_in_order() {
+            let attempts = vec![
+                auto_auth_skip(
+                    "password",
+                    "no password configured for this connection".to_string(),
+                ),
+                auto_auth_attempt("private-key", "rejected by the server".to_string()),
+                auto_auth_attempt(
+                    "keyboard-interactive",
+                    "SSH keyboard-interactive authentication was rejected".to_string(),
+                ),
+                auto_auth_attempt("agent", "no SSH Agent identity was accepted".to_string()),
+            ];
+            // 汇总保持固定顺序，逐方式带原因；skipped 有显式标记。
+            assert_eq!(
+                auto_auth_failure_message(&attempts),
+                "SSH authentication failed in Auto mode, tried in order — \
+                 password (skipped: no password configured for this connection); \
+                 private-key (rejected by the server); \
+                 keyboard-interactive (SSH keyboard-interactive authentication was rejected); \
+                 agent (no SSH Agent identity was accepted)"
+            );
+        }
+
+        #[test]
+        fn auto_auth_failure_message_without_attempts_names_the_chain() {
+            assert_eq!(
+                auto_auth_failure_message(&[]),
+                "SSH authentication failed in Auto mode: no method could be attempted"
+            );
+        }
+
+        #[test]
+        fn auto_auth_attempt_helpers_mark_skip_state() {
+            let skipped = auto_auth_skip("password", "reason".to_string());
+            assert!(skipped.skipped);
+            assert_eq!(skipped.method, "password");
+            let attempted = auto_auth_attempt("agent", "detail".to_string());
+            assert!(!attempted.skipped);
+            assert_eq!(attempted.method, "agent");
+        }
     }
 
     /// 登录期 2FA 的端到端回归（issue #17 / #30）：密码/公钥先被接受后服务器
@@ -9583,6 +11177,7 @@ matrix-ed25519";
             instruction: &'static str,
             prompt: &'static str,
             answers: Arc<Mutex<Vec<String>>>,
+            exec_seen: Arc<Mutex<Vec<String>>>,
         }
 
         impl MockKoko {
@@ -9592,6 +11187,7 @@ matrix-ed25519";
                     instruction,
                     prompt,
                     answers: Arc::new(Mutex::new(Vec::new())),
+                    exec_seen: Arc::new(Mutex::new(Vec::new())),
                 }
             }
         }
@@ -9601,6 +11197,7 @@ matrix-ed25519";
             instruction: &'static str,
             prompt: &'static str,
             answers: Arc<Mutex<Vec<String>>>,
+            exec_seen: Arc<Mutex<Vec<String>>>,
             ki_round: usize,
         }
 
@@ -9620,9 +11217,13 @@ matrix-ed25519";
             async fn exec_request(
                 &mut self,
                 channel: ChannelId,
-                _data: &[u8],
+                data: &[u8],
                 session: &mut Session,
             ) -> Result<(), Self::Error> {
+                self.exec_seen
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(data).into_owned());
                 session.channel_success(channel)?;
                 session.data(channel, b"/bin/bash".to_vec())?;
                 session.eof(channel)?;
@@ -9757,6 +11358,7 @@ matrix-ed25519";
                     instruction: self.instruction,
                     prompt: self.prompt,
                     answers: self.answers.clone(),
+                    exec_seen: self.exec_seen.clone(),
                     ki_round: 0,
                 }
             }
@@ -9766,7 +11368,12 @@ matrix-ed25519";
             shape: Shape,
             instruction: &'static str,
             prompt: &'static str,
-        ) -> (u16, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        ) -> (
+            u16,
+            Arc<Mutex<Vec<String>>>,
+            Arc<Mutex<Vec<String>>>,
+            tokio::task::JoinHandle<()>,
+        ) {
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
                 .await
                 .expect("bind mock koko");
@@ -9785,10 +11392,11 @@ matrix-ed25519";
             });
             let mut server = MockKoko::new(shape, instruction, prompt);
             let answers = server.answers.clone();
+            let exec_seen = server.exec_seen.clone();
             let task = tokio::spawn(async move {
                 let _ = server.run_on_socket(config, &listener).await;
             });
-            (port, answers, task)
+            (port, answers, exec_seen, task)
         }
 
         fn koko_connection(port: u16, secrets: Value, external: Value) -> StoredConnection {
@@ -9865,7 +11473,7 @@ matrix-ed25519";
 
         #[tokio::test]
         async fn unknown_chinese_mfa_prompt_requests_current_code_from_user() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, "请输入6位数字。", "[MFA认证]：").await;
             let gateway = Arc::new(ManualOtpGateway::submitting(MFA_CODE));
             let mut runtime = test_runtime();
@@ -9907,7 +11515,7 @@ matrix-ed25519";
 
         #[tokio::test]
         async fn configured_totp_keeps_login_automatic_without_user_prompt() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, MFA_INSTRUCTION, MFA_QUESTION).await;
             let gateway = Arc::new(ManualOtpGateway::submitting("should-not-be-used"));
             let mut runtime = test_runtime();
@@ -9934,7 +11542,7 @@ matrix-ed25519";
 
         #[tokio::test]
         async fn cancelling_manual_mfa_prompt_fails_closed() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, "请输入6位数字。", "[MFA认证]：").await;
             let gateway = Arc::new(ManualOtpGateway::cancelling());
             let mut runtime = test_runtime();
@@ -9964,7 +11572,7 @@ matrix-ed25519";
 
         #[tokio::test]
         async fn second_terminal_session_reuses_authenticated_transport() {
-            let (port, answers, server) = spawn_mock_koko(
+            let (port, answers, _exec, server) = spawn_mock_koko(
                 Shape::PasswordThenMfa,
                 "Please enter 6 digits.",
                 "[MFA auth]:",
@@ -9991,6 +11599,7 @@ matrix-ed25519";
                         reuse_authenticated_transport: false,
                         reuse_authenticated_session_id: None,
                         requested_session_id: None,
+                        spawn_command: None,
                         cols: 80,
                         rows: 24,
                     },
@@ -10009,6 +11618,7 @@ matrix-ed25519";
                             .as_str()
                             .map(str::to_string),
                         requested_session_id: None,
+                        spawn_command: None,
                         cols: 80,
                         rows: 24,
                     },
@@ -10032,6 +11642,114 @@ matrix-ed25519";
             for opened in [first, second] {
                 let session_id = opened["sessionId"].as_str().unwrap();
                 runtime.close_session(session_id).await.unwrap();
+            }
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn spawn_command_session_runs_on_shared_transport_with_escaped_exec() {
+            // WT-4 contract: a spawnCommand open on the reused transport must
+            // NOT re-authenticate (bastion MFA is answered exactly once) and
+            // must exec the single-quote-wrapped `sh -c '...'` payload.
+            let (port, answers, exec_seen, server) = spawn_mock_koko(
+                Shape::PasswordThenMfa,
+                "Please enter 6 digits.",
+                "[MFA auth]:",
+            )
+            .await;
+            let gateway = Arc::new(ManualOtpGateway::submitting(MFA_CODE));
+            let mut runtime = test_runtime();
+            runtime.prompts = PromptBroker::with_gateway(gateway.clone());
+            let connection = koko_connection(
+                port,
+                json!({}),
+                json!({
+                    "authentication": "password",
+                    "auth_flow_mode": "off",
+                }),
+            );
+            runtime.store_connection(connection).unwrap();
+
+            let base = runtime
+                .open_session(
+                    &SessionOpenRequest {
+                        connection_id: "koko-login".into(),
+                        workbench_id: "workbench-1".into(),
+                        reuse_authenticated_transport: false,
+                        reuse_authenticated_session_id: None,
+                        requested_session_id: None,
+                        spawn_command: None,
+                        cols: 80,
+                        rows: 24,
+                    },
+                    "open-base",
+                    test_emitter(),
+                )
+                .await
+                .expect("base shell session");
+            let spawned = runtime
+                .open_session(
+                    &SessionOpenRequest {
+                        connection_id: "koko-login".into(),
+                        workbench_id: "workbench-2".into(),
+                        reuse_authenticated_transport: true,
+                        reuse_authenticated_session_id: base["sessionId"]
+                            .as_str()
+                            .map(str::to_string),
+                        requested_session_id: None,
+                        spawn_command: Some("htop --tree".into()),
+                        cols: 80,
+                        rows: 24,
+                    },
+                    "open-spawn",
+                    test_emitter(),
+                )
+                .await
+                .expect("spawn command session on the shared transport");
+
+            assert_ne!(
+                spawned["sessionId"].as_str().unwrap(),
+                base["sessionId"].as_str().unwrap(),
+                "the command session owns its own sessionId"
+            );
+            assert_eq!(
+                gateway.prompts_seen.lock().unwrap().len(),
+                1,
+                "a command session on the shared transport must not ask for MFA again"
+            );
+            assert_eq!(
+                answers.lock().unwrap().as_slice(),
+                [MFA_CODE.to_string()],
+                "the bastion must authenticate only the first SSH transport"
+            );
+            // russh 0.62 channel requests are fire-and-forget: `exec` only
+            // queues the message, so the mock server may not have handled it
+            // by the time `open_session` returns. Poll briefly instead of
+            // asserting immediately.
+            let exec_payload = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let seen = exec_seen.lock().unwrap().clone();
+                    if !seen.is_empty() {
+                        break seen;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the mock server must receive the exec request");
+            assert_eq!(
+                exec_payload.as_slice(),
+                ["sh -c 'htop --tree'"],
+                "the command is wrapped as one single-quoted sh -c argument"
+            );
+
+            for opened in [base, spawned] {
+                let session_id = opened["sessionId"].as_str().unwrap();
+                // The mock exec handler closes the channel right after the
+                // reply, so the spawned session's read loop may already have
+                // reaped it ("SSH session was not found") — that self-cleanup
+                // on command exit is the expected command-session behavior.
+                let _ = runtime.close_session(session_id).await;
             }
             server.abort();
         }
@@ -10077,6 +11795,7 @@ matrix-ed25519";
                         reuse_authenticated_transport: true,
                         reuse_authenticated_session_id: Some("missing-session".into()),
                         requested_session_id: None,
+                        spawn_command: None,
                         cols: 80,
                         rows: 24,
                     },
@@ -10092,7 +11811,7 @@ matrix-ed25519";
 
         #[tokio::test]
         async fn mfa_code_is_answered_after_partial_success_password() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10114,7 +11833,7 @@ matrix-ed25519";
         /// 用户照屏幕抄进 OTP 提示词的就是这句话（issue #17 的 martin-bian）。
         #[tokio::test]
         async fn mfa_is_answered_from_challenge_instructions() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, MFA_INSTRUCTION, "Code: ").await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10135,7 +11854,7 @@ matrix-ed25519";
         /// 完全自定义的提问文案靠用户提示词命中（无内置模式可依赖）。
         #[tokio::test]
         async fn mfa_is_answered_from_user_hint() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, "", "Enter verification token: ").await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10157,7 +11876,7 @@ matrix-ed25519";
         /// 保护仍然生效——不回码，且失败信息点名服务器提问与配置入口。
         #[tokio::test]
         async fn bare_mfa_prompt_stays_unanswered_before_the_password() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::KiMfaOnly, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10185,7 +11904,7 @@ matrix-ed25519";
         /// 同一形态改配「密码 + OTP 合并」：反问顺序主机应能登录（表单选型指引）。
         #[tokio::test]
         async fn bare_mfa_prompt_is_answered_in_combined_mode() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::KiMfaOnly, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10203,7 +11922,7 @@ matrix-ed25519";
         /// 单独的 sudo 口令（凭据混用只会认证失败，还把特权口令送给主机）。
         #[tokio::test]
         async fn login_password_prompt_gets_the_login_password() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::KiPasswordThenMfa, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10224,7 +11943,7 @@ matrix-ed25519";
         /// 合并提问（一条应答同时要密码与验证码）：+合并模式拼接后通过。
         #[tokio::test]
         async fn combined_prompt_gets_password_and_code() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::KiCombined, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10246,7 +11965,7 @@ matrix-ed25519";
         /// 合并提问的应答内容）。
         #[tokio::test]
         async fn combined_prompt_gets_password_and_code_in_password_then_otp() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::KiCombined, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let connection = koko_connection(
@@ -10267,7 +11986,7 @@ matrix-ed25519";
         /// MFA 也必须能读到该配置的 TOTP 与流程模式。
         #[tokio::test]
         async fn global_profile_supplies_login_mfa_credentials() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let mut store = sudo_profiles::SudoProfileStore::default();
@@ -10307,7 +12026,7 @@ matrix-ed25519";
         /// `scripts/smoke_login_mfa_test.py`（paramiko 会如实置位）。
         #[tokio::test]
         async fn publickey_partial_success_is_reported_by_russh_server_as_reject() {
-            let (port, answers, server) =
+            let (port, answers, _exec, server) =
                 spawn_mock_koko(Shape::PasswordThenMfa, MFA_INSTRUCTION, MFA_QUESTION).await;
             let runtime = test_runtime();
             let key_text = test_key(2)

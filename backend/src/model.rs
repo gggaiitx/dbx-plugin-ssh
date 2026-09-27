@@ -11,6 +11,12 @@ pub enum AuthenticationMethod {
     PrivateKey,
     PrivateKeyPassword,
     Agent,
+    /// Tabby-style ordered fallback: try password → private key →
+    /// keyboard-interactive (incl. TOTP) → ssh-agent, in that fixed order,
+    /// until one succeeds or every attempt has failed. Stage prerequisites
+    /// (no password, no key material, unreachable agent) are recorded as
+    /// skipped attempts instead of aborting the chain.
+    Auto,
     None,
 }
 
@@ -23,7 +29,7 @@ impl AuthenticationMethod {
             .and_then(Value::as_str)
             .unwrap_or("password");
         match value {
-            "password" | "private-key" | "private-key-password" | "agent" | "none" => {
+            "password" | "private-key" | "private-key-password" | "agent" | "none" | "auto" => {
                 Ok(Self::from_method_name(value))
             }
             _ => Err(format!("Unsupported SSH authentication method '{value}'")),
@@ -36,6 +42,7 @@ impl AuthenticationMethod {
             "private-key-password" => Self::PrivateKeyPassword,
             "agent" => Self::Agent,
             "none" => Self::None,
+            "auto" => Self::Auto,
             _ => Self::Password,
         }
     }
@@ -49,6 +56,7 @@ impl AuthenticationMethod {
             Self::PrivateKeyPassword => "private-key-password",
             Self::Agent => "agent",
             Self::None => "none",
+            Self::Auto => "auto",
             Self::Password => "password",
         }
     }
@@ -94,6 +102,66 @@ impl SudoSource {
     }
 }
 
+/// Logical connection identity plus the host-provided runtime dial target.
+/// Non-SSH saved connections use this small lifecycle shape instead of the
+/// SSH credential parser; the logical endpoint remains the UI identity while
+/// TCP traffic always targets `runtime_host:runtime_port`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeEndpoint {
+    pub connection_id: String,
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+    pub runtime_host: String,
+    pub runtime_port: u16,
+}
+
+impl RuntimeEndpoint {
+    pub fn from_lifecycle_params(params: &Value) -> Result<Self, String> {
+        let connection = params
+            .get("connection")
+            .and_then(Value::as_object)
+            .ok_or("Missing connection payload")?;
+        let connection_id = string_field(connection, "id")?;
+        let host = validate_host_field(string_field(connection, "host")?)?;
+        let port = connection
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or("Connection port must be between 1 and 65535")?;
+        let runtime = params.get("runtime").and_then(Value::as_object);
+        let runtime_host = optional_string(runtime, "host");
+        let runtime_port = runtime
+            .and_then(|value| value.get("port"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(port);
+        let protocol = optional_string(
+            connection.get("external_config").and_then(Value::as_object),
+            "protocol",
+        );
+        Ok(Self {
+            connection_id,
+            protocol: match protocol.as_str() {
+                // M32-B：serial/rdp 连接记录与 telnet/vnc 同走非 SSH 生命周期
+                // （test 探测 / connect 直通），不进 SSH 凭据解析。
+                "telnet" | "vnc" | "serial" | "rdp" => protocol,
+                _ => "ssh".to_string(),
+            },
+            host: host.clone(),
+            port,
+            runtime_host: if runtime_host.is_empty() {
+                host
+            } else {
+                runtime_host
+            },
+            runtime_port,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredConnection {
     pub id: String,
@@ -107,6 +175,10 @@ pub struct StoredConnection {
     pub runtime_host: String,
     pub runtime_port: u16,
     pub username: String,
+    /// Retained for the SSH/MCP parser's forward-compatible lifecycle model;
+    /// non-SSH routing is handled by [`RuntimeEndpoint`] before SSH parsing.
+    #[allow(dead_code)]
+    pub protocol: String,
     pub password: String,
     pub authentication: AuthenticationMethod,
     pub private_key_path: String,
@@ -283,6 +355,7 @@ impl JumpHost {
             runtime_host: self.host.clone(),
             runtime_port: self.port,
             username: self.username.clone(),
+            protocol: "ssh".to_string(),
             password: self.password.clone(),
             authentication: AuthenticationMethod::from_method_name(&self.authentication),
             private_key_path: self.private_key_path.clone(),
@@ -360,6 +433,14 @@ impl StoredConnection {
             .filter(|value| *value > 0)
             .unwrap_or(port);
         let username = string_field(connection, "username")?;
+        let protocol = optional_string(
+            connection.get("external_config").and_then(Value::as_object),
+            "protocol",
+        );
+        let protocol = match protocol.as_str() {
+            "telnet" | "vnc" | "serial" | "rdp" => protocol,
+            _ => "ssh".to_string(),
+        };
         let mut password = connection
             .get("password")
             .and_then(Value::as_str)
@@ -544,6 +625,7 @@ impl StoredConnection {
             runtime_host,
             runtime_port,
             username,
+            protocol,
             password,
             authentication,
             private_key_path,
@@ -785,6 +867,11 @@ pub enum TerminalStream {
     Stdout = 0,
     Stderr = 1,
     State = 2,
+    /// Serial B1 inbound write frames (`serial/terminal/in/{id}`) only; the
+    /// value skips `State = 2`, which the local terminal already uses for
+    /// in-band state frames. Decoders that meet an unknown tag must drop the
+    /// frame silently and count it (docs/SERIAL_ENHANCE_DESIGN.zh-CN.md §2).
+    Stdin = 3,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -808,6 +895,11 @@ pub struct SftpEntry {
     pub owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 显示名不可忠实还原（M14-B）：wire 名含 U+FFFD（上游 lossy 解码已把
+    /// 非法字节替换掉）。传输始终走 wire/uri；true 时 UI 提示该名字节级
+    /// 不可还原，可在设置 → 传输切换文件名编码后重列。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lossy: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -829,6 +921,12 @@ pub struct SessionOpenRequest {
     /// before the long-running open RPC returns. Older callers keep server UUIDs.
     #[serde(default)]
     pub requested_session_id: Option<String>,
+    /// WT-4 (WezTerm `spawn` parity): run this command on the new channel
+    /// (independent PTY) instead of a shell. One-shot open parameter — the
+    /// contract lives in docs/PROTOCOL.zh-CN.md「同 transport 命令会话」;
+    /// absent/blank keeps the ordinary shell or connection `remote_command`.
+    #[serde(default)]
+    pub spawn_command: Option<String>,
     #[serde(default = "default_cols")]
     pub cols: u32,
     #[serde(default = "default_rows")]
@@ -905,6 +1003,21 @@ mod tests {
     }
 
     #[test]
+    fn stdin_stream_tag_is_three_and_avoids_state() {
+        // B1 契约：Stdin = 3，避开 local 终端已占用带内状态帧的 State = 2。
+        assert_eq!(TerminalStream::Stdin as u8, 3);
+        let encoded = TerminalFrame {
+            sequence: 7,
+            stream: TerminalStream::Stdin,
+            data: b"hi".to_vec(),
+        }
+        .encode();
+        assert_eq!(encoded[0], 3);
+        assert_eq!(u64::from_be_bytes(encoded[1..9].try_into().unwrap()), 7);
+        assert_eq!(&encoded[9..], b"hi");
+    }
+
+    #[test]
     fn session_open_request_accepts_legacy_payload() {
         let request: SessionOpenRequest = serde_json::from_value(serde_json::json!({
             "connectionId": "conn",
@@ -918,6 +1031,7 @@ mod tests {
         assert!(request.requested_session_id.is_none());
         assert_eq!(request.cols, 120);
         assert_eq!(request.rows, 32);
+        assert!(request.spawn_command.is_none());
     }
 
     #[test]
@@ -933,6 +1047,19 @@ mod tests {
         assert_eq!(request.requested_session_id.as_deref(), Some("session-1"));
         assert_eq!(request.cols, 80);
         assert_eq!(request.rows, 24);
+    }
+
+    #[test]
+    fn session_open_request_accepts_spawn_command() {
+        let request: SessionOpenRequest = serde_json::from_value(serde_json::json!({
+            "connectionId": "conn",
+            "reuseAuthenticatedTransport": true,
+            "reuseAuthenticatedSessionId": "source",
+            "spawnCommand": "htop"
+        }))
+        .unwrap();
+        assert_eq!(request.spawn_command.as_deref(), Some("htop"));
+        assert!(request.reuse_authenticated_transport);
     }
 
     #[test]
@@ -1024,6 +1151,7 @@ mod tests {
             .collect();
         let expected = [
             "display_name",
+            "protocol",
             "host",
             "port",
             "username",
@@ -1056,6 +1184,18 @@ mod tests {
             "trigger_answer_2",
             "passphrase_command",
             "remote_command",
+            // M32-B：serial/rdp 连接类型字段（协议门控见各字段 visible_when；
+            // 解析面只消费 external_config.protocol，其余字段由前端路由读取）。
+            "serial_port",
+            "serial_baud",
+            "serial_data_bits",
+            "serial_parity",
+            "serial_stop_bits",
+            "serial_backspace",
+            "rdp_domain",
+            "rdp_resolution",
+            "rdp_certificate_policy",
+            "rdp_clipboard",
         ];
         assert_eq!(keys, expected, "manifest field list drifted from parsing");
 
@@ -1164,46 +1304,57 @@ mod tests {
         // 出现本连接密码/PTY；global 模式出现全局配置引用；2FA 编排字段
         // （totp_secret/auth_flow_mode/hints）服务登录期 keyboard-interactive，
         // global 模式下整体由全局配置接管故隐藏，off/custom 模式仍常显。
-        let visible_when = |key: &str| -> Option<(String, Vec<String>)> {
+        // 协议门控（M9）后 SSH 字段的 visible_when 为 all_of（protocol=ssh
+        // 叠加原条件）；改用完整结构比对，含 protocol 子句。
+        let visible_when = |key: &str| -> serde_json::Value {
             fields
                 .iter()
                 .find(|field| field["key"] == key)
                 .unwrap()
                 .get("visible_when")
-                // 复合条件（all_of/any_of/not）没有单字段形态，返回 None，由
-                // 调用点按各自结构单独断言。
-                .filter(|gate| !gate["field"].is_null())
-                .map(|gate| {
-                    (
-                        gate["field"].as_str().unwrap().to_string(),
-                        gate["one_of"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|value| value.as_str().unwrap().to_string())
-                            .collect(),
-                    )
-                })
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
         };
+        let protocol_gate = serde_json::json!({ "field": "protocol", "one_of": ["ssh"] });
         assert_eq!(
             visible_when("sudo_password"),
-            Some(("sudo_source".to_string(), vec!["custom".to_string()])),
-            "sudo_password must stay gated on sudo_source=custom"
+            serde_json::json!({
+                "all_of": [
+                    protocol_gate,
+                    { "field": "sudo_source", "one_of": ["custom"] },
+                ]
+            }),
+            "sudo_password must stay gated on protocol=ssh + sudo_source=custom"
         );
         assert_eq!(
             visible_when("sudo_use_pty"),
-            Some(("sudo_source".to_string(), vec!["custom".to_string()])),
-            "sudo_use_pty must stay gated on sudo_source=custom"
+            serde_json::json!({
+                "all_of": [
+                    protocol_gate,
+                    { "field": "sudo_source", "one_of": ["custom"] },
+                ]
+            }),
+            "sudo_use_pty must stay gated on protocol=ssh + sudo_source=custom"
         );
         assert_eq!(
             visible_when("sudo_profile"),
-            Some(("sudo_source".to_string(), vec!["global".to_string()])),
+            serde_json::json!({
+                "all_of": [
+                    protocol_gate,
+                    { "field": "sudo_source", "one_of": ["global"] },
+                ]
+            }),
             "sudo_profile must show only for sudo_source=global"
         );
         let key = "auth_flow_mode";
         assert_eq!(
             visible_when(key),
-            Some(("sudo_source".to_string(), vec!["custom".to_string(), "off".to_string()])),
+            serde_json::json!({
+                "all_of": [
+                    protocol_gate,
+                    { "field": "sudo_source", "one_of": ["custom", "off"] },
+                ]
+            }),
             "{key} must hide under sudo_source=global (the bound profile owns the whole credential source) and stay visible otherwise"
         );
         // password_prompt_hint 属于 2FA 三件套（TOTP 密钥 / OTP 提示词 / 密码
@@ -1216,6 +1367,7 @@ mod tests {
                 .unwrap()["visible_when"],
             serde_json::json!({
                 "all_of": [
+                    { "field": "protocol", "one_of": ["ssh"] },
                     { "field": "sudo_source", "one_of": ["custom", "off"] },
                     { "field": "auth_flow_mode", "one_of": ["password_then_otp", "password_plus_otp"] },
                 ]
@@ -1223,7 +1375,8 @@ mod tests {
             "password_prompt_hint must follow the sudo source and fold with the 2FA trio when OTP auto-answer is off"
         );
         // passphrase_command 只服务密钥解密：密码 / agent 认证下是死 UI，
-        // 需要同时满足高级区与密钥类认证。
+        // 需要同时满足高级区与密钥类认证（Auto 按序回退同样解密密钥，纳入
+        // 密钥类门控）。
         assert_eq!(
             fields
                 .iter()
@@ -1231,8 +1384,9 @@ mod tests {
                 .unwrap()["visible_when"],
             serde_json::json!({
                 "all_of": [
+                    protocol_gate,
                     { "field": "advanced_options", "one_of": ["true"] },
-                    { "field": "authentication", "one_of": ["private-key", "private-key-password"] },
+                    { "field": "authentication", "one_of": ["private-key", "private-key-password", "auto"] },
                 ]
             }),
             "passphrase_command must combine the advanced switch with key-based auth"
@@ -1240,13 +1394,13 @@ mod tests {
         for key in ["totp_secret", "totp_prompt_hint"] {
             assert_eq!(
                 visible_when(key),
-                Some((
-                    "auth_flow_mode".to_string(),
-                    vec![
-                        "password_then_otp".to_string(),
-                        "password_plus_otp".to_string()
+                serde_json::json!({
+                    "all_of": [
+                        protocol_gate,
+                        { "field": "auth_flow_mode", "one_of": ["password_then_otp", "password_plus_otp"] },
                     ]
-                ))
+                }),
+                "{key} must be gated on protocol=ssh + auth_flow_mode OTP auto-answer"
             );
         }
 
@@ -1286,6 +1440,7 @@ mod tests {
             "private-key",
             "private-key-password",
             "agent",
+            "auto",
             "none",
         ] {
             // Name round-trip is a pure enum mapping; credential validation is
@@ -1419,6 +1574,27 @@ mod tests {
         );
         assert_eq!(connection.private_key_path, "C:/keys/id_ed25519");
         assert_eq!(connection.private_key_passphrase, "key-secret");
+    }
+
+    #[test]
+    fn runtime_endpoint_parses_non_ssh_lifecycle_without_ssh_credentials() {
+        let endpoint = RuntimeEndpoint::from_lifecycle_params(&serde_json::json!({
+            "connection": {
+                "id": "telnet-tunnel",
+                "host": "logical.telnet.internal",
+                "port": 23,
+                "external_config": { "protocol": "telnet" }
+            },
+            "runtime": { "host": "127.0.0.1", "port": 39123 }
+        }))
+        .expect("Telnet lifecycle endpoint must not require SSH credentials");
+
+        assert_eq!(endpoint.connection_id, "telnet-tunnel");
+        assert_eq!(endpoint.protocol, "telnet");
+        assert_eq!(endpoint.host, "logical.telnet.internal");
+        assert_eq!(endpoint.port, 23);
+        assert_eq!(endpoint.runtime_host, "127.0.0.1");
+        assert_eq!(endpoint.runtime_port, 39123);
     }
 
     #[test]
@@ -2395,6 +2571,15 @@ mod manifest_contract_tests {
                 serde_json::json!({}),
                 AuthenticationMethod::Agent,
             ),
+            // Auto 按序回退不要求任何前置凭据：密码/私钥缺失只是对应阶段
+            // 被跳过（回退链里的既有记录），解析层必须接受零凭据组合。
+            (
+                "auto",
+                None,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                AuthenticationMethod::Auto,
+            ),
             (
                 "none",
                 None,
@@ -2789,6 +2974,7 @@ mod manifest_contract_tests {
             "trigger_answer_2",
         ];
         let config_keys = [
+            "protocol",
             "authentication",
             "private_key_path",
             "agent_socket",
@@ -2811,6 +2997,18 @@ mod manifest_contract_tests {
             "auth_flow_mode",
             "password_prompt_hint",
             "totp_prompt_hint",
+            // M32-B：serial/rdp 连接配置由前端 openSession 路由读取（不进
+            // StoredConnection 凭据解析），但同为 external_config 键面。
+            "serial_port",
+            "serial_baud",
+            "serial_data_bits",
+            "serial_parity",
+            "serial_stop_bits",
+            "serial_backspace",
+            "rdp_domain",
+            "rdp_resolution",
+            "rdp_certificate_policy",
+            "rdp_clipboard",
         ];
         let mut seen_secret: Vec<String> = Vec::new();
         let mut seen_config: Vec<String> = Vec::new();
@@ -2856,38 +3054,45 @@ mod manifest_contract_tests {
     /// the connection's own values still serve login-time 2FA.
     #[test]
     fn quick_sudo_visibility_pairing() {
+        // 协议门控（M9）把 SSH 字段的 visible_when 升级为 all_of（protocol=ssh
+        // 叠加原条件）；断言改为在全部子句中查找目标门控字段。
+        fn gated_on_one_of(entry: &Value, condition: &str, target: &str) -> Option<Vec<String>> {
+            let condition_value = &entry[condition];
+            let mut clauses: Vec<&Value> = Vec::new();
+            if condition_value.get("field").is_some() {
+                clauses.push(condition_value);
+            }
+            clauses.extend(condition_value["all_of"].as_array()?.iter());
+            for clause in clauses {
+                if clause["field"].as_str() == Some(target) {
+                    return Some(
+                        clause["one_of"]
+                            .as_array()?
+                            .iter()
+                            .map(|value| value.as_str().unwrap_or_default().to_string())
+                            .collect(),
+                    );
+                }
+            }
+            None
+        }
         for key in ["sudo_password", "sudo_use_pty"] {
             let entry = field(key);
             assert_eq!(
-                condition_field(&entry, "visible_when"),
-                Some("sudo_source"),
-                "{key} must be gated on sudo_source"
-            );
-            assert_eq!(
-                condition_one_of(&entry, "visible_when"),
+                gated_on_one_of(&entry, "visible_when", "sudo_source"),
                 Some(vec!["custom".to_string()]),
-                "{key} must be visible only while sudo_source is custom"
+                "{key} must be gated on sudo_source=custom (protocol gate stacks alongside)"
             );
         }
         let profile = field("sudo_profile");
         assert_eq!(
-            condition_field(&profile, "visible_when"),
-            Some("sudo_source"),
-            "sudo_profile must be gated on sudo_source"
-        );
-        assert_eq!(
-            condition_one_of(&profile, "visible_when"),
+            gated_on_one_of(&profile, "visible_when", "sudo_source"),
             Some(vec!["global".to_string()]),
-            "sudo_profile must be visible only while sudo_source is global"
+            "sudo_profile must be gated on sudo_source=global"
         );
         let key = "auth_flow_mode";
         assert_eq!(
-            condition_field(&field(key), "visible_when"),
-            Some("sudo_source"),
-            "{key} must be gated on sudo_source"
-        );
-        assert_eq!(
-            condition_one_of(&field(key), "visible_when"),
+            gated_on_one_of(&field(key), "visible_when", "sudo_source"),
             Some(vec!["custom".to_string(), "off".to_string()]),
             "{key} must hide under global (profile owns the source) and stay visible for custom/off"
         );
@@ -2898,6 +3103,7 @@ mod manifest_contract_tests {
             field("password_prompt_hint")["visible_when"],
             serde_json::json!({
                 "all_of": [
+                    { "field": "protocol", "one_of": ["ssh"] },
                     { "field": "sudo_source", "one_of": ["custom", "off"] },
                     { "field": "auth_flow_mode", "one_of": ["password_then_otp", "password_plus_otp"] },
                 ]
@@ -2906,11 +3112,7 @@ mod manifest_contract_tests {
         );
         for key in ["totp_secret", "totp_prompt_hint"] {
             assert_eq!(
-                condition_field(&field(key), "visible_when"),
-                Some("auth_flow_mode")
-            );
-            assert_eq!(
-                condition_one_of(&field(key), "visible_when"),
+                gated_on_one_of(&field(key), "visible_when", "auth_flow_mode"),
                 Some(vec![
                     "password_then_otp".to_string(),
                     "password_plus_otp".to_string()
@@ -2925,6 +3127,7 @@ mod manifest_contract_tests {
     fn defaults_match_parser_fallbacks() {
         let expected_defaults: &[(&str, Value)] = &[
             ("display_name", Value::from("SSH server")),
+            ("protocol", Value::from("ssh")),
             ("host", Value::from("127.0.0.1")),
             ("port", Value::from(22)),
             ("username", Value::from("root")),

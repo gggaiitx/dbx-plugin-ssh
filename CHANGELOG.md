@@ -4,6 +4,51 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [Unreleased]
+
+### 新增 / Added（M2 W2b）
+
+- **Docker 管理面板**：`docker/list|logs|action`（白名单 start/stop/restart/kill/rm + 容器 ID hex 门 + 只读连接拒绝 + 审计日志前后落笔）；sudo 回退走 Quick Sudo 管线（密码只走 stdin）；MCP 新增 `docker_list`（只读）与 `docker_action`（destructive 提示）；侧栏面板含 10s 轮询（3 连败停轮询）、日志抽屉、rm/kill 确认框、"在终端打开"剪贴板降级。
+  **Docker management panel:** allow-listed container actions with hex-id gate, read-only refusal and audit trail; sudo fallback via the Quick Sudo pipeline; MCP tools; side panel with polling, log drawer and destructive-action confirms.
+- **watcher 文件自动回传（桌面端）**：`watch/start|stop|stop-all`（notify 非递归 + 会话去重表 + 500ms 去抖 + 启动 2s 抑制窗），len/mtime/SHA256 三元指纹确认内容真变才广播 `watch/file-modified`；会话关闭自动回收。
+  **File watcher (desktop):** notify-based non-recursive watches with session dedup, 500ms debounce, 2s suppression window and len/mtime/SHA256 fingerprints — `watch/file-modified` only fires on real content changes.
+- **OTP 面板**：条目列表 + TOTP 倒计时环形（reused 提示）、HOTP 生成（counter+1 持久化）、扫码导入（图片 base64 → `otp/import-qr` 预填）、新增/编辑（secret 遮蔽，编辑留空保留旧密钥）、连接绑定、发送验证码到终端。
+  **OTP panel:** entry list with countdown, HOTP generation, QR import, masked editing, connection bindings and send-to-terminal.
+- **导入向导**：主文件与可选 WindTerm `user.config` 走有界二进制分块与 ACK 的临时流式预览（64 MiB 总预算、超时/取消即清理），可导出脱敏规范化 JSON；插件不再保存导入会话，密码、私钥内容与口令绝不导出或持久化。
+  **Import wizard:** bounded binary chunks with ACKs provide temporary previews for the main export and optional WindTerm `user.config` (64 MiB total; timeout/cancel cleans up), with sanitized normalized JSON export; imported sessions are never stored and passwords, private-key material and passphrases never leave the sidecar.
+- **终端大输出保护**：写入积压 ≥128KiB 进入 strained（32KiB 分帧、挂起 gutter/高亮扫描），<64KiB 恢复；七语提示。
+  **Large-output protection:** write backlog ≥128KiB strains the terminal (32KiB framing, gutter/highlight scans suspended) until <64KiB; localized notice.
+- **终端右键菜单 + 选中文本在线搜索**：Copy/Paste/搜索引擎列表（可配 `ctx_search_engines`，%s 模板）；宿主 openExternal 缺失时降级复制链接。
+  **Terminal context menu + online search:** copy/paste and configurable search engines (`ctx_search_engines`); falls back to copying the link until the host ships openExternal.
+- **背景图**：`local/wallpaper/get|set|clear`（≤8MiB，png/jpeg/webp 魔数校验，tmp+rename 原子写）；Appearance 设置开关 + 透明度滑杆；开启时挂起 WebGL 回退 DOM 渲染。
+  **Wallpaper:** validated get/set/clear protocol, Appearance toggle with opacity slider; enabling suspends WebGL in favour of DOM rendering.
+
+### 新增 / Added（M2 W2a）
+
+- **OTP 中心化库**：TOTP/HOTP 算法（RFC 4226/6238 向量单测）、`otpauth://` 解析、二维码扫码导入（`rqrr`+`image`，新依赖）、条目库（secret 经 vault 加密落盘）、连接绑定、跨路径共享的 TOTP 防重放缓存；登录/sudo 自动应答取码新增「绑定条目」来源（连接 `totp_secret` 优先级不变）。MCP 无新增工具（`otp/*` 为 workbench 内部协议）。
+  **Centralized OTP library:** TOTP/HOTP with RFC vectors, otpauth:// parsing, QR import (rqrr+image, new deps), encrypted entry store, connection bindings and a shared replay guard; login/sudo auto-answer now consults bound entries after the connection `totp_secret`.
+- **会话导入（Xshell / MobaXterm / WindTerm）**：`.xts`（ZIP+GBK+INI）、`.mxtsessions`（INI 管道格式）、`.sessions`（JSON+PBKDF2-SHA3-512/AES-CBC 主密码解密）解析器；现采用 `import/preview/start|finish|cancel` 临时流式预览与脱敏导出，旧 `import/commit` 与插件私有连接存储已移除；zip-bomb 防护（条目/单条/总量上限）。新依赖 `zip`/`encoding_rs`/`sha3`/`cbc`/`aes`/`pbkdf2`。
+  **Session import:** parsers for Xshell/MobaXterm/WindTerm now use temporary `import/preview/start|finish|cancel` streaming previews and sanitized exports; the old `import/commit` and plugin-private connection storage are removed, with zip-bomb guards retained.
+- **Telnet 会话**（明文协议，UI 提示仅限可信网络）：手写 IAC 协商（WILL/DO/NAWS、跨块状态机、IAC IAC 还原）、回车与 Backspace 模式、Expect 自动登录（复用 triggers 规则解析）、`telnet/start|write|resize|close|list` + `telnet/terminal/out` 帧通道；工作台 "New Telnet session" 入口（与 SSH/本地会话互斥确认后切换）。
+  **Telnet sessions:** hand-rolled IAC negotiation with cross-chunk state machine, enter/backspace modes, Expect auto-login reusing the trigger rule parser, and a workbench entry with mutual-exclusion confirm.
+
+### 新增 / Added
+
+- **终端命令建议浮层**（对标 NyaTerm）：终端内输入时按模糊评分浮出历史/快捷命令建议（↑↓ 选择、Tab 填充、Enter 执行、Esc 关闭）；采集挂接 shell integration 命令标记与命令条执行路径，沿用密钥样过滤，Expect/OTP 注入文本不入库；alternate buffer/pager/抑制程序集（htop/less/man/journalctl/tail -f 等）五门抑制；设置键 `history_suggestions_enabled`（默认开）与长度上下限。
+  **Terminal command suggestions:** fuzzy-scored history/quick-command overlay in the terminal (↑↓ select, Tab fill, Enter run, Esc dismiss); collection hooks shell-integration command markers and the command bar, reuses the secret-like filter, and never records Expect/OTP injected text; suppressed in alternate buffers, pagers and a suppressive-program set; new `history_suggestions_enabled` and length-limit preferences.
+
+- **动作链接**（默认关闭，对标 NyaTerm）：识别终端输出中的 IPv4、`host:port` 与压缩包文件名并加下划线，点击把建议命令（`ping`/`nc -vz`/`unzip` 等）填入输入行而不执行；三类匹配器独立开关；与既有 IP/关键词高亮让位共存。
+  **Action links (off by default):** underline IPv4, host:port and archive names in terminal output; clicking fills the suggested command (`ping`/`nc -vz`/`unzip`…) into the input line without running it; three matcher toggles; yields to the existing keyword/IP highlights.
+
+- **行号/时间戳 gutter**（默认关闭，对标 NyaTerm）：终端左缘行号列与行首写时间戳列（回车重盖当前行），格式串可配（`[HH:mm:ss]` 默认，token 化）；wrapped 行只标首行，alternate buffer 隐藏，读不到渲染尺寸时整体降级隐藏。
+  **Line-number / timestamp gutter (off by default):** left gutter with line numbers and first-write timestamps (Enter restamps the current line), configurable token-based format; wrapped lines mark their first row only, hidden in the alternate buffer, degrades gracefully.
+
+- **GPU / Ascend NPU 监控**（对标 NyaTerm）：`ssh_metrics` 新增 `gpu`/`npu` sections——NVIDIA 经 `nvidia-smi`（利用率/显存/温度/功耗/风扇/pstate + 计算进程按 uuid 归卡），Ascend 经 `npu-smi info`（AI Core/HBM/健康度/功耗 + CANN 版本从安装元数据读取）；MCP `ssh_metrics` 自动受益；监控面板新增卡片区（警戒色阈值、空进程态、不可用弱化提示）。
+  **GPU / Ascend NPU monitoring:** `ssh_metrics` gains `gpu`/`npu` sections — NVIDIA via nvidia-smi (utilization/memory/temp/power/fan/pstate plus compute processes keyed by uuid), Ascend via npu-smi info (AI Core/HBM/health/power with the CANN version read from install metadata); the MCP tool benefits automatically and the metrics panel renders per-device cards with warning colours and graceful unavailable states.
+
+- **传输并发与重复目标策略**：上传并发可配置（`transfer_concurrency`，1–10 默认 3，暂停占位/取消释放槽位）；远端同名文件按 `transfer_duplicate_policy` 处理——自动改名（默认，`name(1)..name(999)` 经新 `sftp/rename-unique`）/覆盖/逐个询问（支持应用到全部）。
+  **Transfer concurrency and duplicate policy:** configurable upload concurrency (`transfer_concurrency`, 1–10, default 3; paused transfers keep their slot, cancelled release it); remote name clashes follow `transfer_duplicate_policy` — auto-rename (default, via the new `sftp/rename-unique`), overwrite, or per-batch ask with apply-to-all.
+
 ## [0.6.0] — 2026-09-22
 
 0.6.0 正式版，收束 0.6.0-beta.1–4 的全部变更。
