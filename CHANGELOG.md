@@ -4,6 +4,11 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
+## [Unreleased]
+
+- **dock「+」启动项重构为「本地终端」可折叠分组**：`local/terminal/launch-options` 返回的每一项携带 `group` 本地化标签——首项为默认 Shell 启动项（描述展示解析后的默认 Shell，`localShell` 偏好优先），其余为本机扫描到的 shell 子项（`context` 固定 `shell` 程序）；宿主渲染为单个可折叠「本地终端」分组，与下方连接分组同一交互。
+  **Dock "+" launch options reworked into a collapsible "Local terminal" group:** every entry now carries a localized `group` label — the first entry launches with the resolved default shell (shown in its description, `localShell` preference first) followed by one entry per machine-scanned shell; the host renders them as one collapsible section matching the connection groups below.
+
 ## [0.7.1-beta.7] — 2026-09-27
 
 - **统一终端文案并本地化工作台标签**：sidecar 错误文案去掉「SSH terminal」式旧称（如 `SSH terminal is closed` → `Terminal is closed`、`Failed to open SSH terminal channel` → `Failed to open terminal channel`）；工作台标签标题改为跟随界面语言（中文环境显示「终端」，此前为静态英文 Terminal）。

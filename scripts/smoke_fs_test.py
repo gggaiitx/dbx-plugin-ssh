@@ -1565,26 +1565,33 @@ def main() -> None:
         report.run("ssh/recording start/stop/list/get/delete", "ssh/recording/start",
                    case_recording_flow)
 
-        # -- dock「+」launch-options 单项契约 group ------------------------------
-        # 宿主侧 options_action 下发 locale；launch-options 只回一项
-        # 「本地终端」，描述带解析后的默认 Shell（localShell 偏好
-        # 优先，否则自动探测链）。不走 SSH 连接，任意环境可跑。
-        def case_launch_options_single_entry():
-            """launch-options returns exactly one localized local-terminal entry."""
+        # -- dock「+」launch-options 本地终端分组 group -------------------------
+        # 宿主侧 options_action 下发 locale；launch-options 返回「本地终端」
+        # 分组：默认项（描述带解析后的默认 Shell，localShell 偏好优先，否则自
+        # 动探测链）+ 扫描到的 shell 子项，所有项共享同一 group 标签。不走
+        # SSH 连接，任意环境可跑。
+        def case_launch_options_local_terminal_group():
+            """launch-options returns a localized local-terminal group."""
             options = req("local/terminal/launch-options", {"locale": "zh-CN"})
             entries = options.get("entries") or []
-            assert len(entries) == 1, f"expected single entry, got {len(entries)}"
+            assert len(entries) >= 1, "expected at least the default entry"
             first = entries[0]
             assert first.get("label") == "本地终端", first.get("label")
             description = first.get("description") or ""
             assert description.startswith("默认 Shell："), description
             assert len(description) > len("默认 Shell："), "default shell program missing"
             assert first.get("context", {}).get("plugin", {}).get("mode") == "local-terminal"
+            # 所有项共享同一分组标签，宿主渲染为单个可折叠「本地终端」组。
+            for entry in entries:
+                assert entry.get("group") == "本地终端", entry.get("group")
+            # shell 子项在 context 里固定 shell 程序。
+            for entry in entries[1:]:
+                assert (entry.get("context", {}).get("plugin", {}) or {}).get("shell"), entry
             legacy = req("local/terminal/launch-options", {})
             assert (legacy.get("entries") or [{}])[0].get("label") == "Local terminal"
 
-        report.run("local/terminal/launch-options single localized entry", "local/terminal/launch-options",
-                   case_launch_options_single_entry)
+        report.run("local/terminal/launch-options local-terminal group", "local/terminal/launch-options",
+                   case_launch_options_local_terminal_group)
 
         # -- M14-M17 编码 / 管线偏好 / MCP 工具面 group ---------------------------
         # 补批次欠账：latin-1 编码族真容器链路（M14/M16/M17）、每连接编码覆盖

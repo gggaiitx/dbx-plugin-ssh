@@ -815,20 +815,30 @@ fn shell_display_name(basename: &str) -> String {
     }
 }
 
-/// Copy for the single launch option, keyed by the host UI locale (the host
+/// Copy for the launch-option group, keyed by the host UI locale (the host
 /// sends it as the `locale` param on `local/terminal/launch-options`). The
 /// table mirrors the workbench locale set (frontend/src/lib/i18n.ts); unknown
-/// or missing locales fall back to English. Returns (label, description
-/// prefix) — the caller appends the resolved default shell program.
-fn launch_option_copy(locale: &str) -> (&'static str, &'static str) {
+/// or missing locales fall back to English. Returns (default entry label,
+/// group label, description prefix) — the caller appends the resolved default
+/// shell program. Every entry (default + discovered shells) carries the same
+/// `group` so the host renders one collapsible "local terminal" section.
+fn launch_option_copy(locale: &str) -> (&'static str, &'static str, &'static str) {
     match locale {
-        "zh-CN" | "zh" => ("本地终端", "默认 Shell："),
-        "zh-TW" => ("本地終端", "預設 Shell："),
-        "ja" => ("ローカルターミナル", "デフォルトシェル: "),
-        "es" => ("Terminal local", "Shell predeterminado: "),
-        "it" => ("Terminale locale", "Shell predefinita: "),
-        "pt-BR" | "pt" => ("Terminal local", "Shell padrão: "),
-        _ => ("Local terminal", "Default shell: "),
+        "zh-CN" | "zh" => ("本地终端", "本地终端", "默认 Shell："),
+        "zh-TW" => ("本地終端", "本地終端", "預設 Shell："),
+        "ja" => (
+            "ローカルターミナル",
+            "ローカルターミナル",
+            "デフォルトシェル: ",
+        ),
+        "es" => ("Terminal local", "Terminal local", "Shell predeterminado: "),
+        "it" => (
+            "Terminale locale",
+            "Terminale locale",
+            "Shell predefinita: ",
+        ),
+        "pt-BR" | "pt" => ("Terminal local", "Terminal local", "Shell padrão: "),
+        _ => ("Local terminal", "Local terminal", "Default shell: "),
     }
 }
 
@@ -857,24 +867,37 @@ pub fn resolve_default_shell(data_dir: &Path) -> String {
 }
 
 impl LocalTerminalRuntime {
-    /// PR-A4 generic launch-options contract (host dock "+"): a single
-    /// local-terminal entry carrying the context fragment the
-    /// host merges into its host-authored panel context. Per-shell picking
-    /// moved into the workbench (shell picker + settings default), so the
-    /// picker stays one row; the resolved default shell is shown in the
-    /// description. Business meaning stays on the plugin side; the host
-    /// renders labels and never interprets the contexts. `locale` is the host
-    /// UI language (the host-side `options_action` contract); older hosts omit
-    /// it and get English.
+    /// PR-A4 generic launch-options contract (host dock "+"): one "local
+    /// terminal" entry using the resolved default shell plus one entry per
+    /// discovered shell, all sharing a `group` label so the host renders a
+    /// single collapsible section. The default entry opens with the
+    /// configured `localShell` preference (auto-detect chain as fallback) —
+    /// resolved by `resolve_default_shell` on the host call path — while the
+    /// per-shell entries pin an explicit shell via their context fragment.
+    /// Business meaning stays on the plugin side; the host renders labels and
+    /// never interprets the contexts. `locale` is the host UI language (the
+    /// host-side `options_action` contract); older hosts omit it and get
+    /// English.
     pub fn launch_options(&self, locale: &str, default_shell: &str) -> Value {
-        let (label, description_prefix) = launch_option_copy(locale);
-        json!({
-            "entries": [{
-                "label": label,
-                "description": format!("{description_prefix}{default_shell}"),
-                "context": { "plugin": { "mode": "local-terminal" } },
-            }],
-        })
+        let (label, group, description_prefix) = launch_option_copy(locale);
+        let mut entries = vec![json!({
+            "label": label,
+            "description": format!("{description_prefix}{default_shell}"),
+            "context": { "plugin": { "mode": "local-terminal" } },
+            "group": group,
+        })];
+        for shell in discover_shells(current_platform()) {
+            if shell.program.is_empty() {
+                continue;
+            }
+            entries.push(json!({
+                "label": shell.name,
+                "description": shell.program,
+                "context": { "plugin": { "mode": "local-terminal", "shell": shell.program } },
+                "group": group,
+            }));
+        }
+        json!({ "entries": entries })
     }
 
     /// Read-only shell inventory for the workbench's shell picker.
@@ -1137,23 +1160,31 @@ mod tests {
         let runtime = LocalTerminalRuntime::new();
         let options = runtime.launch_options("zh-CN", "/bin/zsh");
         let entries = options["entries"].as_array().unwrap();
-        // Per-shell picking moved into the workbench (picker + settings
-        // default): the dock picker stays a single row.
-        assert_eq!(entries.len(), 1);
+        // First entry: the default-shell launcher (configured localShell or
+        // the auto-detect chain, resolved by the caller).
         assert_eq!(entries[0]["label"], "本地终端");
         assert_eq!(entries[0]["description"], "默认 Shell：/bin/zsh");
-        // The context fragment the host merges stays locale-independent.
-        assert_eq!(entries[0]["context"]["plugin"]["mode"], "local-terminal");
+        // Every entry — default plus discovered shells — shares the localized
+        // group label so the host renders one collapsible section.
+        for entry in entries {
+            assert_eq!(entry["group"], "本地终端");
+            assert_eq!(entry["context"]["plugin"]["mode"], "local-terminal");
+        }
+        // Per-shell entries (when discovery found any) pin the shell program
+        // in their context; shell names stay verbatim.
+        for entry in entries.iter().skip(1) {
+            assert!(entry["context"]["plugin"]["shell"].as_str().is_some());
+            assert!(!entry["label"].as_str().expect("label string").is_empty());
+        }
     }
 
     #[test]
     fn launch_options_fall_back_to_english_for_unknown_locale() {
         // Older hosts pass no locale at all (empty string) — same fallback.
         let runtime = LocalTerminalRuntime::new();
-        assert_eq!(
-            runtime.launch_options("ko", "/bin/bash")["entries"][0]["label"],
-            "Local terminal"
-        );
+        let english = runtime.launch_options("ko", "/bin/bash");
+        assert_eq!(english["entries"][0]["label"], "Local terminal");
+        assert_eq!(english["entries"][0]["group"], "Local terminal");
         assert_eq!(
             runtime.launch_options("", "/bin/bash")["entries"][0]["description"],
             "Default shell: /bin/bash"
