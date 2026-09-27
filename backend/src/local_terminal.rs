@@ -385,6 +385,11 @@ fn spawn_pump(
     let writer = Arc::new(Mutex::new(writer));
     tokio::spawn(async move {
         let mut master = Some(master);
+        // Tracked so same-size client resizes can be dropped before ConPTY
+        // (requested_pty_size) and so the CPR handshake answers with the live
+        // viewport, not the spawn-time one.
+        let mut pty_rows = pty_rows;
+        let mut pty_cols = pty_cols;
         let mut closing = false;
         let mut exit_code: Option<Option<u32>> = None;
         let mut handshake_pending = current_platform() == Platform::Windows;
@@ -441,13 +446,12 @@ fn spawn_pump(
                         }
                     }
                     Some(LocalTerminalCommand::Resize { cols, rows }) => {
-                        if let Some(master) = master.as_ref() {
-                            let _ = master.resize(PtySize {
-                                rows: rows.clamp(1, u16::MAX as u32) as u16,
-                                cols: cols.clamp(1, u16::MAX as u32) as u16,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            });
+                        if let Some(size) = requested_pty_size(pty_rows, pty_cols, rows, cols) {
+                            if let Some(master) = master.as_ref() {
+                                let _ = master.resize(size);
+                            }
+                            pty_rows = size.rows;
+                            pty_cols = size.cols;
                         }
                     }
                     Some(LocalTerminalCommand::Close) | None => {
@@ -522,6 +526,31 @@ fn detect_conpty_handshake(scan: &mut Vec<u8>, chunk: &[u8]) -> bool {
 /// The CPR reply ConPTY expects: `CSI rows;cols R` (1-based viewport size).
 fn conpty_cpr_reply(rows: u16, cols: u16) -> Vec<u8> {
     format!("\x1b[{rows};{cols}R").into_bytes()
+}
+
+/// Gates client resize requests before they reach the PTY. ConPTY
+/// re-serializes its whole screen buffer on every ResizePseudoConsole call —
+/// same-size included — and right after spawn that redraw races the shell
+/// banner into a duplicated prompt (an orphan first glyph on top, a banner
+/// copy without it at the viewport bottom). Same-size requests are therefore
+/// dropped; the tracked size doubles as the ConPTY CPR reply source.
+fn requested_pty_size(
+    current_rows: u16,
+    current_cols: u16,
+    rows: u32,
+    cols: u32,
+) -> Option<PtySize> {
+    let rows = rows.clamp(1, u16::MAX as u32) as u16;
+    let cols = cols.clamp(1, u16::MAX as u32) as u16;
+    if rows == current_rows && cols == current_cols {
+        return None;
+    }
+    Some(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
 }
 
 fn unix_now_secs() -> u64 {
@@ -1082,7 +1111,29 @@ mod tests {
     }
 
     #[test]
-    fn launch_options_single_local_terminal_entry_localized() {
+    fn pty_resize_drops_same_size_requests() {
+        assert_eq!(requested_pty_size(32, 120, 32, 120), None);
+        assert_eq!(requested_pty_size(24, 80, 24, 80), None);
+    }
+
+    #[test]
+    fn pty_resize_passes_real_geometry_changes() {
+        let size = requested_pty_size(24, 80, 30, 100).unwrap();
+        assert_eq!((size.rows, size.cols), (30, 100));
+        assert_eq!(requested_pty_size(24, 80, 24, 81).unwrap().cols, 81);
+        assert_eq!(requested_pty_size(24, 80, 25, 80).unwrap().rows, 25);
+    }
+
+    #[test]
+    fn pty_resize_clamps_out_of_range_values() {
+        let size = requested_pty_size(24, 80, 0, 500_000).unwrap();
+        assert_eq!((size.rows, size.cols), (1, u16::MAX));
+        // Clamped onto the current size: nothing reaches the PTY.
+        assert_eq!(requested_pty_size(1, u16::MAX, 0, 500_000), None);
+    }
+
+    #[test]
+    fn launch_options_group_local_terminal_with_discovered_shells() {
         let runtime = LocalTerminalRuntime::new();
         let options = runtime.launch_options("zh-CN", "/bin/zsh");
         let entries = options["entries"].as_array().unwrap();
