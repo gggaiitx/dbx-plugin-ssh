@@ -7715,9 +7715,7 @@ async fn authenticate_auto(
                 Err(error) => record(auto_auth_attempt("keyboard-interactive", error)),
             }
         }
-        Ok(AgentAuthOutcome::Rejected(reason)) => {
-            record(auto_auth_attempt("agent", reason))
-        }
+        Ok(AgentAuthOutcome::Rejected(reason)) => record(auto_auth_attempt("agent", reason)),
         Err(error) => record(auto_auth_attempt("agent", error)),
     }
 
@@ -9944,7 +9942,6 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
         // without S_IFMT bits) must degrade to a file icon, never a folder.
         assert_eq!(classify_entry_kind(FileType::Other), "file");
     }
-
 
     #[test]
     fn test_timeout_message_names_budget_source_and_remedy() {
