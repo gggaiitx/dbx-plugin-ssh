@@ -96,7 +96,9 @@ jobs:
       - name: Assert vendored RDP chain lockstep
         run: python3 scripts/check_vendor_lockstep.py
       - name: Verify vendored RDP provenance registration
-        run: python3 scripts/verify_rdp_vendor_integrity.py
+        # --require-recorded-hashes: 六个 crate 必须登记 tarball + 树双哈希，
+        # 树哈希与实际 vendored 内容逐文件比对（backend/vendor/README.md）。
+        run: python3 scripts/verify_rdp_vendor_integrity.py --require-recorded-hashes
       - run: cargo fmt --manifest-path backend/Cargo.toml --check
       # -D warnings keeps new lints out; a stable-toolchain update that
       # introduces a new lint fails here and is fixed like any other red CI.
@@ -184,6 +186,11 @@ jobs:
         run: |
           python3 scripts/smoke_test.py
           python3 scripts/smoke_fs_test.py
+          # WT-3/WT-4 end-to-end regression: ssh-config import and
+          # same-transport command sessions against the live endpoint
+          # (defaults match the container above; sidecar via DBX_PLUGIN_SIDECAR).
+          python3 scripts/smoke_ssh_config_import.py
+          python3 scripts/smoke_spawn_session_test.py
           # MCP stdio live section: real tools/call round-trips over the
           # container endpoint (test/browse/exec/sftp family/run_bg/metrics/
           # transfer + live enum/pipelining tail).

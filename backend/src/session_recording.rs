@@ -16,6 +16,9 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
 use serde_json::{json, Value};
 
 /// Directory holding the `.cast` files.
@@ -105,9 +108,26 @@ impl SessionRecorder {
         height: u32,
     ) -> Result<Self, String> {
         let dir = recordings_dir(data_dir);
+        // 录像是完整终端输出流（可能含回显的 token / 内联密码），目录与文件
+        // 权限对齐 preferences / otp_store 的 0600 纪律，只留属主可读。
+        #[cfg(unix)]
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+            .map_err(|error| format!("Failed to create recordings directory: {error}"))?;
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("Failed to create recordings directory: {error}"))?;
         let path = dir.join(format!("{recording_id}.cast"));
+        #[cfg(unix)]
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("Failed to create recording file: {error}"))?;
+        #[cfg(not(unix))]
         let file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -532,6 +552,21 @@ mod tests {
         // 目录不存在时安全返回 0。
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(clear_recordings(&dir), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_file_and_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let recorder = SessionRecorder::start(&dir, "rec-perm", "c", "h", "s", 80, 24).unwrap();
+        drop(recorder);
+        // 录像含终端回显的全部输出：文件 0600、目录 0700，与 otp/preferences 同纪律。
+        let meta = std::fs::metadata(recordings_dir(&dir).join("rec-perm.cast")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let dir_meta = std::fs::metadata(recordings_dir(&dir)).unwrap();
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

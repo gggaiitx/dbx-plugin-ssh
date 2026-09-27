@@ -28,6 +28,9 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           python3 scripts/validate_repo.py
+          # Vendored RDP 认证链发布硬门：六个 crate 的双哈希登记 + 树哈希
+          # 与实际内容逐文件比对（backend/vendor/README.md；计划 §6）。
+          python3 scripts/verify_rdp_vendor_integrity.py --require-recorded-hashes
           python3 - "$RELEASE_TAG" <<'PY'
           import json
           import pathlib

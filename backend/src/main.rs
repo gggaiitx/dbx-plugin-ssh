@@ -2479,6 +2479,12 @@ fn spawn_terminal_input_counter() {
                 .map(|since| since.as_secs())
                 .unwrap_or(0);
             let path = plugin_data_dir().join("terminal-input-count.log");
+            // 一次性排障插桩也会常驻生产进程：超限截断（丢弃最旧时序，
+            // 继续追加），避免长期高频使用把日志累积到几十 MB。
+            const DIAG_LOG_LIMIT: u64 = 256 * 1024;
+            if std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0) > DIAG_LOG_LIMIT {
+                let _ = std::fs::remove_file(&path);
+            }
             let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

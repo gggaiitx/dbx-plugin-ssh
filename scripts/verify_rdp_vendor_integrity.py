@@ -9,6 +9,7 @@ an operator to record a source digest after obtaining the original artifact.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -25,6 +26,26 @@ CHAIN = (
     "sspi",
 )
 LICENSE_NAMES = ("LICENSE", "LICENSE-APACHE", "LICENSE-MIT", "COPYING")
+
+
+def tree_digest(crate_dir: Path) -> str:
+    """Deterministic content hash of the vendored tree.
+
+    Files are visited in sorted relative-path order and their bytes are
+    CRLF-normalised before streaming into SHA-256, so the digest is stable
+    across checkouts with different line-ending handling. Any unregistered
+    edit to the tree changes the digest.
+    """
+    digest = hashlib.sha256()
+    files = sorted(path for path in crate_dir.rglob("*") if path.is_file())
+    for path in files:
+        rel = path.relative_to(crate_dir).as_posix()
+        data = path.read_bytes().replace(b"\r\n", b"\n")
+        digest.update(rel.encode())
+        digest.update(b"\0")
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(data)
+    return digest.hexdigest()
 
 
 def manifest_identity(crate: str) -> tuple[str, str]:
@@ -75,8 +96,20 @@ def main() -> int:
         row = registered_row(readme, crate, version)
         if not row:
             errors.append(f"{crate} {version}: missing source registration row")
-        elif not re.search(r"sha256 `[0-9a-f]{64}`", row):
+            continue
+        if not re.search(r"(?<!tree-)sha256 `[0-9a-f]{64}`", row):
             pending_hashes.append(f"{crate} {version}")
+        tree_match = re.search(r"tree-sha256 `([0-9a-f]{64})`", row)
+        if not tree_match:
+            pending_hashes.append(f"{crate} {version} (tree digest)")
+        else:
+            actual_digest = tree_digest(VENDOR / crate)
+            if actual_digest != tree_match.group(1):
+                errors.append(
+                    f"{crate}: vendored tree drifted from the registered tree-sha256 "
+                    f"(registered {tree_match.group(1)[:12]}…, actual {actual_digest[:12]}…) — "
+                    "review the change, then re-register the digest in backend/vendor/README.md"
+                )
         crate_dir = VENDOR / crate
         # ironrdp-client's upstream 0.1.0 package omits license files; the
         # registration documents the same-monorepo license inheritance. Other
@@ -95,7 +128,7 @@ def main() -> int:
         for error in errors:
             print(f"  - {error}", file=sys.stderr)
         return 1
-    print("vendor integrity check PASS (local identity/license/registration checks)")
+    print("vendor integrity check PASS (identity/license/registration + tree digests verified)")
     return 0
 
 

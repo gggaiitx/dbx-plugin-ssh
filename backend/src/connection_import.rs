@@ -26,7 +26,8 @@
 //! - **Termius** export JSON: `hosts` + `groups` / `ssh_configs` /
 //!   `identities` / `keys` under an optional `data` wrapper. Secret fields
 //!   that arrive as encrypted sync blobs (`BA…` base64) are dropped, never
-//!   decrypted; plaintext passwords and PEM private keys are carried over.
+//!   decrypted; plaintext passwords and PEM private keys are only flagged as
+//!   present (`has_secret`) and never carried into the preview model.
 //! - **OpenSSH config** (`~/.ssh/config`, WT-3, the 8th source): plain text.
 //!   `Host` (wildcard patterns carry defaults only and never become entries),
 //!   `Hostname`, `User`, `Port`, `IdentityFile` (the path is mapped, never
@@ -1964,6 +1965,19 @@ fn split_ssh_config_line(line: &str) -> Option<(String, String)> {
 /// Tokenizes the config into top-level blocks. Directives before the first
 /// `Host`/`Match` line land in the implicit global preamble; a `Host` line
 /// with no pattern degrades to an empty block that matches nothing.
+/// Host/Match 行的参数与普通指令同帽：敌意超长模式串截断到上限（按 char
+/// 边界）。块结构必须保留——跳过整块会让后续指令错落到前一个块。
+fn truncate_ssh_config_arg(argument: &str) -> &str {
+    if argument.len() <= MAX_SSH_CONFIG_ARG_BYTES {
+        return argument;
+    }
+    let mut end = MAX_SSH_CONFIG_ARG_BYTES;
+    while !argument.is_char_boundary(end) {
+        end -= 1;
+    }
+    &argument[..end]
+}
+
 fn ssh_config_blocks(text: &str) -> Result<Vec<SshConfigBlock>, String> {
     let mut blocks: Vec<SshConfigBlock> = vec![SshConfigBlock::default()];
     let mut lines = 0usize;
@@ -1979,13 +1993,18 @@ fn ssh_config_blocks(text: &str) -> Result<Vec<SshConfigBlock>, String> {
         };
         match keyword.as_str() {
             "host" => blocks.push(SshConfigBlock {
-                host_patterns: Some(argument.split_whitespace().map(str::to_string).collect()),
+                host_patterns: Some(
+                    truncate_ssh_config_arg(&argument)
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect(),
+                ),
                 match_criteria: None,
                 directives: Vec::new(),
             }),
             "match" => blocks.push(SshConfigBlock {
                 host_patterns: None,
-                match_criteria: Some(parse_ssh_match_criteria(&argument)),
+                match_criteria: Some(parse_ssh_match_criteria(truncate_ssh_config_arg(&argument))),
                 directives: Vec::new(),
             }),
             _ => {
@@ -2114,15 +2133,21 @@ fn ssh_config_candidates(blocks: &[SshConfigBlock]) -> Result<Vec<String>, Strin
             continue;
         };
         for pattern in patterns {
-            if !ssh_concrete_pattern(pattern) || !seen.insert(pattern.clone()) {
-                continue;
+            // OpenSSH treats `Host web1,web2` as a pattern list: split on the
+            // comma so each name becomes its own entry. Without the split the
+            // whole token passes as one "concrete" name and imports a
+            // connection that can never resolve.
+            for part in pattern.split(',') {
+                if !ssh_concrete_pattern(part) || !seen.insert(part.to_string()) {
+                    continue;
+                }
+                if candidates.len() >= MAX_PREVIEW_SESSIONS {
+                    return Err(format!(
+                        "Import exceeds the {MAX_PREVIEW_SESSIONS} session limit"
+                    ));
+                }
+                candidates.push(part.to_string());
             }
-            if candidates.len() >= MAX_PREVIEW_SESSIONS {
-                return Err(format!(
-                    "Import exceeds the {MAX_PREVIEW_SESSIONS} session limit"
-                ));
-            }
-            candidates.push(pattern.clone());
         }
     }
     Ok(candidates)
@@ -2659,8 +2684,12 @@ fn preview_view(index: usize, session: &Value) -> Value {
 }
 
 fn preview_text(value: &str) -> String {
+    // All-source shared exit: hostile config / JSON fields may carry ANSI ESC
+    // sequences; the preview table, the sanitized export JSON and log viewers
+    // are escape-capable downstream consumers, so strip before the length cap.
+    let value = crate::exec::strip_ansi_control_sequences(value);
     if value.len() <= MAX_PREVIEW_TEXT_BYTES {
-        return value.to_string();
+        return value;
     }
     let mut end = MAX_PREVIEW_TEXT_BYTES;
     while !value.is_char_boundary(end) {
@@ -3676,6 +3705,18 @@ mod tests {
     }
 
     #[test]
+    fn sshconfig_comma_separated_host_list_becomes_separate_entries() {
+        // OpenSSH 模式列表最常见的写法：逗号分隔。不拆开会把 "web1,db2"
+        // 整体当成一个具名主机，导入一条必然连不上的坏条目。
+        let config = "Host web1,web2,*.prod,!nope db3\n  User ops\n";
+        let sessions = parse_ssh_config(config).unwrap();
+        let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["web1", "web2", "db3"]);
+        // 两个条目共享同一块内的设置。
+        assert!(sessions.iter().all(|s| s.username == "ops"));
+    }
+
+    #[test]
     fn sshconfig_hostname_tokens_and_negation_patterns() {
         let config = concat!(
             "Host tunnel\n",
@@ -3789,6 +3830,32 @@ mod tests {
                 .count(),
             MAX_SSH_CONFIG_NOTES
         );
+    }
+
+    #[test]
+    fn sshconfig_host_argument_is_capped_and_block_structure_survives() {
+        // 敌意超长 Host 模式串：截断到参数帽，块结构保留——后续指令仍归属
+        // 该块，而不是错落到前一个块（截断的模式匹配不到任何主机，语义
+        // 自然降级为"块保留、模式失效"）。
+        let giant = "x".repeat(MAX_SSH_CONFIG_ARG_BYTES + 1024);
+        let config = format!("Host {giant}\n  Port 2222\n");
+        let blocks = ssh_config_blocks(&config).unwrap();
+        assert_eq!(blocks.len(), 2);
+        let patterns = blocks[1].host_patterns.as_ref().unwrap().join(" ");
+        assert_eq!(patterns.len(), MAX_SSH_CONFIG_ARG_BYTES);
+        assert_eq!(
+            blocks[1].directives,
+            vec![("port".to_string(), "2222".to_string())]
+        );
+    }
+
+    #[test]
+    fn preview_text_strips_ansi_escapes_before_length_cap() {
+        assert_eq!(preview_text("\u{1b}[31mweb-01\u{1b}[0m"), "web-01");
+        assert_eq!(preview_text("plain"), "plain");
+        // 帽在剥除之后计算：剥除后恰好触界的字符串不再截断。
+        let long = format!("{}\u{1b}[0m", "y".repeat(MAX_PREVIEW_TEXT_BYTES));
+        assert_eq!(preview_text(&long), "y".repeat(MAX_PREVIEW_TEXT_BYTES));
     }
 
     #[test]

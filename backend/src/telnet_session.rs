@@ -1218,11 +1218,26 @@ fn spawn_pump(
     });
 }
 
-/// Decodes the `telnet/write` JSON fallback payload.
+/// Hard cap for one `telnet/write` / `telnet/terminal/in/{id}` payload. The
+/// JSON fallback and the binary channel share the base64 path, so the limit
+/// lives here rather than at each call site — the host's frame ceiling is not
+/// a substitute for an input-channel bound of our own.
+pub const WRITE_PAYLOAD_LIMIT: usize = 64 * 1024;
+
+/// Decodes the `telnet/write` JSON fallback payload and the binary
+/// `telnet/terminal/in/{id}` frames.
 pub fn decode_write_payload(data_base64: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::STANDARD
+    let data = base64::engine::general_purpose::STANDARD
         .decode(data_base64.trim())
-        .map_err(|_| "telnet/write: dataBase64 is not valid base64".to_string())
+        .map_err(|_| "telnet/write: dataBase64 is not valid base64".to_string())?;
+    if data.len() > WRITE_PAYLOAD_LIMIT {
+        return Err(format!(
+            "telnet write payload of {} bytes exceeds the {} byte limit",
+            data.len(),
+            WRITE_PAYLOAD_LIMIT
+        ));
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -1795,6 +1810,19 @@ mod tests {
     fn write_payload_requires_base64() {
         assert_eq!(decode_write_payload("aGk=").unwrap(), b"hi");
         assert!(decode_write_payload("!!").is_err());
+    }
+
+    #[test]
+    fn write_payload_enforces_size_limit() {
+        // 边界值通过，超限拒绝——键盘输入的现实尺寸远小于该帽，帽只挡
+        // 异常/恶意的大 payload（对齐 serial 上传分块的 64KiB 纪律）。
+        let boundary = vec![b'a'; WRITE_PAYLOAD_LIMIT];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&boundary);
+        assert_eq!(decode_write_payload(&encoded).unwrap(), boundary);
+        let oversized = vec![b'a'; WRITE_PAYLOAD_LIMIT + 1];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&oversized);
+        let error = decode_write_payload(&encoded).unwrap_err();
+        assert!(error.contains(&WRITE_PAYLOAD_LIMIT.to_string()), "{error}");
     }
 
     #[test]

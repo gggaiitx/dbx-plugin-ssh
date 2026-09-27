@@ -15,3 +15,6 @@
 # Codex planning artifacts
 .zcode/
 .omc/
+
+# AI 会话工件（hook-state / 转录）不入库：曾一次性入库 6.7 万行后被清除
+.mimosa/

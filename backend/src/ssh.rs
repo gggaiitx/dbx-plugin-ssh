@@ -7528,6 +7528,28 @@ fn auto_auth_skip(method: &'static str, detail: String) -> AutoAuthAttempt {
     }
 }
 
+/// Merges one recorded Auto-stage outcome into the attempt list. The same
+/// method can legitimately be recorded more than once: the private-key /
+/// agent partial-success KI continuations plus the dedicated KI stage each
+/// record `keyboard-interactive`. Repeats merge their detail instead of
+/// pushing a duplicate entry, keeping the "one entry per method, in
+/// first-try order" invariant that the aggregated failure message and the
+/// order assertion below rely on.
+fn merge_auto_auth_attempt(attempts: &mut Vec<AutoAuthAttempt>, attempt: AutoAuthAttempt) {
+    if let Some(existing) = attempts
+        .iter_mut()
+        .find(|recorded| recorded.method == attempt.method)
+    {
+        if !attempt.skipped {
+            existing.skipped = false;
+        }
+        existing.detail.push_str("; ");
+        existing.detail.push_str(&attempt.detail);
+    } else {
+        attempts.push(attempt);
+    }
+}
+
 /// Aggregated failure message for the Auto chain: every attempted (or
 /// skipped) method with its reason, in the fixed try order, so a total
 /// failure explains itself instead of surfacing only the last error.
@@ -7603,7 +7625,7 @@ async fn authenticate_auto(
             attempt.detail
         );
         report(&attempt);
-        attempts.push(attempt);
+        merge_auto_auth_attempt(&mut attempts, attempt);
     };
 
     // Stage 1: password.
@@ -11660,6 +11682,79 @@ matrix-ed25519";
                 auto_auth_failure_message(&[]),
                 "SSH authentication failed in Auto mode: no method could be attempted"
             );
+        }
+
+        #[test]
+        fn merge_auto_auth_attempt_keeps_one_entry_per_method_in_try_order() {
+            // 双重 KI 场景（private-key partial-success 续答失败 + agent 续答
+            // 失败 + 专属 KI 阶段 skip）：同 method 必须合并 detail 而不是重复
+            // push，否则"每方法一条、按首试顺序"的不变量（authenticate_auto
+            // 末尾的 debug_assert_eq）在 debug 构建必假，聚合消息也会把同一
+            // 方法列两遍。
+            let mut attempts = Vec::new();
+            merge_auto_auth_attempt(
+                &mut attempts,
+                auto_auth_attempt("password", "rejected by the server".to_string()),
+            );
+            merge_auto_auth_attempt(
+                &mut attempts,
+                auto_auth_attempt("keyboard-interactive", "KI round one rejected".to_string()),
+            );
+            merge_auto_auth_attempt(
+                &mut attempts,
+                auto_auth_skip(
+                    "keyboard-interactive",
+                    "already answered as the MFA follow-up".to_string(),
+                ),
+            );
+            merge_auto_auth_attempt(
+                &mut attempts,
+                auto_auth_attempt("keyboard-interactive", "KI round two rejected".to_string()),
+            );
+            merge_auto_auth_attempt(
+                &mut attempts,
+                auto_auth_attempt("agent", "no SSH Agent identity was accepted".to_string()),
+            );
+
+            let methods: Vec<_> = attempts.iter().map(|attempt| attempt.method).collect();
+            assert_eq!(methods, ["password", "keyboard-interactive", "agent"]);
+            let ki = &attempts[1];
+            assert!(
+                !ki.skipped,
+                "an actual attempt clears the earlier skip mark"
+            );
+            assert_eq!(
+                ki.detail,
+                "KI round one rejected; already answered as the MFA follow-up; KI round two rejected"
+            );
+            // authenticate_auto 末尾的顺序断言在此场景下必须还原成立。
+            assert_eq!(
+                attempts
+                    .iter()
+                    .map(|attempt| attempt.method)
+                    .collect::<Vec<_>>(),
+                AUTO_AUTH_ORDER
+                    .iter()
+                    .filter(|method| attempts.iter().any(|attempt| attempt.method == **method))
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn merge_auto_auth_attempt_appends_new_methods_in_arrival_order() {
+            let mut attempts = Vec::new();
+            merge_auto_auth_attempt(
+                &mut attempts,
+                auto_auth_attempt("keyboard-interactive", "rejected".to_string()),
+            );
+            merge_auto_auth_attempt(
+                &mut attempts,
+                auto_auth_attempt("agent", "no identity".to_string()),
+            );
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[1].method, "agent");
+            assert!(!attempts[1].skipped);
         }
 
         #[test]
