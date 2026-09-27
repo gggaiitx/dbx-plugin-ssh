@@ -808,6 +808,11 @@ pub struct SftpEntry {
     pub owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// russh-sftp decodes names with `from_utf8_lossy`, so a name that the
+    /// server locale cannot express in UTF-8 (GBK bytes etc.) arrives with
+    /// U+FFFD replacement characters; the raw bytes are gone. The UI shows a
+    /// warning instead of pretending the name is intact.
+    pub undecodable: bool,
 }
 
 #[derive(Debug, Deserialize)]

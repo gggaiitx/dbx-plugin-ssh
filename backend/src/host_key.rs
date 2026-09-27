@@ -458,4 +458,91 @@ mod tests {
         // host field looks like a stray marker fragment).
         assert!(verifier.list_known_hosts().unwrap().is_empty());
     }
+
+    /// Builds an in-memory ed25519 key so TOFU tests need no ssh-keygen.
+    fn generated_test_key() -> russh::keys::ssh_key::PublicKey {
+        let private = russh::keys::ssh_key::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        private.public_key().clone()
+    }
+
+    /// Control environment so `check()`'s system-store leg never consults the
+    /// developer's real ~/.ssh/known_hosts (the tempdir HOME makes that path
+    /// missing, matching a fresh machine).
+    struct HomeIsolationGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeIsolationGuard {
+        fn new(home: &std::path::Path) -> Self {
+            let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            let previous = std::env::var_os(var);
+            std::env::set_var(var, home);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeIsolationGuard {
+        fn drop(&mut self) {
+            let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            match &self.previous {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
+
+    #[test]
+    fn check_learn_check_closes_the_trust_loop() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = HomeIsolationGuard::new(home.path());
+        let directory = tempfile::tempdir().unwrap();
+        let verifier = HostKeyVerifier::new(directory.path().join("known_hosts"));
+        let key = generated_test_key();
+
+        // First sight: unknown (electerm's "prompts for an unknown host key
+        // once" precondition).
+        assert_eq!(
+            verifier.check("tofu.test", 2222, &key).unwrap(),
+            HostKeyState::Unknown
+        );
+
+        // Trust-on-first-use records the key, and a second check must now be
+        // Trusted — the "second connection does not prompt again" semantic.
+        verifier.learn("tofu.test", 2222, &key).unwrap();
+        assert_eq!(
+            verifier.check("tofu.test", 2222, &key).unwrap(),
+            HostKeyState::Trusted
+        );
+
+        // The same key under the plugin's canonical port-form must also be
+        // trusted (learn wrote an [host]:port entry for the non-default port).
+        let entries = verifier.list_known_hosts().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host_field, "[tofu.test]:2222");
+    }
+
+    #[test]
+    fn learned_key_mismatch_still_rejects_with_changed_key() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = HomeIsolationGuard::new(home.path());
+        let directory = tempfile::tempdir().unwrap();
+        let verifier = HostKeyVerifier::new(directory.path().join("known_hosts"));
+
+        let trusted_key = generated_test_key();
+        verifier.learn("rotate.test", 22, &trusted_key).unwrap();
+        assert_eq!(
+            verifier.check("rotate.test", 22, &trusted_key).unwrap(),
+            HostKeyState::Trusted
+        );
+
+        // A different key on the same host must surface the changed-key
+        // error (MITM guard) rather than silently falling back to Unknown.
+        let rotated_key = generated_test_key();
+        let error = verifier.check("rotate.test", 22, &rotated_key).unwrap_err();
+        assert!(error.to_string().contains("changed"), "{error}");
+    }
 }

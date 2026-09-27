@@ -344,6 +344,7 @@ fn parse_ls_output(directory: &str, ls_output: &str) -> Vec<SftpEntry> {
         .map(|entry| {
             let path = format!("{}/{}", base, entry.name);
             SftpEntry {
+                undecodable: entry.name.contains('\u{FFFD}'),
                 name: entry.name,
                 uri: sftp_uri(&path),
                 kind: entry.kind,

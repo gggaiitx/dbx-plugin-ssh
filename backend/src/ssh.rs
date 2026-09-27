@@ -14,7 +14,7 @@ use russh::client::{self, AuthResult, Handle};
 use russh::keys::agent::{client::AgentClient, AgentIdentity};
 use russh::keys::ssh_key::HashAlg;
 use russh::keys::{decode_secret_key, key::PrivateKeyWithHashAlg};
-use russh::{ChannelMsg, Disconnect, MethodKind};
+use russh::{ChannelMsg, Disconnect, MethodKind, MethodSet};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
 use serde_json::{json, Value};
@@ -2482,12 +2482,19 @@ impl SshRuntime {
             login_sudo_auth(connection, profile.as_ref())
         };
 
+        // #6（none 广告集前置 reconcile，对抗评审第二期）：none 探测拿到的
+        // 服务器广告集作为后续 password/KI 方法选择的初始门。广告集拿不到
+        // （连接中断等异常形状）时为 None，方法选择回退为逐步广告判定，
+        // 绝不 fail-closed 卡死登录。
+        let advertised_none = advertised_methods(&none);
+
         match connection.authentication {
             AuthenticationMethod::Password => {
                 authenticate_password_or_interactive(
                     &mut session,
                     connection,
                     &orchestration,
+                    advertised_none,
                     &none,
                     &self.prompts,
                 )
@@ -2526,6 +2533,7 @@ impl SshRuntime {
                         &mut session,
                         connection,
                         &orchestration,
+                        advertised_none,
                         &key_result,
                         &self.prompts,
                     )
@@ -2550,8 +2558,8 @@ impl SshRuntime {
                         )
                         .await?;
                     }
-                    AgentAuthOutcome::Rejected => {
-                        return Err("No SSH Agent identity was accepted".to_string());
+                    AgentAuthOutcome::Rejected(reason) => {
+                        return Err(reason);
                     }
                 }
             }
@@ -3946,6 +3954,14 @@ impl SshRuntime {
         }
     }
 
+    /// russh-sftp decodes names with from_utf8_lossy, so a non-UTF-8 server
+    /// locale (GBK etc.) arrives here with U+FFFD replacement chars. Flag the
+    /// entry instead of pretending the name is intact; the raw bytes are gone
+    /// and no client-side codec can recover them.
+    fn entry_has_undecodable_name(name: &str) -> bool {
+        name.contains('\u{FFFD}')
+    }
+
     pub async fn sftp_list_path(
         &self,
         session_id: &str,
@@ -3980,6 +3996,7 @@ impl SshRuntime {
                     (None, None)
                 };
                 SftpEntry {
+                    undecodable: Self::entry_has_undecodable_name(&entry.file_name()),
                     name: entry.file_name(),
                     uri: sftp_uri(&entry.path()),
                     kind,
@@ -6460,6 +6477,50 @@ fn method_offered(result: &AuthResult, kind: MethodKind) -> bool {
     }
 }
 
+/// Extracts the server's method advertisement from a rejection. An empty set
+/// carries no information — russh also produces one when the transport dies
+/// mid-probe — and maps to `None` so callers fail open instead of gating on a
+/// phantom restriction.
+fn advertised_methods(result: &AuthResult) -> Option<&MethodSet> {
+    match result {
+        AuthResult::Failure {
+            remaining_methods, ..
+        } if !remaining_methods.is_empty() => Some(remaining_methods),
+        _ => None,
+    }
+}
+
+/// Merges the leading none probe's advertisement with the advertisement of
+/// the immediately preceding auth step and decides whether `wanted` may still
+/// be attempted (Tabby authMethodSelection parity, second phase of the
+/// none-probe rollout): a method only stays on the menu while both
+/// advertisements list it — the stricter of the two wins, so a server that
+/// narrows its advertisement mid-negotiation can never be blind-tried into
+/// MaxAuthTries. A missing none advertisement (abnormal shape, see
+/// [`advertised_methods`]) fails open to the per-step gate.
+fn reconcile_advertised(
+    advertised_none: Option<&MethodSet>,
+    step_offered: &AuthResult,
+    wanted: MethodKind,
+) -> bool {
+    let none_still_offers = advertised_none.is_none_or(|set| set.contains(&wanted));
+    none_still_offers && method_offered(step_offered, wanted)
+}
+
+/// Failure text for the "neither password nor keyboard-interactive" gate.
+/// When the none probe's advertisement is known it is appended so the error
+/// names what the server actually allows (publickey-only hosts, for one).
+fn advertisement_rejection_message(advertised_none: Option<&MethodSet>) -> String {
+    let message = "SSH server did not advertise password or keyboard-interactive authentication; refusing to send the password".to_string();
+    match advertised_none {
+        Some(set) if !set.is_empty() => {
+            let names: Vec<&str> = set.iter().map(<&'static str>::from).collect();
+            format!("{message} (server advertises: {})", names.join(", "))
+        }
+        _ => message,
+    }
+}
+
 /// True when the server accepted the preceding step but demands another
 /// authentication method before letting the session in — the shape koko (and
 /// PAM 2FA stacks in general) uses for "password/publickey accepted, now send
@@ -6478,16 +6539,19 @@ fn auth_partial_success(result: &AuthResult) -> bool {
 
 /// Tries password authentication first, then keyboard-interactive. The
 /// `offered` result of the preceding auth attempt tells which methods the
-/// server still accepts. Keyboard-interactive rounds are auto-answered from
+/// server still accepts, reconciled against the leading none probe's
+/// advertisement (`advertised_none` — see [`reconcile_advertised`]).
+/// Keyboard-interactive rounds are auto-answered from
 /// the Quick Sudo orchestration config, covering PAM 2FA/TOTP logins.
 async fn authenticate_password_or_interactive(
     session: &mut Handle<SshClient>,
     connection: &StoredConnection,
     orchestration: &SudoAuth,
+    advertised_none: Option<&MethodSet>,
     offered: &AuthResult,
     prompts: &PromptBroker,
 ) -> Result<(), String> {
-    if method_offered(offered, MethodKind::Password) {
+    if reconcile_advertised(advertised_none, offered, MethodKind::Password) {
         eprintln!("[ssh-trace] auth: password method offered, trying password");
         let result = try_password(session, connection).await?;
         eprintln!(
@@ -6497,7 +6561,7 @@ async fn authenticate_password_or_interactive(
         if result.success() {
             return Ok(());
         }
-        if method_offered(&result, MethodKind::KeyboardInteractive) {
+        if reconcile_advertised(advertised_none, &result, MethodKind::KeyboardInteractive) {
             eprintln!(
                 "[ssh-trace] auth: falling back to keyboard-interactive (partial_success={})",
                 auth_partial_success(&result)
@@ -6516,7 +6580,7 @@ async fn authenticate_password_or_interactive(
         }
         return Err("SSH password authentication was rejected".to_string());
     }
-    if method_offered(offered, MethodKind::KeyboardInteractive) {
+    if reconcile_advertised(advertised_none, offered, MethodKind::KeyboardInteractive) {
         eprintln!("[ssh-trace] auth: keyboard-interactive only, starting");
         // Servers with PasswordAuthentication disabled still accept the
         // password through keyboard-interactive (PAM), including hosts that
@@ -6531,7 +6595,7 @@ async fn authenticate_password_or_interactive(
         .await;
     }
     eprintln!("[ssh-trace] auth: neither password nor keyboard-interactive offered");
-    Err("SSH server did not advertise password or keyboard-interactive authentication; refusing to send the password".to_string())
+    Err(advertisement_rejection_message(advertised_none))
 }
 
 async fn try_password(
@@ -7043,14 +7107,81 @@ fn expand_private_key_path(path: &str) -> PathBuf {
 }
 
 /// Outcome of trying every identity the SSH Agent offers for one connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentAuthOutcome {
     Accepted,
     /// The server accepted an identity but still demands keyboard-interactive
     /// (MFA), so the caller must continue the handshake instead of reporting
     /// "no identity was accepted".
     NeedsKeyboardInteractive,
-    Rejected,
+    /// No identity was accepted; the payload is the rejection reason planned
+    /// by [`plan_agent_identity_attempt`] (first transport error verbatim, or
+    /// the MaxAuthTries budget message).
+    Rejected(String),
+}
+
+/// Plans the next agent-identity attempt against the MaxAuthTries budget.
+/// Budget derivation: OpenSSH MaxAuthTries defaults to 6 *total* failures
+/// including the leading none probe (ssh.rs:2456), so identity attempts
+/// get 5.
+const AGENT_IDENTITY_MAX_ATTEMPTS: usize = 5;
+
+/// Decision of [`plan_agent_identity_attempt`] for the next agent identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentPlan {
+    /// Try the next identity in the queue.
+    TryNext,
+    /// Stop and reject with this message.
+    StopRejection(String),
+    /// Stop because an identity was accepted and the server still demands
+    /// keyboard-interactive (MFA) — the caller must continue the handshake.
+    StopPartialSuccess,
+}
+
+/// Pure planner for the agent-identity loop: decides what to do after one
+/// identity attempt without touching the session or the agent. Drives the
+/// runtime loop in `authenticate_agent`; the tests below fix the contract
+/// (attempt budget, first transport error stops, partial success + KI
+/// advertisement stops).
+///
+/// - A transport-level `last_error` is terminal for *every* identity: all of
+///   them share the same agent handle, so the first failure leaves no
+///   recoverable path and burning further identities just wastes the
+///   MaxAuthTries budget.
+/// - A partial success advertises keyboard-interactive is the koko/PAM 2FA
+///   shape: the identity was accepted and only the second factor is owed, so
+///   trying more identities can never improve the outcome.
+/// - A full rejection just moves to the next identity while budget remains.
+///   During per-identity attempts the server's advertised method set does not
+///   change, so a publickey rejection never implies "publickey withdrawn".
+/// - `AuthResult::Success` never reaches the planner (the caller returns).
+fn plan_agent_identity_attempt(
+    attempts_so_far: usize,
+    last_result: Option<&AuthResult>,
+    last_error: Option<&str>,
+) -> AgentPlan {
+    // The first transport error is final: every remaining identity would
+    // re-dial the same dead agent handle.
+    if let Some(error) = last_error {
+        return AgentPlan::StopRejection(error.to_string());
+    }
+    if let Some(result) = last_result {
+        if auth_partial_success(result) && method_offered(result, MethodKind::KeyboardInteractive) {
+            return AgentPlan::StopPartialSuccess;
+        }
+    }
+    if attempts_so_far >= AGENT_IDENTITY_MAX_ATTEMPTS {
+        // MaxAuthTries is a *total* budget (the leading none probe already
+        // spent one): once the identity budget is exhausted the server has
+        // usually already dropped the connection, and further attempts would
+        // only surface as confusing transport errors.
+        return AgentPlan::StopRejection(
+            "server may have disconnected after too many auth attempts (MaxAuthTries); \
+             consider specifying a private key"
+                .to_string(),
+        );
+    }
+    AgentPlan::TryNext
 }
 
 async fn authenticate_agent(
@@ -7097,8 +7228,38 @@ async fn authenticate_agent(
     let outcome = tokio::time::timeout(
         Duration::from_secs(connection.connect_timeout_secs),
         async {
-            let mut needs_keyboard_interactive = false;
-            for identity in identities {
+            // Planner-driven identity loop: every round consults
+            // [`plan_agent_identity_attempt`] before spending another
+            // MaxAuthTries slot, so a transport error or a partial success
+            // advertising keyboard-interactive stops the queue immediately
+            // instead of burning the remaining budget.
+            let mut attempts: usize = 0;
+            let mut last_result: Option<AuthResult> = None;
+            let mut last_error: Option<String> = None;
+            let mut identities = identities.into_iter();
+            loop {
+                match plan_agent_identity_attempt(
+                    attempts,
+                    last_result.as_ref(),
+                    last_error.as_deref(),
+                ) {
+                    AgentPlan::TryNext => {}
+                    AgentPlan::StopPartialSuccess => {
+                        return AgentAuthOutcome::NeedsKeyboardInteractive;
+                    }
+                    AgentPlan::StopRejection(reason) => {
+                        return AgentAuthOutcome::Rejected(reason);
+                    }
+                }
+                let Some(identity) = identities.next() else {
+                    // The identity queue drained while the planner still said
+                    // TryNext (fewer identities than the budget): keep the
+                    // historical generic rejection text for this shape.
+                    return AgentAuthOutcome::Rejected(
+                        "No SSH Agent identity was accepted".to_string(),
+                    );
+                };
+                attempts += 1;
                 let result = match &identity {
                     AgentIdentity::PublicKey { key, .. } => {
                         session
@@ -7121,21 +7282,14 @@ async fn authenticate_agent(
                             .await
                     }
                 };
-                if let Ok(result) = result {
-                    if result.success() {
-                        return AgentAuthOutcome::Accepted;
-                    }
-                    if auth_partial_success(&result)
-                        && method_offered(&result, MethodKind::KeyboardInteractive)
-                    {
-                        needs_keyboard_interactive = true;
-                    }
+                match result {
+                    Ok(result) if result.success() => return AgentAuthOutcome::Accepted,
+                    Ok(result) => last_result = Some(result),
+                    // Every identity shares one agent handle: the first
+                    // transport error is terminal, and the planner surfaces
+                    // its text verbatim on the next round.
+                    Err(error) => last_error = Some(error.to_string()),
                 }
-            }
-            if needs_keyboard_interactive {
-                AgentAuthOutcome::NeedsKeyboardInteractive
-            } else {
-                AgentAuthOutcome::Rejected
             }
         },
     )
@@ -7441,10 +7595,41 @@ fn resumable_uploads_from(transfer_dir: &Path, live_task_ids: &[String]) -> Vec<
 }
 
 fn remote_transfer_paths(target: &str, task_id: &str) -> Result<(String, String), String> {
-    let (parent, _) = target
+    let (raw_parent, _) = target
         .rsplit_once('/')
         .ok_or("Remote upload path has no parent")?;
-    let parent = if parent.is_empty() { "/" } else { parent };
+    let raw_parent = if raw_parent.is_empty() {
+        "/"
+    } else {
+        raw_parent
+    };
+    // Segment-level `..` convergence (same shape as `normalize_remote_path`):
+    // the `.part`/`.backup` staging files must land in the *resolved* target
+    // directory, or the same-directory atomic rename premise breaks for
+    // traversal-shaped targets (`/data/a/../f.bin` must stage in `/data/`,
+    // not `/data/a/../`). A `..` arriving at the root is dropped, never
+    // escaped; a relative parent that collapses entirely has no anchor left
+    // and is rejected like a bare name (relative staging would depend on the
+    // remote CWD).
+    let absolute = raw_parent.starts_with('/');
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in raw_parent.split('/') {
+        if segment == ".." {
+            // Only a real name segment can be popped; the leading "" of an
+            // absolute path is the root marker and `..` there is discarded.
+            let poppable = !(segments.len() == 1 && segments[0].is_empty());
+            if poppable {
+                segments.pop();
+            }
+        } else {
+            segments.push(segment);
+        }
+    }
+    if !absolute && segments.is_empty() {
+        return Err("Remote upload path has no parent".to_string());
+    }
+    let joined = segments.join("/");
+    let parent: &str = if joined.is_empty() { "/" } else { &joined };
     Ok((
         format!(
             "{}/.dbx-upload-{task_id}.part",
@@ -7861,6 +8046,257 @@ mod tests {
     use super::*;
     use russh::{cipher, kex, mac};
 
+    fn auth_failure(remaining: &[MethodKind], partial_success: bool) -> AuthResult {
+        let mut methods = russh::MethodSet::empty();
+        for kind in remaining {
+            methods.push(*kind);
+        }
+        AuthResult::Failure {
+            remaining_methods: methods,
+            partial_success,
+        }
+    }
+
+    #[test]
+    fn method_offered_reads_only_the_server_advertised_set() {
+        let offered = auth_failure(&[MethodKind::KeyboardInteractive], false);
+        assert!(method_offered(&offered, MethodKind::KeyboardInteractive));
+        // Tabby parity (authMethodSelection): a method the server did not
+        // advertise must never be tried — blind retries trip MaxAuthTries.
+        assert!(!method_offered(&offered, MethodKind::Password));
+        assert!(!method_offered(&offered, MethodKind::PublicKey));
+    }
+
+    #[test]
+    fn method_offered_is_false_for_success_and_empty_advertisements() {
+        assert!(!method_offered(&AuthResult::Success, MethodKind::Password));
+        assert!(!method_offered(
+            &auth_failure(&[], false),
+            MethodKind::KeyboardInteractive
+        ));
+    }
+
+    #[test]
+    fn auth_partial_success_only_fires_when_the_server_flags_it() {
+        // koko / PAM 2FA shape: first factor accepted, second factor demanded.
+        assert!(auth_partial_success(&auth_failure(
+            &[MethodKind::KeyboardInteractive],
+            true
+        )));
+        assert!(!auth_partial_success(&auth_failure(
+            &[MethodKind::Password],
+            false
+        )));
+        assert!(!auth_partial_success(&AuthResult::Success));
+    }
+
+    fn method_set(kinds: &[MethodKind]) -> MethodSet {
+        MethodSet::from(kinds)
+    }
+
+    #[test]
+    fn reconcile_advertised_requires_both_advertisements_to_list_the_method() {
+        // none 探测广告 password + KI；密码步之后服务器只放行 KI（koko
+        // 第一因子已过的形状）：KI 双份广告集都在 → 可试；password 被逐步
+        // 广告集收走 → 不可再试。
+        let none = method_set(&[MethodKind::Password, MethodKind::KeyboardInteractive]);
+        let step = auth_failure(&[MethodKind::KeyboardInteractive], true);
+        assert!(reconcile_advertised(
+            Some(&none),
+            &step,
+            MethodKind::KeyboardInteractive
+        ));
+        assert!(!reconcile_advertised(
+            Some(&none),
+            &step,
+            MethodKind::Password
+        ));
+    }
+
+    #[test]
+    fn reconcile_advertised_lets_the_none_probe_veto_later_methods() {
+        // 严格服务器：none 探测只广告 publickey。即使后续逐步广告集放行
+        // password/KI，也不得盲试 —— Tabby authMethodSelection 语义，防止
+        // 把 MaxAuthTries 预算烧在服务器根本不开的方法上。
+        let none = method_set(&[MethodKind::PublicKey]);
+        let step = auth_failure(
+            &[MethodKind::Password, MethodKind::KeyboardInteractive],
+            false,
+        );
+        assert!(!reconcile_advertised(
+            Some(&none),
+            &step,
+            MethodKind::Password
+        ));
+        assert!(!reconcile_advertised(
+            Some(&none),
+            &step,
+            MethodKind::KeyboardInteractive
+        ));
+    }
+
+    #[test]
+    fn reconcile_advertised_takes_the_stricter_side_on_conflicting_sets() {
+        // 两份广告集互相冲突：none 只广告 password，逐步广告集只广告 KI。
+        // 合并判定必须两边都放行才可试，因此两个方法都被否掉。
+        let none = method_set(&[MethodKind::Password]);
+        let step = auth_failure(&[MethodKind::KeyboardInteractive], true);
+        assert!(!reconcile_advertised(
+            Some(&none),
+            &step,
+            MethodKind::Password
+        ));
+        assert!(!reconcile_advertised(
+            Some(&none),
+            &step,
+            MethodKind::KeyboardInteractive
+        ));
+    }
+
+    #[test]
+    fn reconcile_advertised_fails_open_without_a_none_advertisement() {
+        // 异常形状（拿不到 none 广告集）→ 回退旧行为：只看逐步广告集。
+        let step = auth_failure(&[MethodKind::Password], false);
+        assert!(reconcile_advertised(None, &step, MethodKind::Password));
+        assert!(!reconcile_advertised(
+            None,
+            &step,
+            MethodKind::KeyboardInteractive
+        ));
+        assert!(!reconcile_advertised(
+            None,
+            &AuthResult::Success,
+            MethodKind::Password
+        ));
+    }
+
+    #[test]
+    fn advertised_methods_maps_empty_and_non_failure_shapes_to_none() {
+        // russh 在传输层断开时也回 Failure{空集}：空集信息量为零，必须判为
+        // "无广告集"，否则幽灵限制会把登录 fail-closed 卡死。
+        assert!(advertised_methods(&auth_failure(&[], false)).is_none());
+        assert!(advertised_methods(&AuthResult::Success).is_none());
+        let rejection = auth_failure(&[MethodKind::Password], true);
+        let none = advertised_methods(&rejection)
+            .expect("a non-empty rejection carries the advertisement");
+        assert!(none.contains(&MethodKind::Password));
+    }
+
+    #[test]
+    fn advertisement_rejection_message_keeps_the_base_text_and_appends_the_set() {
+        let base = "SSH server did not advertise password or keyboard-interactive authentication; refusing to send the password";
+        assert_eq!(advertisement_rejection_message(None), base);
+        let none = method_set(&[MethodKind::PublicKey]);
+        let message = advertisement_rejection_message(Some(&none));
+        assert!(
+            message.starts_with(base),
+            "the historical message must stay a prefix: {message}"
+        );
+        assert!(
+            message.contains("publickey"),
+            "the server's advertisement must be named: {message}"
+        );
+    }
+
+    #[test]
+    fn agent_planner_stops_at_the_identity_budget() {
+        // OpenSSH MaxAuthTries defaults to 6 *total* failures including the
+        // leading none probe, so the 5th identity attempt is the last one.
+        let full_rejection = auth_failure(&[MethodKind::PublicKey], false);
+        assert_eq!(
+            plan_agent_identity_attempt(
+                AGENT_IDENTITY_MAX_ATTEMPTS - 1,
+                Some(&full_rejection),
+                None
+            ),
+            AgentPlan::TryNext,
+            "budget not yet exhausted: the next identity may still be tried"
+        );
+        match plan_agent_identity_attempt(AGENT_IDENTITY_MAX_ATTEMPTS, Some(&full_rejection), None)
+        {
+            AgentPlan::StopRejection(message) => assert!(
+                message.contains("server may have disconnected after too many auth attempts (MaxAuthTries)")
+                    && message.contains("consider specifying a private key"),
+                "the budget message must name MaxAuthTries and the private-key workaround: {message}"
+            ),
+            other => panic!("the exhausted budget must stop the loop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_planner_stops_on_partial_success_advertising_keyboard_interactive() {
+        // koko shape: identity accepted, MFA still owed. Advertising
+        // keyboard-interactive while flagging partial success means the
+        // identity landed — more identities could only burn the budget.
+        let partial = auth_failure(&[MethodKind::KeyboardInteractive], true);
+        assert_eq!(
+            plan_agent_identity_attempt(0, Some(&partial), None),
+            AgentPlan::StopPartialSuccess
+        );
+        // Without the KI advertisement (or the partial flag) a rejection is
+        // full: the advertised set does not change between per-identity
+        // attempts, so the planner must not over-read it.
+        let full = auth_failure(&[MethodKind::Password], true);
+        assert_eq!(
+            plan_agent_identity_attempt(0, Some(&full), None),
+            AgentPlan::TryNext
+        );
+        assert_eq!(
+            plan_agent_identity_attempt(0, Some(&partial), None),
+            AgentPlan::StopPartialSuccess
+        );
+        assert_eq!(
+            plan_agent_identity_attempt(
+                0,
+                Some(&auth_failure(&[MethodKind::PublicKey], false)),
+                None
+            ),
+            AgentPlan::TryNext
+        );
+    }
+
+    #[test]
+    fn agent_planner_stops_on_first_transport_error_and_surfaces_it() {
+        // All identities share the same agent handle: after the first
+        // transport error no remaining attempt can recover, and the surfaced
+        // message must carry the original error text.
+        let plan = plan_agent_identity_attempt(
+            1,
+            Some(&auth_failure(&[MethodKind::PublicKey], false)),
+            Some("agent signature request failed: connection reset"),
+        );
+        match plan {
+            AgentPlan::StopRejection(message) => assert_eq!(
+                message, "agent signature request failed: connection reset",
+                "the first error must be surfaced verbatim"
+            ),
+            other => panic!("a transport error must stop the loop, got {other:?}"),
+        }
+        // Even a budget-exhausted plan defers to the concrete error.
+        assert_eq!(
+            plan_agent_identity_attempt(AGENT_IDENTITY_MAX_ATTEMPTS, None, Some("any error")),
+            AgentPlan::StopRejection("any error".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_planner_tries_next_while_budget_remains() {
+        let rejection = auth_failure(&[MethodKind::PublicKey], false);
+        assert_eq!(
+            plan_agent_identity_attempt(0, None, None),
+            AgentPlan::TryNext,
+            "before the first attempt the planner has nothing to stop on"
+        );
+        assert_eq!(
+            plan_agent_identity_attempt(0, Some(&rejection), None),
+            AgentPlan::TryNext
+        );
+        assert_eq!(
+            plan_agent_identity_attempt(AGENT_IDENTITY_MAX_ATTEMPTS - 1, Some(&rejection), None),
+            AgentPlan::TryNext
+        );
+    }
+
     #[test]
     fn upload_progress_payload_marks_the_phase() {
         let staging = upload_progress_payload(
@@ -8026,6 +8462,64 @@ lrwxrwxrwx  1 root root   11 1720000004 link -> notes.txt
         // Missing/unusable type bits (no PERMISSIONS flag, or permissions
         // without S_IFMT bits) must degrade to a file icon, never a folder.
         assert_eq!(classify_entry_kind(FileType::Other), "file");
+    }
+
+    #[test]
+    fn entry_has_undecodable_name_is_false_for_plain_ascii() {
+        // The common case must never be flagged: every regular ASCII name
+        // (and any directory entry from a UTF-8 locale) stays clean.
+        assert!(!SshRuntime::entry_has_undecodable_name("notes.txt"));
+        assert!(!SshRuntime::entry_has_undecodable_name(".bashrc"));
+        assert!(!SshRuntime::entry_has_undecodable_name(""));
+    }
+
+    #[test]
+    fn entry_has_undecodable_name_is_false_for_valid_utf8_names() {
+        // Legitimate multi-byte UTF-8 names must not be misreported — the
+        // check targets U+FFFD, not "non-ASCII".
+        assert!(!SshRuntime::entry_has_undecodable_name("中文目录"));
+        assert!(!SshRuntime::entry_has_undecodable_name("naïve résumé.txt"));
+        assert!(!SshRuntime::entry_has_undecodable_name(
+            "日本語ファイル.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn entry_has_undecodable_name_flags_replacement_characters() {
+        // russh-sftp `from_utf8_lossy` turns GBK bytes into U+FFFD; the raw
+        // bytes are unrecoverable, so the entry must be flagged for the UI.
+        let lossy = String::from_utf8_lossy(&[0xC4, 0xE3, 0xBA, 0xC3]);
+        // Four GBK bytes collapse into replacement characters (lossy decode
+        // may merge or pad depending on the byte run); every char is U+FFFD.
+        assert!(lossy.chars().all(|c| c == '\u{FFFD}'));
+        assert!(!lossy.is_empty());
+        assert!(SshRuntime::entry_has_undecodable_name(&lossy));
+        assert!(SshRuntime::entry_has_undecodable_name(
+            "bad\u{FFFD}name.txt"
+        ));
+        // A single stray byte flags the entry too.
+        let stray = String::from_utf8_lossy(&[0x61, 0xFF, 0x62]).to_string();
+        assert!(SshRuntime::entry_has_undecodable_name(&stray));
+    }
+
+    #[test]
+    fn sftp_entry_serializes_undecodable_as_camel_case() {
+        // Protocol contract: the flag must serialize as `undecodable` (single
+        // word, already camelCase under `rename_all = "camelCase"`).
+        let entry = SftpEntry {
+            name: "x.txt".to_string(),
+            uri: "sftp:/tmp/x.txt".to_string(),
+            kind: "file",
+            size: Some(1),
+            modified_at: None,
+            permissions: None,
+            content_type: None,
+            owner: None,
+            group: None,
+            undecodable: true,
+        };
+        let json = serde_json::to_value(&entry).expect("SftpEntry must serialize");
+        assert_eq!(json["undecodable"], serde_json::Value::Bool(true));
     }
 
     #[test]
@@ -8549,6 +9043,73 @@ matrix-ed25519";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// T2d 字段类型错乱矩阵：断电/并发写坏/被外部工具改写的 meta 不得让
+    /// resume 接受错误语义。真实语义（实现决定断言）：
+    /// - `read_upload_meta` 只保证"能解析成 JSON 就返回"——数组/字符串
+    ///   类型的 size 都能读出值，防线在读取方的 `as_str`/`as_u64`；
+    /// - `open_resume_spool` 对类型错乱字段一律拒绝（None/不匹配 → Err），
+    ///   resume 永远不会把字符串 size 当成 0 或静默通过；
+    /// - 截断 JSON 连解析都不过，直接 None。
+    #[test]
+    fn upload_meta_field_corruption_is_rejected_not_misread() {
+        use serde_json::Value;
+        let dir = temp_transfer_dir();
+        let meta_with = |text: &str, name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            read_upload_meta(&path)
+        };
+
+        // size 是字符串："9" ≠ 9（u64），resume 必须拒绝而不是宽容转换。
+        let stringy = meta_with(
+            r#"{"remotePath":"/srv/a.bin","size":"9"}"#,
+            "upload-t-str.json",
+        )
+        .unwrap();
+        assert_eq!(stringy.get("size").and_then(Value::as_u64), None);
+        let runtime = SshRuntime::new(dir.clone());
+        std::fs::write(dir.join("upload-t-str.part"), b"xxxx").unwrap();
+        assert!(runtime.open_resume_spool("t-str", "/srv/a.bin", 9).is_err());
+
+        // offset 字段错乱（负数/字符串）：当前实现把 offset 放在二进制
+        // 分块头部（BE u64），meta 里出现该字段属于垃圾数据，读取方忽略
+        // 它即可——断言 meta 仍能解析且不会被任何字段误升级为合法 resume。
+        let negative = meta_with(
+            r#"{"remotePath":"/srv/a.bin","size":9,"offset":-4}"#,
+            "upload-t-neg.json",
+        )
+        .unwrap();
+        assert_eq!(negative.get("offset").and_then(Value::as_u64), None);
+        // size 为负数同理：JSON 负数不满足 as_u64。
+        let neg_size = meta_with(
+            r#"{"remotePath":"/srv/a.bin","size":-9}"#,
+            "upload-t-negsize.json",
+        )
+        .unwrap();
+        assert_eq!(neg_size.get("size").and_then(Value::as_u64), None);
+
+        // meta 是 JSON 数组而非对象：解析成功但 as_str/as_u64 全部落空，
+        // resumable 扫描与 resume 校验都必须跳过/拒绝。
+        let array = meta_with(r#"["/srv/a.bin",9]"#, "upload-t-arr.json").unwrap();
+        assert!(array.is_array());
+        assert_eq!(array.get("remotePath"), None);
+        std::fs::write(dir.join("upload-t-arr.part"), b"xxxx").unwrap();
+        assert!(runtime.open_resume_spool("t-arr", "/srv/a.bin", 9).is_err());
+
+        // 截断 JSON（写一半断电）：连解析都不过，read_upload_meta 返回
+        // None，resumable 扫描直接跳过。
+        assert!(meta_with(r#"{"remotePath":"/srv/a.bin","size"#, "upload-t-trunc.json").is_none());
+        // resumable 扫描同样只收健康 meta：上述四种坏件全部不出现在清单。
+        std::fs::write(dir.join("upload-t-negsize.part"), b"xxxx").unwrap();
+        std::fs::write(dir.join("upload-t-trunc.part"), b"xxxx").unwrap();
+        let tasks = resumable_uploads_from(&dir, &[]);
+        assert!(
+            tasks.is_empty(),
+            "corrupted metas must not resurface: {tasks:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn resume_spool_validation_matches_meta() {
         let dir = temp_transfer_dir();
@@ -8699,6 +9260,61 @@ matrix-ed25519";
         let (temporary, backup) = remote_transfer_paths("/home/user/file.txt", "task").unwrap();
         assert_eq!(temporary, "/home/user/.dbx-upload-task.part");
         assert_eq!(backup, "/home/user/.dbx-upload-task.backup");
+    }
+
+    /// T2c（Guacamole 路径矩阵）：无论目标形态如何，`.dbx-upload-<id>.part`
+    /// 与 `.backup` 都必须与最终目标**同目录**——原子 rename 只在同目录内
+    /// 可靠（跨目录 rename 会退化为 copy+unlink，或直接失败）。逐项断言
+    /// `.part` 路径的父目录与目标父目录一致，且不含残留尾斜杠（双斜杠
+    /// 会让远端 shell/SFTP 语义产生差异）。
+    #[test]
+    fn transfer_paths_anchor_in_target_directory_for_edge_targets() {
+        let anchored = |target: &str, task: &str| {
+            let (temporary, backup) = remote_transfer_paths(target, task).unwrap();
+            assert!(backup.ends_with(&format!(".dbx-upload-{task}.backup")));
+            assert!(!temporary.contains("//"), "{temporary}");
+            assert!(!backup.contains("//"), "{backup}");
+            temporary
+        };
+        // 根 `/`：rsplit_once('/') 的 parent 是空串，实现回落为 "/"，再经
+        // trim_end_matches('/') 收敛为空串，最终拼成根下的隐藏临时文件。
+        let root = anchored("/", "root");
+        assert_eq!(root, "/.dbx-upload-root.part", "root target stays in /");
+        // 目标带尾斜杠：rsplit_once 丢弃末尾空段，parent 落在 /data/dir
+        // 本身——与目标真实父目录一致，原子 rename 前提成立，且不产生
+        // 双斜杠（`.contains("//")` 断言兜底）。
+        assert_eq!(
+            anchored("/data/dir/", "trail"),
+            "/data/dir/.dbx-upload-trail.part",
+            "trailing slash keeps the temp in the same parent"
+        );
+        // `..` 段：函数入口做段级收敛（与 model::normalize_remote_path 同
+        // 语义），临时件落进**解析后**的目标目录，与最终 rename 目标同目录，
+        // 原子 rename 前提对遍历形态的目标同样成立。
+        let dots = remote_transfer_paths("/data/a/../f.bin", "dots").unwrap();
+        assert_eq!(dots.0, "/data/.dbx-upload-dots.part");
+        // 多级/根级 `..`：收敛到根就停在根，绝不逃逸；相对父目录被弹空
+        // （无锚定目录，落点会依赖远端 CWD）则与裸名一样显式报错。
+        let dots_root = remote_transfer_paths("/data/a/../../f.bin", "dots-root").unwrap();
+        assert_eq!(dots_root.0, "/.dbx-upload-dots-root.part");
+        assert!(remote_transfer_paths("a/../../f.bin", "dots-collapse").is_err());
+        // 目标文件名含空格/引号：文件名只影响 target 自身，不影响临时件
+        // 目录选择；临时件名由 task_id（UUID）构成，天然免于引号/空格注入。
+        assert_eq!(
+            anchored("/data/my file\"it's\".bin", "quoted"),
+            "/data/.dbx-upload-quoted.part"
+        );
+        assert_eq!(
+            anchored("/data/quote'.bin", "single"),
+            "/data/.dbx-upload-single.part"
+        );
+    }
+
+    /// 缺父目录形态的拒绝路径：没有 `/` 的裸名没有父目录，无法落临时件，
+    /// 必须显式报错而不是拼出相对路径（相对路径会依赖远端 CWD，不可控）。
+    #[test]
+    fn transfer_paths_reject_parentless_targets() {
+        assert!(remote_transfer_paths("bare-name.bin", "t").is_err());
     }
 
     /// `sudo/profiles/options` backs the connection form's dynamic dropdown:
@@ -9555,6 +10171,9 @@ matrix-ed25519";
         enum Shape {
             /// 开放 password 方法：密码通过后 partial success → KI 问 MFA（koko 默认）。
             PasswordThenMfa,
+            /// 开放 password 方法：密码全拒（无 partial success）→ KI 仍问
+            /// MFA（PAM 栈不置 partial_success 位的形状）。
+            PasswordRejectedThenMfa,
             /// 只开放 keyboard-interactive：KI 第一轮问密码，第二轮问 MFA（PAM 风格）。
             KiPasswordThenMfa,
             /// 只开放 keyboard-interactive：只问 MFA（反问顺序主机）。
@@ -9565,7 +10184,10 @@ matrix-ed25519";
 
         impl Shape {
             fn allows_password_method(self) -> bool {
-                self == Shape::PasswordThenMfa
+                matches!(
+                    self,
+                    Shape::PasswordThenMfa | Shape::PasswordRejectedThenMfa
+                )
             }
         }
 
@@ -9665,6 +10287,11 @@ matrix-ed25519";
                 password: &str,
             ) -> Result<Auth, Self::Error> {
                 if password != LOGIN_PASSWORD {
+                    return Ok(Auth::reject());
+                }
+                if self.shape == Shape::PasswordRejectedThenMfa {
+                    // 全拒形状：第一因子从未通过（无 partial success），但
+                    // 服务器仍把 keyboard-interactive 列为可继续的方法。
                     return Ok(Auth::reject());
                 }
                 // koko: 第一因子通过 → PartialSuccessError，下一步
@@ -10295,6 +10922,44 @@ matrix-ed25519";
             server.abort();
             result.expect("global-profile connection must answer login MFA");
             assert_eq!(answers.lock().unwrap().as_slice(), [MFA_CODE.to_string()]);
+        }
+
+        /// 密码被全拒（无 partial success）且服务器仍广告 keyboard-interactive：
+        /// KI 以 `first_factor_accepted=true`（无条件 seed，ssh.rs 密码编排回退
+        /// 分支）起步——PAM 形状的服务器根本不置 partial_success 位，若改成
+        /// 严格判定（按 partial_success seed），OTP 提问将无人应答、会话晾死。
+        /// 对抗评审 #7 的固化测试：改 seed 语义前必须先让本用例失败。
+        #[tokio::test]
+        async fn password_full_rejection_still_seeds_first_factor_for_ki() {
+            let (port, answers, server) = spawn_mock_koko(
+                Shape::PasswordRejectedThenMfa,
+                MFA_INSTRUCTION,
+                MFA_QUESTION,
+            )
+            .await;
+            let runtime = test_runtime();
+            // 提交错误密码：mock 全拒（Auth::reject()，不置 partial_success），
+            // 但 keyboard-interactive 仍在服务器的可继续方法集里。
+            let mut connection = koko_connection(
+                port,
+                json!({ "totp_secret": MFA_CODE }),
+                json!({
+                    "authentication": "password",
+                    "auth_flow_mode": "password_then_otp",
+                }),
+            );
+            connection.password = "definitely-wrong".to_string();
+
+            let result = runtime.connect_headless(&connection).await;
+            server.abort();
+            result.expect(
+                "a full password rejection must still seed the KI first factor so the MFA question is answered",
+            );
+            assert_eq!(
+                answers.lock().unwrap().as_slice(),
+                [MFA_CODE.to_string()],
+                "the OTP question must be answered even though the password step fully failed"
+            );
         }
 
         /// 私钥被接受、服务器还要 MFA：以前直接报 "private-key authentication
