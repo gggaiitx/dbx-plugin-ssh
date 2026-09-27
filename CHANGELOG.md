@@ -6,6 +6,10 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 
 ## [Unreleased]
 
+## [0.7.1-beta.4] — 2026-09-27
+
+Tabby / NetCatty 五协议对标批（协议处理加固 + 测试面扩容，后端 617 / 前端 646 单测 + 8 个真机 smoke 全绿；对标与决策记录见 `docs/TABBY_PROTOCOL_PARITY.zh-CN.md`、`docs/AUTH_ADVERSARIAL_REVIEW.zh-CN.md`）。
+
 ### 新增 / Added（M2 W2b）
 
 - **Docker 管理面板**：`docker/list|logs|action`（白名单 start/stop/restart/kill/rm + 容器 ID hex 门 + 只读连接拒绝 + 审计日志前后落笔）；sudo 回退走 Quick Sudo 管线（密码只走 stdin）；MCP 新增 `docker_list`（只读）与 `docker_action`（destructive 提示）；侧栏面板含 10s 轮询（3 连败停轮询）、日志抽屉、rm/kill 确认框、"在终端打开"剪贴板降级。
@@ -49,11 +53,7 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 - **传输并发与重复目标策略**：上传并发可配置（`transfer_concurrency`，1–10 默认 3，暂停占位/取消释放槽位）；远端同名文件按 `transfer_duplicate_policy` 处理——自动改名（默认，`name(1)..name(999)` 经新 `sftp/rename-unique`）/覆盖/逐个询问（支持应用到全部）。
   **Transfer concurrency and duplicate policy:** configurable upload concurrency (`transfer_concurrency`, 1–10, default 3; paused transfers keep their slot, cancelled release it); remote name clashes follow `transfer_duplicate_policy` — auto-rename (default, via the new `sftp/rename-unique`), overwrite, or per-batch ask with apply-to-all.
 
-## [0.7.1-beta.4] — 2026-09-27
-
-Tabby / NetCatty 五协议对标批（协议处理加固 + 测试面扩容，后端 617 / 前端 646 单测 + 8 个真机 smoke 全绿；对标与决策记录见 `docs/TABBY_PROTOCOL_PARITY.zh-CN.md`、`docs/AUTH_ADVERSARIAL_REVIEW.zh-CN.md`）。
-
-### 新增 / Added
+### 新增 / Added（五协议对标批）
 
 - **Agent 认证预算计划器**：agent 密钥逐个尝试现在受预算约束（默认 5 次——OpenSSH `MaxAuthTries` 默认 6 次含 none 探测），服务器已示意 keyboard-interactive（partial success）时立即转入 MFA 应答而不再烧掉剩余尝试名额；传输层错误首个即停，错误原文直接呈现，预算耗尽时提示改用指定私钥，不再只给笼统的"身份被拒"。
   **Agent auth budget planner:** identity attempts are now budgeted (5 by default — OpenSSH's `MaxAuthTries` of 6 includes the leading none probe), a partial-success nudge toward keyboard-interactive switches to MFA answering immediately instead of burning remaining attempts, the first transport error stops the loop with its original message, and an exhausted budget suggests pinning a private key instead of a generic rejection.
@@ -71,6 +71,24 @@ Tabby / NetCatty 五协议对标批（协议处理加固 + 测试面扩容，后
 
 - **含 `..` 的上传目标不再落错临时目录**：上传临时件（`.part`/`.backup`)现在与规范化后的最终目标同目录，原子改名前提在所有路径形态下成立；相对路径父目录弹空时显式报错。
   **Upload targets containing `..` stage in the right directory:** upload temporaries (`.part`/`.backup`) now sit next to the normalized final target, keeping the atomic rename precondition for every path shape; relative paths whose parent collapses away fail with an explicit error.
+
+- **会话导入加固**：OpenSSH `Host a,b` 逗号分隔列表拆分为独立条目（此前整体当作一个具名主机，导入必然连不上的坏条目）；预览文本先剥离 ANSI 控制序列再按上限截断；Host/Match 超长参数按字符边界安全截断。
+  **Import hardening:** comma-separated `Host a,b` lists now split into separate entries (previously imported as one unresolvable name); preview text strips ANSI escape sequences before the length cap; overlong Host/Match arguments are truncated on char boundaries.
+- **Auto 认证失败聚合去重**：keyboard-interactive 在 partial-success 续答与专属阶段被多次记录时合并 detail，聚合消息不再重复同一方法，「每方法一条、按首试顺序」不变量在 debug 构建不再假失败。
+  **Auto-auth dedup:** repeated keyboard-interactive records merge their details instead of duplicating entries in the aggregated failure message.
+- **Windows PowerShell 集成脚本兼容 Restricted 策略**：以进程级 `-ExecutionPolicy Bypass` 运行临时目录集成脚本（不改机器/用户策略；组策略强制时保持原 fail-safe 行为）。
+  **PowerShell Restricted-policy compatibility:** the temp-dir integration script now runs with process-scoped `-ExecutionPolicy Bypass`; group-policy-enforced machines keep the previous fail-safe behavior.
+- **安全加固**：终端录像文件 0600 / 目录 0700 落盘（录像含回显输出，对齐 otp_store 纪律）；telnet 写入与二进制输入通道 64KiB 载荷硬帽；终端输入计数诊断日志 256KB 上限截断。
+  **Hardening:** session recordings persist 0600 (dir 0700); telnet input channels cap payloads at 64 KiB; the terminal-input diagnostic log truncates at 256 KiB.
+- `.dbx-store.json` 声明 `host.storage` 与 `host.clipboard:read` 宿主能力。
+  **Store metadata:** declare `host.storage` and `host.clipboard:read` host capabilities.
+
+### 构建 / Build
+
+- **Vendored RDP 链完整性硬门**：`verify_rdp_vendor_integrity.py` 默认比对 vendored 树 tree-sha256；CI 与发布流程启用 `--require-recorded-hashes`（六个 crate 登记 tarball+树双哈希并逐文件比对）；vendor README 回填实际差异面并修正此前「无补丁」的不实声明。
+  **Vendored RDP integrity gate:** tree-digest verification runs by default; CI and release enforce `--require-recorded-hashes` with dual-hash registration and per-file comparison for all six crates; the vendor README records the actual patch surface.
+- CI 冒烟新增 `smoke_ssh_config_import.py` 与 `smoke_spawn_session_test.py`（WT-3/WT-4 端到端回归）。
+  **CI:** add ssh-config import and same-transport spawn-session smoke regressions.
 
 ## [0.6.0] — 2026-09-22
 
