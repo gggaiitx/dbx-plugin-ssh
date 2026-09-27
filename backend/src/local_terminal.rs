@@ -42,6 +42,10 @@ const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Second, shorter window after SIGKILL for the waiter thread to deliver the
 /// status; the child is being reaped either way.
 const LOCAL_KILL_GRACE: Duration = Duration::from_secs(2);
+/// Per-chunk budget for draining the PTY tail after the child is gone; the
+/// reader thread gets this long between chunks before the exited State frame
+/// is published without it.
+const LOCAL_EXIT_DRAIN: Duration = Duration::from_millis(500);
 
 const INTEGRATION_ZSH: &str = include_str!("shell_integration/integration.zsh");
 const INTEGRATION_BASH: &str = include_str!("shell_integration/integration.bash");
@@ -448,10 +452,20 @@ fn spawn_pump(
                     Some(LocalTerminalCommand::Resize { cols, rows }) => {
                         if let Some(size) = requested_pty_size(pty_rows, pty_cols, rows, cols) {
                             if let Some(master) = master.as_ref() {
-                                let _ = master.resize(size);
+                                // Track the size only after a successful resize:
+                                // a failed call would poison the same-size dedup
+                                // and the ConPTY CPR reply, which must answer
+                                // with the live viewport.
+                                if master.resize(size).is_ok() {
+                                    pty_rows = size.rows;
+                                    pty_cols = size.cols;
+                                } else {
+                                    eprintln!(
+                                        "[ssh-sftp-plugin] local terminal resize to {}x{} failed",
+                                        size.cols, size.rows
+                                    );
+                                }
                             }
-                            pty_rows = size.rows;
-                            pty_cols = size.cols;
                         }
                     }
                     Some(LocalTerminalCommand::Close) | None => {
@@ -460,6 +474,9 @@ fn spawn_pump(
                         // history) on their own; killer only after the grace.
                         drop(master.take());
                         closing = true;
+                        // Late/blocked input senders must fail fast instead of
+                        // piling up behind the close grace window.
+                        cmd_rx.close();
                     }
                 },
                 code = exit_rx.recv() => {
@@ -472,6 +489,15 @@ fn spawn_pump(
         // remaining value here unblocks the reader thread even when a
         // background child still holds the slave.
         drop(master);
+        // The exit signal races the reader thread: the child can be reaped
+        // while the PTY's last bytes (final command output, logout message)
+        // are still in flight, so the channel must be drained before the
+        // exited frame — dropping it here would silently lose the tail the
+        // user is waiting to read.
+        while let Ok(Some(data)) = tokio::time::timeout(LOCAL_EXIT_DRAIN, out_rx.recv()).await {
+            publish_local_terminal(&session_id, TerminalStream::Stdout, data, &replay, &emitter)
+                .await;
+        }
         publish_local_terminal(
             &session_id,
             TerminalStream::State,
@@ -540,8 +566,8 @@ fn requested_pty_size(
     rows: u32,
     cols: u32,
 ) -> Option<PtySize> {
-    let rows = rows.clamp(1, u16::MAX as u32) as u16;
-    let cols = cols.clamp(1, u16::MAX as u32) as u16;
+    let rows = rows.clamp(2, u16::MAX as u32) as u16;
+    let cols = cols.clamp(2, u16::MAX as u32) as u16;
     if rows == current_rows && cols == current_cols {
         return None;
     }
@@ -682,7 +708,9 @@ pub struct ShellEntry {
 
 /// Pure core of shell discovery: merge candidate program paths in priority
 /// order (user login shell first, then /etc/shells, then platform defaults),
-/// deduplicating case-insensitively on the basename. `exists` is injected so
+/// deduplicating case-insensitively on the basename and dropping login-unusable
+/// entries (`nologin`/`false` are real files in `/etc/shells` but would exit
+/// immediately). `exists` is injected so
 /// tests can simulate the filesystem.
 fn merge_shell_candidates(
     user_shell: Option<&str>,
@@ -694,7 +722,7 @@ fn merge_shell_candidates(
     let mut ordered: Vec<String> = Vec::new();
     let mut push = |program: &str| {
         let program = program.trim();
-        if program.is_empty() || !exists(program) {
+        if program.is_empty() || !exists(program) || is_login_unusable(program) {
             return;
         }
         let key = shell_basename(program);
@@ -1142,10 +1170,11 @@ mod tests {
 
     #[test]
     fn pty_resize_clamps_out_of_range_values() {
+        // Same 2-row floor as `start` — ConPTY misbehaves on 1-row geometry.
         let size = requested_pty_size(24, 80, 0, 500_000).unwrap();
-        assert_eq!((size.rows, size.cols), (1, u16::MAX));
+        assert_eq!((size.rows, size.cols), (2, u16::MAX));
         // Clamped onto the current size: nothing reaches the PTY.
-        assert_eq!(requested_pty_size(1, u16::MAX, 0, 500_000), None);
+        assert_eq!(requested_pty_size(2, u16::MAX, 0, 500_000), None);
     }
 
     #[test]
@@ -1441,6 +1470,30 @@ mod tests {
     fn shell_discovery_survives_missing_user_shell_and_empty_etc_shells() {
         let merged = merge_shell_candidates(None, &[], &["/bin/bash"], &|p| p == "/bin/bash");
         assert_eq!(merged, vec!["/bin/bash"]);
+    }
+
+    #[test]
+    fn shell_discovery_skips_login_unusable_entries() {
+        // /etc/shells 常见 /sbin/nologin 与 /bin/false：文件存在但不能登录，
+        // 列进选择器就是"点了就闪退"的启动项，必须与 pick_shell 同规则过滤。
+        let exists = |program: &str| {
+            matches!(
+                program,
+                "/bin/bash" | "/sbin/nologin" | "/usr/sbin/false" | "/bin/zsh"
+            )
+        };
+        let merged = merge_shell_candidates(
+            None,
+            &[
+                "/bin/bash".to_string(),
+                "/sbin/nologin".to_string(),
+                "/usr/sbin/false".to_string(),
+                "/bin/zsh".to_string(),
+            ],
+            &[],
+            &exists,
+        );
+        assert_eq!(merged, vec!["/bin/bash", "/bin/zsh"]);
     }
 
     #[test]
