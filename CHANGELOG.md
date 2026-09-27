@@ -4,7 +4,7 @@
 
 This file records user-facing changes for Terminal. Unless noted otherwise, version dates follow the corresponding GitHub Release.
 
-## [Unreleased]
+## [0.7.1-beta.7] — 2026-09-27
 
 - **统一终端文案并本地化工作台标签**：sidecar 错误文案去掉「SSH terminal」式旧称（如 `SSH terminal is closed` → `Terminal is closed`、`Failed to open SSH terminal channel` → `Failed to open terminal channel`）；工作台标签标题改为跟随界面语言（中文环境显示「终端」，此前为静态英文 Terminal）。
   **Unified terminal copy and localized the workbench tab title:** sidecar error strings drop the legacy "SSH terminal" wording (`SSH terminal is closed` → `Terminal is closed`, `Failed to open SSH terminal channel` → `Failed to open terminal channel`); the workbench tab title now follows the UI locale ("终端" in Chinese instead of a static English "Terminal").
