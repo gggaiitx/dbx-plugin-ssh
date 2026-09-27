@@ -24,6 +24,18 @@ export interface TerminalInputQueue {
   reset(): void;
 }
 
+/**
+ * 会话 id → 二进制输入通道。本地 PTY 的会话 id 只登记在 sidecar 的 local
+ * 会话表：误发 `ssh/terminal/in/{id}` 会被 SSH 会话表以
+ * "SSH session was not found or expired" 拒收，每个键入都被吞——本地终端
+ * 打不进字的回归即源于此，通道选择必须按会话身份而不是固定通道。
+ */
+export function terminalInputChannel(sessionId: string, localSessionId: string | undefined): string {
+  if (sessionId.startsWith("telnet:")) return `telnet/terminal/in/${sessionId.slice("telnet:".length)}`;
+  if (localSessionId && sessionId === localSessionId) return `local/terminal/in/${sessionId}`;
+  return `ssh/terminal/in/${sessionId}`;
+}
+
 function writeU64(target: Uint8Array, offset: number, value: number) {
   const view = new DataView(target.buffer, target.byteOffset, target.byteLength);
   view.setBigUint64(offset, BigInt(value), false);

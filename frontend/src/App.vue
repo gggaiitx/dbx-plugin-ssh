@@ -112,7 +112,7 @@ import {
 import { planHostFileDrop } from "./lib/hostFileDrop";
 import { createTerminalWriteThrottle, type TerminalWriteThrottle } from "./lib/terminalWriteThrottle";
 import { createOutputGate } from "./lib/terminalBackpressure";
-import { createTerminalInputQueue } from "./lib/terminalInputQueue";
+import { createTerminalInputQueue, terminalInputChannel } from "./lib/terminalInputQueue";
 import { SERIAL_STREAM_STDIN, isKnownStreamTag, supportsBinaryInput } from "./lib/serialTerminalFrames";
 import { describeReconnectCountdown, describeReconnectRestoredNotice, isConnectionInactiveError, isSessionGoneError, shouldReattachTerminal, terminalReconnectDelay, TERMINAL_RECONNECT_DELAYS, type ReconnectCountdown } from "./lib/terminalReconnect";
 import { classifyConnectError, connectErrorKey } from "./lib/connectError";
@@ -1631,15 +1631,18 @@ if (typeof window !== "undefined") {
 const terminalInputQueue = createTerminalInputQueue({
   send: (sessionId, payload) => {
     terminalDiag.sends += 1;
-    // Telnet 会话以 "telnet:" 前缀进同一串行队列（发送时按前缀拆通道，
-    // 避免异步间隙里模式切换串台）；本地/SSH 会话保持原通道不变。
-    if (sessionId.startsWith("telnet:")) {
-      return window.dbxPlugin.sendBinary(`telnet/terminal/in/${sessionId.slice("telnet:".length)}`, payload);
-    }
-    return window.dbxPlugin.sendBinary(`ssh/terminal/in/${sessionId}`, payload);
+    // 通道按会话身份选择（telnet: 前缀 / 本地会话 / SSH，见
+    // terminalInputChannel）：本地会话误发 ssh 通道会被 sidecar 的 SSH
+    // 会话表拒收，表现为终端看似在线却打不进字。
+    return window.dbxPlugin.sendBinary(terminalInputChannel(sessionId, localSession.value?.sessionId), payload);
   },
   onError: (cause) => {
     terminalDiag.errors += 1;
+    // 本地会话的输入错误（进程退出/会话被回收）直接落退出态，不走 SSH 重连梯子。
+    if (isLocalMode.value) {
+      markLocalExited(null);
+      return;
+    }
     showError(cause, "terminal");
     // 会话被外部杀掉（宿主重推连接的 disconnect、sidecar 重启）时本 tab 无
     // 事件感知，终端看似活着实则打不进字。输入撞上死会话时按传输断开的
@@ -12966,6 +12969,8 @@ onBeforeUnmount(() => {
       :local-download-dir="localDownloadDir"
       :local-can-save="localCanSave"
       :webgl-enabled="webglEnabled"
+      :local-shell="localShellPref"
+      @set-local-shell="setLocalShellPref"
       :terminal-behavior="terminalBehavior"
       :terminal-hotkeys="terminalHotkeys"
       :apple-platform="applePlatform"

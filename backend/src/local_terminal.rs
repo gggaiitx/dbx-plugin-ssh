@@ -786,41 +786,72 @@ fn shell_display_name(basename: &str) -> String {
     }
 }
 
+/// Copy for the single launch option, keyed by the host UI locale (the host
+/// sends it as the `locale` param on `local/terminal/launch-options`). The
+/// table mirrors the workbench locale set (frontend/src/lib/i18n.ts); unknown
+/// or missing locales fall back to English. Returns (label, description
+/// prefix) — the caller appends the resolved default shell program.
+fn launch_option_copy(locale: &str) -> (&'static str, &'static str) {
+    match locale {
+        "zh-CN" | "zh" => ("本地终端（自动检测）", "默认 Shell："),
+        "zh-TW" => ("本地終端（自動偵測）", "預設 Shell："),
+        "ja" => ("ローカルターミナル（自動検出）", "デフォルトシェル: "),
+        "es" => (
+            "Terminal local (detección automática)",
+            "Shell predeterminado: ",
+        ),
+        "it" => (
+            "Terminale locale (rilevamento automatico)",
+            "Shell predefinita: ",
+        ),
+        "pt-BR" | "pt" => ("Terminal local (detecção automática)", "Shell padrão: "),
+        _ => ("Local terminal (auto-detect)", "Default shell: "),
+    }
+}
+
+/// The shell a plain "local terminal" opens with: the configured `localShell`
+/// preference when set, otherwise the same auto-detect chain as
+/// `local/terminal/start` (Directory Services → `$SHELL` → platform default).
+/// Surfaced in the dock picker description; the default itself is set from the
+/// workbench settings dialog (also the shell picker's `localShell` key).
+pub fn resolve_default_shell(data_dir: &Path) -> String {
+    let prefs = crate::preferences::load_preferences(data_dir);
+    let configured = prefs
+        .get("localShell")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if let Some(program) = configured {
+        return program.to_string();
+    }
+    let shell_env = std::env::var("SHELL").ok();
+    pick_shell(
+        None,
+        shell_env.as_deref(),
+        directory_services_shell().as_deref(),
+        current_platform(),
+    )
+    .program
+}
+
 impl LocalTerminalRuntime {
-    /// PR-A4 generic launch-options contract (host dock "+"): returns picker
-    /// entries — auto-detect plus one entry per discovered shell — each carrying
-    /// the context fragment the host merges into its host-authored panel
-    /// context. Business meaning stays on the plugin side; the host renders
-    /// labels and never interprets the contexts.
-    pub fn launch_options(&self) -> Value {
-        let shells = self.shells();
-        let mut entries = Vec::new();
-        entries.push(json!({
-            "label": "Auto-detect shell",
-            "description": "Follow the platform default login shell",
-            "context": { "plugin": { "mode": "local-terminal" } },
-        }));
-        if let Some(list) = shells.get("shells").and_then(|value| value.as_array()) {
-            for shell in list {
-                let program = shell
-                    .get("program")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default();
-                let name = shell
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(program);
-                if program.is_empty() {
-                    continue;
-                }
-                entries.push(json!({
-                    "label": name,
-                    "description": program,
-                    "context": { "plugin": { "mode": "local-terminal", "shell": program } },
-                }));
-            }
-        }
-        json!({ "entries": entries })
+    /// PR-A4 generic launch-options contract (host dock "+"): a single
+    /// "local terminal (auto-detect)" entry carrying the context fragment the
+    /// host merges into its host-authored panel context. Per-shell picking
+    /// moved into the workbench (shell picker + settings default), so the
+    /// picker stays one row; the resolved default shell is shown in the
+    /// description. Business meaning stays on the plugin side; the host
+    /// renders labels and never interprets the contexts. `locale` is the host
+    /// UI language (the host-side `options_action` contract); older hosts omit
+    /// it and get English.
+    pub fn launch_options(&self, locale: &str, default_shell: &str) -> Value {
+        let (label, description_prefix) = launch_option_copy(locale);
+        json!({
+            "entries": [{
+                "label": label,
+                "description": format!("{description_prefix}{default_shell}"),
+                "context": { "plugin": { "mode": "local-terminal" } },
+            }],
+        })
     }
 
     /// Read-only shell inventory for the workbench's shell picker.
@@ -1054,6 +1085,59 @@ mod tests {
     fn conpty_cpr_reply_carries_viewport_size() {
         assert_eq!(conpty_cpr_reply(24, 80), b"\x1b[24;80R".to_vec());
         assert_eq!(conpty_cpr_reply(1, 1), b"\x1b[1;1R".to_vec());
+    }
+
+    #[test]
+    fn launch_options_single_local_terminal_entry_localized() {
+        let runtime = LocalTerminalRuntime::new();
+        let options = runtime.launch_options("zh-CN", "/bin/zsh");
+        let entries = options["entries"].as_array().unwrap();
+        // Per-shell picking moved into the workbench (picker + settings
+        // default): the dock picker stays a single row.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["label"], "本地终端（自动检测）");
+        assert_eq!(entries[0]["description"], "默认 Shell：/bin/zsh");
+        // The context fragment the host merges stays locale-independent.
+        assert_eq!(entries[0]["context"]["plugin"]["mode"], "local-terminal");
+    }
+
+    #[test]
+    fn launch_options_fall_back_to_english_for_unknown_locale() {
+        // Older hosts pass no locale at all (empty string) — same fallback.
+        let runtime = LocalTerminalRuntime::new();
+        assert_eq!(
+            runtime.launch_options("ko", "/bin/bash")["entries"][0]["label"],
+            "Local terminal (auto-detect)"
+        );
+        assert_eq!(
+            runtime.launch_options("", "/bin/bash")["entries"][0]["description"],
+            "Default shell: /bin/bash"
+        );
+    }
+
+    #[test]
+    fn resolve_default_shell_prefers_configured_preference() {
+        let dir =
+            std::env::temp_dir().join(format!("dbx-launch-shell-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create prefs dir");
+        std::fs::write(
+            dir.join("preferences.json"),
+            r#"{"prefs":{"localShell":"/usr/bin/fish"}}"#,
+        )
+        .expect("write prefs");
+        assert_eq!(resolve_default_shell(&dir), "/usr/bin/fish");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_default_shell_falls_back_to_auto_detect_chain() {
+        let dir =
+            std::env::temp_dir().join(format!("dbx-launch-shell-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create empty prefs dir");
+        // No preference file: the chain resolves to something (Directory
+        // Services / $SHELL / platform default — never empty).
+        assert!(!resolve_default_shell(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

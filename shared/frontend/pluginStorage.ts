@@ -36,6 +36,11 @@ export interface PluginKvStoreOptions {
   bridge?: DbxPluginStorageBridge | null;
   /** 注入 localStorage 档；null 强制跳过，undefined 按 guarded window.localStorage 解析。 */
   localStorage?: KvBacking | null;
+  /**
+   * 宿主 init 等待上限（默认 3000ms；测试注入短超时）。仅在未显式注入
+   * bridge 且 window.dbxPlugin 已存在（宿主 iframe）时生效。
+   */
+  initTimeoutMs?: number;
 }
 
 export interface PluginKvStore extends KvBacking {
@@ -44,6 +49,11 @@ export interface PluginKvStore extends KvBacking {
   /** 实际生效通道；"memory" 表示仅会话内有效（无桥且 localStorage 不可用）。 */
   readonly channel: PluginKvChannel;
 }
+
+/** 宿主 SDK 在 init 消息落地时于 document 上派发的事件名（pluginSdkSource 同款）。 */
+const HOST_INIT_EVENT = "dbx-plugin-init";
+/** init 等待上限：宿主正常引导（含 reinit 重推）在数百 ms 内；超时按现状降级。 */
+const HOST_INIT_TIMEOUT_MS = 3000;
 
 interface ResolvedChannels {
   bridge: DbxPluginStorageBridge | null;
@@ -58,6 +68,39 @@ function resolveBridge(): DbxPluginStorageBridge | null {
     /* 无 window（单测 node 环境）：无宿主桥 */
   }
   return null;
+}
+
+/**
+ * 宿主 SDK 的 capabilities 由 init 消息填充，而插件模块的加载早于该消息：
+ * 此刻判定通道会看到 `capabilities.storage === undefined`，把宿主 iframe
+ * 误锁进降级档——主题等偏好读到默认、写入重启即丢（新建/复制会话 tab
+ * 配色被重置的回归根因）。这里等待 init 事件落地后再判定；宿主 API 不
+ * 存在（浏览器直连/单测）时不等待，保持原降级路径零延迟。
+ */
+async function resolveBridgeAfterHostInit(timeoutMs: number): Promise<DbxPluginStorageBridge | null> {
+  const immediate = resolveBridge();
+  if (immediate) return immediate;
+  let hasHostApi = false;
+  try {
+    hasHostApi = !!(window as unknown as { dbxPlugin?: unknown }).dbxPlugin;
+  } catch {
+    hasHostApi = false;
+  }
+  if (!hasHostApi || typeof document === "undefined") return null;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      document.removeEventListener(HOST_INIT_EVENT, onInit);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    const onInit = () => done();
+    document.addEventListener(HOST_INIT_EVENT, onInit);
+  });
+  return resolveBridge();
 }
 
 /** guarded localStorage：opaque origin 下访问即抛，这里把异常折断成 null/忽略。 */
@@ -129,6 +172,15 @@ export function createPluginKvStore(keys: string[], options: PluginKvStoreOption
   };
 
   const ready = (async () => {
+    if (options.bridge === undefined) {
+      // 先等宿主 capabilities（init 消息）落地再锁定通道；resolved 在此
+      // 之前保持未解析，等待完成后一次性写入，后续 ensure() 直接复用。
+      const bridge = await resolveBridgeAfterHostInit(options.initTimeoutMs ?? HOST_INIT_TIMEOUT_MS);
+      resolved = {
+        bridge,
+        fallback: options.localStorage !== undefined ? options.localStorage : resolveFallback(),
+      };
+    }
     const mode = channel();
     if (mode === "localStorage") {
       // 直接 localStorage 档：同步水合（读取已在 ensure() 时验证可用）。

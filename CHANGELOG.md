@@ -6,6 +6,9 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 
 ## [Unreleased]
 
+- **dock「+」启动选项收敛为单项 + 默认 Shell 可配置**：`local/terminal/launch-options` 只返回一项「本地终端（自动检测）」（接受宿主下发的 `locale`，描述展示解析后的默认 Shell；逐 shell 启动入口保留在工作台 shell 选择器）；设置·终端新增「默认 Shell」选择器（`localShell` 偏好，与工具条 shell 选择器同存储键），dock 新开的本地终端按该配置启动。
+  **Dock "+" launch options collapsed to one entry + configurable default shell:** `local/terminal/launch-options` returns a single localized "Local terminal (auto-detect)" entry whose description shows the resolved default shell; Settings · Terminal gains a "Default shell" selector (the `localShell` preference shared with the toolbar shell picker), honored by local terminals opened from the dock.
+
 ## [0.7.1-beta.5] — 2026-09-27
 
 ### 修复 / Fixed
@@ -19,7 +22,6 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 
 - `scripts/sidecar_client.py` Windows 兼容：管道读改线程探活（原 `select()` 在 Windows 管道句柄必然 `WinError 10038`）+ stderr 后台排空（防 sidecar 日志塞满管道缓冲卡死）；`smoke_local_terminal.py` 首次在 Windows 真机全绿。
   **smoke client Windows support:** thread-based readability probing and stderr draining let `smoke_local_terminal.py` pass natively on Windows for the first time.
-
 ## [0.7.1-beta.4] — 2026-09-27
 
 Tabby / NetCatty 五协议对标批（协议处理加固 + 测试面扩容，后端 617 / 前端 646 单测 + 8 个真机 smoke 全绿；对标与决策记录见 `docs/TABBY_PROTOCOL_PARITY.zh-CN.md`、`docs/AUTH_ADVERSARIAL_REVIEW.zh-CN.md`）。

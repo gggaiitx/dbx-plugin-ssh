@@ -535,7 +535,15 @@ impl Plugin {
             // 本地终端 shell 发现：工作台选择器用（多平台 shell 设置）。
             "local/shells/list" => Ok(self.local.shells()),
             // PR-A4 generic launch-options contract: picker entries for the dock "+".
-            "local/terminal/launch-options" => Ok(self.local.launch_options()),
+            // locale = 宿主 UI 语言（宿主侧 options_action 契约；旧宿主不传，回落英文）；
+            // 描述展示解析后的默认 Shell（配置的 localShell 优先，否则自动探测链）。
+            "local/terminal/launch-options" => {
+                let default_shell = local_terminal::resolve_default_shell(&plugin_data_dir());
+                Ok(self.local.launch_options(
+                    params.get("locale").and_then(Value::as_str).unwrap_or(""),
+                    &default_shell,
+                ))
+            }
             // Telnet 会话（明文协议，P2-3）：入口在 SSH 工作台工具栏，用户显
             // 式点击才会创建。IAC 协商/NAWS/Expect 自动登录见 telnet_session.rs；
             // 输入走 `telnet/terminal/in/{id}` 二进制通道，输出走

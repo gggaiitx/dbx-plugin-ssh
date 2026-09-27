@@ -2,7 +2,7 @@
 // import 解析成立，并锁定 pluginStore 的迁键清单（实现与文档只在 shared
 // 维护，通道级行为由适配器保证；这里防的是"新偏好键直写 localStorage
 // 没进 store"与"node 环境默认解析抛错"两类回归）。
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DbxPluginStorageBridge } from "../../../shared/frontend/pluginStorage";
 import { PLUGIN_STORE_KEYS, pluginStore } from "./pluginStore";
 
@@ -86,5 +86,86 @@ describe("ssh pluginStore wiring", () => {
     store.removeItem("ssh-sftp-pane-open");
     await Promise.resolve();
     expect(bridge.map.has("ssh-sftp-pane-open")).toBe(false);
+  });
+});
+
+describe("host init-aware channel resolution", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function stubHostApi(capabilities: Record<string, unknown>) {
+    const initListeners = new Set<(event: Event) => void>();
+    const hostApi: Record<string, unknown> = { capabilities };
+    vi.stubGlobal(
+      "window",
+      Object.assign(Object.create(null), { dbxPlugin: hostApi }),
+    );
+    vi.stubGlobal("document", {
+      addEventListener: (_type: string, listener: (event: Event) => void) => initListeners.add(listener),
+      removeEventListener: (_type: string, listener: (event: Event) => void) => initListeners.delete(listener),
+    });
+    return { hostApi, dispatchInit: () => initListeners.forEach((listener) => listener(new Event("dbx-plugin-init"))) };
+  }
+
+  function bridgeFor(map: Map<string, unknown>): DbxPluginStorageBridge {
+    return {
+      get: async (key) => (map.has(key) ? map.get(key) : null),
+      set: async (key, value) => {
+        map.set(key, value);
+        return null;
+      },
+      delete: async (key) => {
+        map.delete(key);
+        return null;
+      },
+    };
+  }
+
+  it("delays channel resolution until the host init event fills capabilities", async () => {
+    // 回归根因（新建/复制会话 tab 主题被重置）：宿主 SDK 的 capabilities
+    // 由 init 消息填充，插件模块加载即判定通道时它还是空对象——opaque
+    // origin 下又没有 localStorage 可降级，整个 store 被误锁到 memory 档，
+    // 主题等偏好读到默认、写入重启即丢。判定必须等 dbx-plugin-init。
+    const map = new Map<string, unknown>([["ssh-terminal-appearance", "{}"]]);
+    const bridge = bridgeFor(map);
+    const { hostApi, dispatchInit } = stubHostApi({});
+    const { createPluginKvStore } = await import("../../../shared/frontend/pluginStorage");
+    const store = createPluginKvStore(["ssh-terminal-appearance"], { localStorage: null, initTimeoutMs: 50 });
+
+    let ready = false;
+    void store.ready.then(() => (ready = true));
+    await Promise.resolve();
+    expect(ready).toBe(false);
+
+    hostApi.capabilities = { storage: true };
+    hostApi.storage = bridge;
+    dispatchInit();
+    await store.ready;
+
+    expect(store.channel).toBe("host");
+    expect(store.getItem("ssh-terminal-appearance")).toBe("{}");
+  });
+
+  it("falls back to the degraded channel when the host init never lands", async () => {
+    stubHostApi({});
+    const { createPluginKvStore } = await import("../../../shared/frontend/pluginStorage");
+    const store = createPluginKvStore(["ssh-terminal-appearance"], { localStorage: null, initTimeoutMs: 10 });
+    await store.ready;
+    expect(store.channel).toBe("memory");
+  });
+
+  it("does not wait when no host api exists (direct-browser/node)", async () => {
+    vi.stubGlobal("window", Object.assign(Object.create(null), {}));
+    vi.stubGlobal("document", { addEventListener() {}, removeEventListener() {} });
+    const backing = new Map<string, string>([["ssh-terminal-appearance", "{}"]]);
+    const localStorage = {
+      getItem: (key: string) => backing.get(key) ?? null,
+      setItem: (key: string, value: string) => backing.set(key, value),
+      removeItem: (key: string) => backing.delete(key),
+    };
+    const { createPluginKvStore } = await import("../../../shared/frontend/pluginStorage");
+    const store = createPluginKvStore(["ssh-terminal-appearance"], { localStorage });
+    await store.ready;
+    expect(store.channel).toBe("localStorage");
+    expect(store.getItem("ssh-terminal-appearance")).toBe("{}");
   });
 });

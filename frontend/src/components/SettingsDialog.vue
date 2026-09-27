@@ -331,6 +331,8 @@ const props = defineProps<{
   localDownloadDir: string;
   localCanSave: boolean;
   webglEnabled: boolean;
+  /** 本地终端默认 Shell（localShell 偏好，权威态在 App）：只读 + 上抛改动。 */
+  localShell: string;
   /** 终端行为偏好（对标 Tabby「Terminal」页）：权威态在 App，本组件只读 + 上抛增量。 */
   terminalBehavior: TerminalBehaviorSettings;
   /** 终端快捷键绑定（对标 Tabby「Hotkeys」页）：权威态在 App。 */
@@ -408,6 +410,8 @@ const emit = defineEmits<{
   (e: "error", cause: unknown): void;
   (e: "browse-download-dir"): void;
   (e: "update:webgl", value: boolean): void;
+  /** 本地终端默认 Shell 改动：App 落 localShell 偏好（local/preferences/set）。 */
+  (e: "set-local-shell", program: string): void;
   /** 行内 ghost 自动建议开关（组件自治持久化 pluginStore，App 只同步内存态）。 */
   (e: "update:ghostSuggest", value: boolean): void;
   /** 行为设置局部增量：App 侧会归一化 + 持久化 + 即时落地到 xterm 选项。 */
@@ -922,8 +926,33 @@ async function reloadSettings() {
   }
 }
 
+// 本地终端默认 Shell（设置·终端）：下拉项来自 local/shells/list（弹窗打开时
+// 拉一次）；localShell 偏好的权威态在 App，这里经 set-local-shell 上抛。
+// reka Select 不接受空串 value，用哨兵表达「自动检测」。
+const LOCAL_SHELL_AUTO = "__auto__";
+const localShellOptions = ref<Array<{ program: string; name: string; isDefault: boolean; isUserShell: boolean; injectable?: boolean }>>([]);
+const localShellOptionsLoaded = ref(false);
+const localShellModelValue = computed(() => (props.localShell ? props.localShell : LOCAL_SHELL_AUTO));
+function resolveLocalShellValue(value: string): string {
+  return value === LOCAL_SHELL_AUTO ? "" : value;
+}
+async function ensureLocalShellOptions() {
+  if (localShellOptionsLoaded.value) return;
+  localShellOptionsLoaded.value = true;
+  try {
+    const result = await window.dbxPlugin?.invoke<{ shells: typeof localShellOptions.value }>("local/shells/list", {}, { timeoutMs: 10_000 });
+    localShellOptions.value = result?.shells ?? [];
+  } catch {
+    // 旧 sidecar 无 shell 发现能力：下拉只剩自动检测项（与工具条选择器同降级）。
+    localShellOptions.value = [];
+  }
+}
+
 watch(() => props.open, (open) => {
-  if (open) void reloadSettings();
+  if (open) {
+    void reloadSettings();
+    void ensureLocalShellOptions();
+  }
 });
 
 // 弹窗开着时活跃会话切到另一连接：启动命令区按新 connectionId 重新回显。
@@ -1767,6 +1796,19 @@ defineExpose({ consumeInlineEsc, setDownloadDirDraft, setDownloadUseDefaultDraft
               <input type="number" :min="SCROLLBACK_MIN" :max="SCROLLBACK_MAX" step="100" :value="terminalBehavior.scrollbackLines" @change="updateScrollback(numberFieldValue($event))" />
             </label>
             <p class="muted settings-note">{{ t("terminalBehavior.scrollbackHint") }}</p>
+
+            <h3 class="settings-section-title">{{ t("terminalBehavior.localShellSection") }}</h3>
+            <label class="settings-field">
+              <span>{{ t("terminalBehavior.localShell") }}</span>
+              <Select :model-value="localShellModelValue" @update:model-value="(value) => emit('set-local-shell', resolveLocalShellValue(String(value)))">
+                <SelectTrigger size="xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__auto__">{{ t("terminalBehavior.localShellAuto") }}</SelectItem>
+                  <SelectItem v-for="shell in localShellOptions" :key="shell.program" :value="shell.program" :title="shell.program">{{ shell.name === shell.program ? shell.name : `${shell.name} · ${shell.program}` }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <p class="muted settings-note">{{ t("terminalBehavior.localShellHint") }}</p>
 
             <h3 class="settings-section-title">{{ t("terminalBehavior.keyboardSection") }}</h3>
             <label class="settings-field settings-switch-row">

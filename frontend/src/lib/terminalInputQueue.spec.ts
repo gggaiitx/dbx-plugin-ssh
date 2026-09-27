@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createTerminalInputQueue } from "./terminalInputQueue";
+import { createTerminalInputQueue, terminalInputChannel } from "./terminalInputQueue";
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -116,5 +116,23 @@ describe("terminal input queue", () => {
     expect(sent).toHaveLength(1);
     expect(Array.from(sent[0].subarray(1, 9))).toEqual([0, 0, 0, 0, 0, 0, 0, 1]);
     expect(Array.from(sent[0].subarray(9))).toEqual([2]);
+  });
+});
+
+describe("terminal input channel", () => {
+  it("routes the local session to the local input channel", () => {
+    // 本地 PTY 的会话 id 只存在于 sidecar 的 local 会话表：发往 ssh 通道
+    // 会被 SSH 会话表拒绝（"SSH session was not found or expired"），
+    // 每个键入都被吞——本地终端无法输入的回归即源于此。
+    expect(terminalInputChannel("local-1", "local-1")).toBe("local/terminal/in/local-1");
+  });
+
+  it("routes the SSH session to the ssh input channel", () => {
+    expect(terminalInputChannel("ssh-1", "local-1")).toBe("ssh/terminal/in/ssh-1");
+    expect(terminalInputChannel("ssh-1", undefined)).toBe("ssh/terminal/in/ssh-1");
+  });
+
+  it("keeps the telnet prefix on its own channel", () => {
+    expect(terminalInputChannel("telnet:tn-1", "local-1")).toBe("telnet/terminal/in/tn-1");
   });
 });
