@@ -6,6 +6,20 @@ This file records user-facing changes for Terminal. Unless noted otherwise, vers
 
 ## [Unreleased]
 
+## [0.7.1-beta.5] — 2026-09-27
+
+### 修复 / Fixed
+
+- **Windows 孤儿进程根治**：sidecar 死亡（崩溃/更新/宿主退出）时本地终端的 ConPTY conhost + shell 全树由进程级 Job Object（kill-on-close）兜底回收，不再残留烧满核心的孤儿 conhost；挂载失败仅记日志不阻断启动。
+  **Windows orphan reaping:** a process-level kill-on-close Job Object tears down the whole ConPTY conhost + shell tree when the sidecar dies (crash, update, host exit); assignment failure is logged only, never fatal.
+- **本地终端启动不再静默卡死**：`local/terminal/start` 调用补 10s 超时（宿主桥丢响应时 promise 不再永久挂起，超时给出错误提示）；启动中状态新增可见加载覆盖层（此前为零反馈黑屏）；七语文案齐备。
+  **Local terminal start hardening:** 10s timeout on the start invoke (a dropped bridge response no longer pends forever and surfaces an error), a visible starting overlay (previously a silent black screen) and localized copy in all seven languages.
+
+### 冒烟 / Tooling
+
+- `scripts/sidecar_client.py` Windows 兼容：管道读改线程探活（原 `select()` 在 Windows 管道句柄必然 `WinError 10038`）+ stderr 后台排空（防 sidecar 日志塞满管道缓冲卡死）；`smoke_local_terminal.py` 首次在 Windows 真机全绿。
+  **smoke client Windows support:** thread-based readability probing and stderr draining let `smoke_local_terminal.py` pass natively on Windows for the first time.
+
 ## [0.7.1-beta.4] — 2026-09-27
 
 Tabby / NetCatty 五协议对标批（协议处理加固 + 测试面扩容，后端 617 / 前端 646 单测 + 8 个真机 smoke 全绿；对标与决策记录见 `docs/TABBY_PROTOCOL_PARITY.zh-CN.md`、`docs/AUTH_ADVERSARIAL_REVIEW.zh-CN.md`）。
