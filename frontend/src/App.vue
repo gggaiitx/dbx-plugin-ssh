@@ -6124,9 +6124,12 @@ function scanHighlightRange(start: number, end: number) {
       if (highlightDecorationCount >= HIGHLIGHT_DECORATION_LIMIT) break;
       const decoration = term.registerDecoration({ marker, x: match.start, width: match.end - match.start });
       if (decoration) {
-        // xterm 5 的 DOM renderer 不应用 registerDecoration 的 backgroundColor
-        // 选项（与 @xterm/addon-search 同因），着色走 onRender 自绘元素样式。
-        // 装饰层在文字层上方，必须用半透明填充——纯色会把字形整个盖住。
+        // xterm 6 的 DOM renderer 仍不把 registerDecoration 的 backgroundColor
+        // 选项应用到 cell（且 CM_RGB 路径会丢 alpha，实心色会盖字形），着色继续
+        // 走 onRender 在 overlay 元素上半透明自绘。注意 overlay 元素由
+        // BufferDecorationRenderer 在渲染刷新帧里创建：窗口被遮挡/rAF 冻结期间
+        // 注册的高亮要等下一次刷新帧才显色（可见后一帧内自愈，属显示时序而非
+        // 逻辑缺陷——逐字符 span 是 cell 层 run 拆分，不代表 decoration 丢失）。
         decoration.onRender((element) => {
           element.style.backgroundColor = highlightFillStyle(match.color);
         });
@@ -7887,6 +7890,15 @@ watch(pathHistoryOpen, (open) => {
 function clearRowSelection() {
   selectedUris.value = [];
   lastClickedUri.value = "";
+}
+
+/** 行宽大于 .file-rows 容器宽时（开满 5 列），mousedown 默认聚焦会把整行
+ *  scrollIntoView 到容器中心——Name 列被挤出视野，双击/右键的第二次点击
+ *  落点随之偏移。阻止行上 mousedown 的默认行为即可消除聚焦滚动；键盘 Tab
+ *  聚焦不走 mousedown，不受影响。重命名输入框需要真实聚焦，放行。 */
+function onFileRowMousedown(event: MouseEvent) {
+  if ((event.target as HTMLElement | null)?.closest(".rename-input")) return;
+  event.preventDefault();
 }
 
 function selectFile(entry: SftpEntry, event?: MouseEvent) {
@@ -10451,6 +10463,9 @@ async function openReplay(item: RecordingSummary) {
         cols: 100,
         rows: 26,
         convertEol: false,
+        // 下方 unicode.activeVersion 属 proposed API；缺此开关会在弹窗打开时
+        // 直接抛 "allowProposedApi option" 错误横幅（与主终端 2391 同因）。
+        allowProposedApi: true,
         theme: terminalTheme(),
         fontFamily: font.fontFamily,
         fontSize: font.fontSize,
@@ -12586,6 +12601,7 @@ onBeforeUnmount(() => {
                 class="file-row"
                 :class="{ selected: selectedPath === entry.uri || selectedUris.includes(entry.uri) }"
                 :style="sftpGridStyle"
+                @mousedown="onFileRowMousedown"
                 @click="selectFile(entry, $event)"
                 @dblclick="openEntry(entry)"
                 @contextmenu="showFileMenu($event, entry)"

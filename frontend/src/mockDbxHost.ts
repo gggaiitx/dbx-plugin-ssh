@@ -514,6 +514,56 @@ const QUICK_COMMANDS_LIMIT = 20;
 const quickCommandsState: { id: string; name: string; command: string; createdAt: number; updatedAt: number }[] = [];
 const settingsState = { quickSudo: true, sudoUsePty: false, sudoPasswordSet: true, totpConfigured: false, authFlowMode: "password_then_otp", passwordPromptHint: "", totpPromptHint: "", agentTerminalMode: "off", rememberedCommands: [] as string[] };
 
+// OTP 条目（otp/*）mock 状态：镜像 sidecar 的脱敏视图形状（hasSecret 不回传
+// secret）与 bindings 映射（connectionId → entryId），防 OTP 面板在可视化
+// 夹具里"保存假成功"。generate 不做真 RFC 6238，用密钥+时间窗的确定性伪码，
+// 剩余秒数按 period 取模，让倒计时环真实走动。
+interface MockOtpEntry {
+  id: string;
+  otpType: "totp" | "hotp";
+  issuer: string;
+  username: string;
+  secret: string;
+  algorithm: string;
+  digits: number;
+  period: number;
+  counter: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+const otpEntriesState: MockOtpEntry[] = [];
+const otpBindingsState: Record<string, string> = {};
+let otpSeq = 0;
+function fakeOtpCode(entry: MockOtpEntry): { code: string; remainingSeconds: number } {
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (entry.otpType === "hotp") {
+    entry.counter = (entry.counter ?? 0) + 1;
+    const material = `${entry.secret}:${entry.counter}`;
+    let h = 2166136261;
+    for (let i = 0; i < material.length; i += 1) {
+      h ^= material.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return { code: String((h >>> 0) % 10 ** entry.digits).padStart(entry.digits, "0"), remainingSeconds: 0 };
+  }
+  const step = Math.floor(nowSec / entry.period);
+  const material = `${entry.secret}:${step}`;
+  let h = 2166136261;
+  for (let i = 0; i < material.length; i += 1) {
+    h ^= material.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return { code: String((h >>> 0) % 10 ** entry.digits).padStart(entry.digits, "0"), remainingSeconds: entry.period - (nowSec % entry.period) };
+}
+
+// SFTP 书签（sftp/bookmarks/*）mock 状态：镜像 lib/sftpBookmarks.ts 的
+// 校验形状（label/path 非空、返回完整 bookmark 记录），防"添加书签"在
+// 夹具里报 invalid bookmark。
+interface MockBookmark { id: string; label: string; path: string; createdAt: number; updatedAt: number }
+const bookmarksState: MockBookmark[] = [];
+let bookmarkSeq = 0;
+
+
 // 关键词高亮规则（ssh/highlightRules/*）mock 状态：镜像 sidecar 存储
 // （highlight-rules.json，0600）的响应形状/上限/默认值语义，并镜像后端
 // 首次初始化播种的 22 条默认规则（highlight_rules::DEFAULT_RULE_SPECS：
@@ -992,9 +1042,15 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
   else if (method === "sftp/read" || method === "sudo/readFile") {
     const readPath = normalizeMockPath(String((params as Record<string, unknown>)?.path || ""));
     const stored = mockFileContents.get(readPath);
+    // 已存在的 0 字节文件（sftp/touch / New file 新建）必须回空内容：
+    // 之前回退到演示脚本，造成"新建空文件 → 打开是 deploy.sh 内容"的假象。
+    const node = findMockNode(readPath);
+    const emptyFile = !!node && node.kind === "file" && node.size === 0 && !stored;
     result = stored
       ? { dataBase64: base64(stored), truncated: false }
-      : { dataBase64: base64(new TextEncoder().encode("#!/usr/bin/env bash\nset -euo pipefail\n\necho deploy\n")), truncated: false };
+      : emptyFile
+        ? { dataBase64: "", truncated: false }
+        : { dataBase64: base64(new TextEncoder().encode("#!/usr/bin/env bash\nset -euo pipefail\n\necho deploy\n")), truncated: false };
   }
   else if (method === "sftp/download/start") {
     const remotePath = normalizeMockPath(String((params as Record<string, unknown>)?.remotePath || "download.bin"));
@@ -1403,6 +1459,98 @@ const invoke: DbxPluginApi["invoke"] = async <T = unknown>(method: string, param
     }
     result = { success: true };
   }
+  else if (method === "otp/list") {
+    result = {
+      entries: otpEntriesState.map(({ secret, ...rest }) => ({ ...rest, hasSecret: secret.length > 0 })),
+      bindings: { ...otpBindingsState },
+    };
+  }
+  else if (method === "otp/save") {
+    const input = (params || {}) as Record<string, unknown>;
+    const id = String(input.id || "");
+    const secret = String(input.secret || "");
+    const digits = Math.min(10, Math.max(4, Number(input.digits) || 6));
+    const period = Math.max(1, Number(input.period) || 30);
+    if (id) {
+      const entry = otpEntriesState.find((item) => item.id === id);
+      if (!entry) throw new Error("otp: no such entry");
+      entry.otpType = input.otpType === "hotp" ? "hotp" : "totp";
+      entry.issuer = String(input.issuer || "");
+      entry.username = String(input.username || "");
+      if (secret) entry.secret = secret;
+      entry.algorithm = String(input.algorithm || "SHA1");
+      entry.digits = digits;
+      entry.period = period;
+      if (input.otpType === "hotp") entry.counter = Number(input.counter) || 0;
+      entry.updatedAt = Math.floor(Date.now() / 1000);
+      result = { entry: { ...entry, secret: undefined, hasSecret: entry.secret.length > 0 } };
+    } else {
+      if (!secret) throw new Error("otp: secret required");
+      const entry: MockOtpEntry = {
+        id: `otp-visual-${++otpSeq}`,
+        otpType: input.otpType === "hotp" ? "hotp" : "totp",
+        issuer: String(input.issuer || ""),
+        username: String(input.username || ""),
+        secret,
+        algorithm: String(input.algorithm || "SHA1"),
+        digits,
+        period,
+        counter: input.otpType === "hotp" ? Number(input.counter) || 0 : null,
+        createdAt: Math.floor(Date.now() / 1000),
+        updatedAt: Math.floor(Date.now() / 1000),
+      };
+      otpEntriesState.push(entry);
+      result = { entry: { id: entry.id, otpType: entry.otpType, issuer: entry.issuer, username: entry.username, hasSecret: true, algorithm: entry.algorithm, digits: entry.digits, period: entry.period, counter: entry.counter } };
+    }
+  }
+  else if (method === "otp/delete") {
+    const id = String((params as Record<string, unknown>)?.id || "");
+    const index = otpEntriesState.findIndex((item) => item.id === id);
+    if (index >= 0) otpEntriesState.splice(index, 1);
+    for (const [connectionId, bound] of Object.entries(otpBindingsState)) {
+      if (bound === id) delete otpBindingsState[connectionId];
+    }
+    result = { deleted: index >= 0 };
+  }
+  else if (method === "otp/generate") {
+    const id = String((params as Record<string, unknown>)?.entryId || "");
+    const entry = otpEntriesState.find((item) => item.id === id);
+    if (!entry) throw new Error("otp: no such entry");
+    result = fakeOtpCode(entry);
+  }
+  else if (method === "otp/bind") {
+    const input = (params || {}) as Record<string, unknown>;
+    otpBindingsState[String(input.connectionId || "")] = String(input.entryId || "");
+    result = { success: true };
+  }
+  else if (method === "otp/unbind") {
+    const connectionId = String((params as Record<string, unknown>)?.connectionId || "");
+    const removed = delete otpBindingsState[connectionId];
+    result = { removed };
+  }
+  else if (method === "otp/import-qr") {
+    // 无真解码器：返回确定性的演示条目草稿，让「导入二维码」在夹具里可走查。
+    result = { otpType: "totp", issuer: "QR Import", label: "QR Import:demo@example.com", secretBase32: "JBSWY3DPEHPK3PXP", algorithm: "SHA1", digits: 6, period: 30, counter: null };
+  }
+  else if (method === "sftp/bookmarks/list") {
+    result = { bookmarks: bookmarksState.map((bookmark) => ({ ...bookmark })) };
+  }
+  else if (method === "sftp/bookmarks/save") {
+    const input = (params || {}) as Record<string, unknown>;
+    const label = String(input.label || "").trim();
+    const path = String(input.path || "").trim();
+    if (!label || !path) throw new Error("sftp/bookmarks/save: label and path are required");
+    const now = Math.floor(Date.now() / 1000);
+    const bookmark: MockBookmark = { id: `bm-visual-${++bookmarkSeq}`, label, path, createdAt: now, updatedAt: now };
+    bookmarksState.push(bookmark);
+    result = { bookmark };
+  }
+  else if (method === "sftp/bookmarks/delete") {
+    const id = String((params as Record<string, unknown>)?.id || "");
+    const index = bookmarksState.findIndex((bookmark) => bookmark.id === id);
+    if (index >= 0) bookmarksState.splice(index, 1);
+    result = { success: true, removed: index >= 0 };
+  }
   else result = { success: true };
   return result as T;
 };
@@ -1464,7 +1612,10 @@ window.dbxPlugin = {
     // 让 WKWebView/Chromium 的按键投递差异可以在无宿主环境下复现。
     if (bytes.byteLength > 8) {
       const echoed = new TextDecoder().decode(bytes.subarray(8));
-      setTimeout(() => emitTerminal(echoed), 12);
+      // 真实 PTY 的 onlcr 会把 \r 转成 \r\n；夹具直发 \r 只会让光标回到行首、
+      // 后续回显互相覆盖（建议命令/批量发送走查时表现为"命令消失"）。
+      const display = echoed.endsWith("\r") ? `${echoed.slice(0, -1)}\r\n` : echoed;
+      setTimeout(() => emitTerminal(display), 12);
     }
   },
   onEvent: (listener) => { eventListeners.add(listener); return () => eventListeners.delete(listener); },
