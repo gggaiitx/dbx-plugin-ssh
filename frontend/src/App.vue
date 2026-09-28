@@ -11003,9 +11003,11 @@ function closeMenus() {
 }
 
 /** document click 收口：reka 菜单/弹层内容 portal 到 body，内部点击会冒泡到
- *  document——旧实现面板上有 @click.stop，内部点击从不触发这里的清扫，保持语义一致。 */
+ *  document——旧实现面板上有 @click.stop，内部点击从不触发这里的清扫，保持语义一致。
+ *  dialog-content 同样排除：模态弹窗（如 Docker 面板的日志抽屉/kill 确认）
+ *  portal 在工具条 popover 之外，点弹窗内部不该把背后的工具条弹层连带收掉。 */
 function onDocumentClickCloseMenus(event: MouseEvent) {
-  if ((event.target as HTMLElement | null)?.closest?.('[data-slot="context-menu-content"], [data-slot="popover-content"]')) return;
+  if ((event.target as HTMLElement | null)?.closest?.('[data-slot="context-menu-content"], [data-slot="popover-content"], [data-slot="dialog-content"]')) return;
   closeMenus();
 }
 

@@ -393,4 +393,37 @@ describe("mockDbxHost fixture", () => {
     await plugin.invoke("ssh/session/open", {});
     expect(events.filter((event) => event.method === "ssh/auth/auto")).toEqual([]);
   });
+
+  // Docker 面板夹具（P2-4 走查）：默认返回容器表（payload 形状与 sidecar
+  // docker/list 契约一致），?docker=off|sudo 两个探针叙事可切换。
+  it("docker family mocks mirror the sidecar payload contract with off/sudo knobs", async () => {
+    const plugin = await loadMock("");
+    const listed = await plugin.invoke("docker/list", {}) as { available: boolean; needsSudo: boolean; containers: Array<Record<string, unknown>> };
+    expect(listed.available).toBe(true);
+    expect(listed.needsSudo).toBe(false);
+    expect(listed.containers.length).toBeGreaterThan(2);
+    for (const key of ["id", "name", "image", "state", "status", "ports", "createdAt"]) {
+      expect(key in listed.containers[0]).toBe(true);
+    }
+    // 状态枚举覆盖：表格状态徽标四色（running/exited/paused/unknown）。
+    expect(new Set(listed.containers.map((row) => row.state))).toEqual(new Set(["running", "exited", "paused"]));
+
+    const logs = await plugin.invoke("docker/logs", { containerId: listed.containers[0].id, tail: 200 }) as { logs: string; container: { health: string } | null };
+    expect(logs.logs.split("\n").length).toBeGreaterThan(3);
+    expect(logs.container?.health).toBe("healthy");
+    // 非法 id 拒绝（与 sidecar 同口径错误文案）。
+    await expect(plugin.invoke("docker/logs", { containerId: "web-nginx" })).rejects.toThrow(/Invalid containerId/);
+    await expect(plugin.invoke("docker/action", { containerId: listed.containers[0].id, action: "exec" })).rejects.toThrow(/Unsupported docker action/);
+    const action = await plugin.invoke("docker/action", { containerId: "d4a7c9f1e2b3", action: "restart" }) as { success: boolean };
+    expect(action.success).toBe(true);
+  });
+
+  it("docker fixture knobs switch the probe narrative (off = missing CLI, sudo = denied socket)", async () => {
+    const off = await (await loadMock("?docker=off")).invoke("docker/list", {}) as { available: boolean; needsSudo: boolean; containers: unknown[] };
+    expect(off).toEqual({ available: false, needsSudo: false, containers: [] });
+    const sudo = await (await loadMock("?docker=sudo")).invoke("docker/list", {}) as { available: boolean; needsSudo: boolean; containers: unknown[] };
+    expect(sudo).toEqual({ available: false, needsSudo: true, containers: [] });
+    // off 叙事下动作直接失败（面板 actionFailed 错误态走查）。
+    await expect((await loadMock("?docker=off")).invoke("docker/action", { containerId: "d4a7c9f1e2b3", action: "stop" })).rejects.toThrow(/docker CLI not found/);
+  });
 });

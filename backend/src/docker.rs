@@ -68,12 +68,9 @@ impl Default for EngineConfig {
 /// quotes, `%`, `&`, `|`, `<`, `>`, `^`, `!`), so the same validated string
 /// can be baked into heredocs, sudo bodies and Windows fallbacks alike.
 fn is_engine_charset(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'.' | b'/' | b'-' | b':' | b'\\')
-        })
+    value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'/' | b'-' | b':' | b'\\')
+    })
 }
 
 /// Validates the `cli` parameter: a binary name (`podman`) or a path
@@ -81,9 +78,7 @@ fn is_engine_charset(value: &str) -> bool {
 /// refused before a command is ever rendered.
 fn validate_cli(cli: &str) -> Result<(), String> {
     if cli.is_empty() || cli.len() > 256 {
-        return Err(format!(
-            "Invalid cli '{cli}': expected 1-256 characters"
-        ));
+        return Err(format!("Invalid cli '{cli}': expected 1-256 characters"));
     }
     if !is_engine_charset(cli) {
         return Err(format!(
@@ -186,7 +181,9 @@ impl EngineConfig {
     pub fn cmd_env_lines(&self) -> String {
         match &self.endpoint {
             None => String::new(),
-            Some(endpoint) => format!("set DOCKER_HOST={endpoint}\r\nset CONTAINER_HOST={endpoint}\r\n"),
+            Some(endpoint) => {
+                format!("set DOCKER_HOST={endpoint}\r\nset CONTAINER_HOST={endpoint}\r\n")
+            }
         }
     }
 
@@ -286,7 +283,11 @@ pub const PATH_PREFIX: &str = concat!(
 /// Elevated logs body for the Quick Sudo retry of `docker/logs`: same
 /// inspect→logs order as [`logs_script`], passed as argv (never stdin, the
 /// password owns it) through `sanitize_sudo_command` by the callers.
-pub fn sudo_logs_body(engine: &EngineConfig, container_id: &str, tail: u64) -> Result<String, String> {
+pub fn sudo_logs_body(
+    engine: &EngineConfig,
+    container_id: &str,
+    tail: u64,
+) -> Result<String, String> {
     validate_container_id(container_id)?;
     let tail = clamp_tail(tail);
     Ok(format!(
@@ -373,7 +374,11 @@ pub fn action_command(engine: &EngineConfig, action: DockerAction, container_id:
 /// through the same text (`set` prefixes never gate actions because the
 /// daemon-permission fallback does not apply there).
 pub fn exec_command(engine: &EngineConfig, action: DockerAction, container_id: &str) -> String {
-    format!("{}{}", engine.env_prefix(), action_command(engine, action, container_id))
+    format!(
+        "{}{}",
+        engine.env_prefix(),
+        action_command(engine, action, container_id)
+    )
 }
 
 /// Container id gate: `^[0-9a-f]{12,64}$`. Hand-rolled (no regex needed):
@@ -797,7 +802,9 @@ async fn run_local(
     let mut command = Command::new(cli);
     command.args(args).stdin(Stdio::null());
     if let Some(endpoint) = endpoint {
-        command.env("DOCKER_HOST", endpoint).env("CONTAINER_HOST", endpoint);
+        command
+            .env("DOCKER_HOST", endpoint)
+            .env("CONTAINER_HOST", endpoint);
     }
     let child = command
         .stdout(Stdio::piped())
@@ -866,8 +873,13 @@ pub async fn collect_logs_local(
     let tail = clamp_tail(tail);
     let cli = find_local_cli(&engine.cli)
         .ok_or_else(|| format!("{} CLI not found on this machine", engine.cli))?;
-    let (inspect_code, inspect_output) =
-        run_local(&cli, &["inspect", container_id], LOGS_TIMEOUT, engine.endpoint.as_deref()).await?;
+    let (inspect_code, inspect_output) = run_local(
+        &cli,
+        &["inspect", container_id],
+        LOGS_TIMEOUT,
+        engine.endpoint.as_deref(),
+    )
+    .await?;
     if inspect_code != 0 && !inspect_output.trim_start().starts_with('[') {
         // Missing container: keep going into logs, which surface the same
         // "No such container" error — the remote script does the same.
@@ -1142,7 +1154,10 @@ d4a7c9f1e2b3\tweb-nginx\tnginx:1.27\trunning\tUp 3 days\t0.0.0.0:8080->80/tcp\t2
             "export DOCKER_HOST='unix:///run/user/1000/podman.sock' \
              CONTAINER_HOST='unix:///run/user/1000/podman.sock'; podman rm d4a7c9f1e2b3"
         );
-        assert_eq!(exec_command(&engine, DockerAction::Stop, "d4a7c9f1e2b3"), "docker stop d4a7c9f1e2b3");
+        assert_eq!(
+            exec_command(&engine, DockerAction::Stop, "d4a7c9f1e2b3"),
+            "docker stop d4a7c9f1e2b3"
+        );
     }
 
     /// The stock-engine renderings must stay byte-identical to the legacy
@@ -1163,11 +1178,17 @@ d4a7c9f1e2b3\tweb-nginx\tnginx:1.27\trunning\tUp 3 days\t0.0.0.0:8080->80/tcp\t2
         // Absent/empty params = stock docker, no endpoint.
         assert_eq!(
             parse_engine(&json!({})).unwrap(),
-            EngineConfig { cli: "docker".into(), endpoint: None }
+            EngineConfig {
+                cli: "docker".into(),
+                endpoint: None
+            }
         );
         assert_eq!(
             parse_engine(&json!({ "cli": "", "socket": "", "host": "" })).unwrap(),
-            EngineConfig { cli: "docker".into(), endpoint: None }
+            EngineConfig {
+                cli: "docker".into(),
+                endpoint: None
+            }
         );
         // Podman by name; whitespace tolerated.
         assert_eq!(
@@ -1175,20 +1196,33 @@ d4a7c9f1e2b3\tweb-nginx\tnginx:1.27\trunning\tUp 3 days\t0.0.0.0:8080->80/tcp\t2
             "podman"
         );
         // Full path + socket URL pass through; bare socket path gains unix://.
-        let engine = parse_engine(&json!({ "cli": "/usr/local/bin/podman", "socket": "/run/user/1000/podman.sock" })).unwrap();
+        let engine = parse_engine(
+            &json!({ "cli": "/usr/local/bin/podman", "socket": "/run/user/1000/podman.sock" }),
+        )
+        .unwrap();
         assert_eq!(engine.cli, "/usr/local/bin/podman");
-        assert_eq!(engine.endpoint.as_deref(), Some("unix:///run/user/1000/podman.sock"));
+        assert_eq!(
+            engine.endpoint.as_deref(),
+            Some("unix:///run/user/1000/podman.sock")
+        );
         // Bare host:port gains tcp://; explicit schemes pass through.
         assert_eq!(
-            parse_engine(&json!({ "host": "127.0.0.1:2375" })).unwrap().endpoint.as_deref(),
+            parse_engine(&json!({ "host": "127.0.0.1:2375" }))
+                .unwrap()
+                .endpoint
+                .as_deref(),
             Some("tcp://127.0.0.1:2375")
         );
         assert_eq!(
-            parse_engine(&json!({ "host": "tcp://10.0.0.8:2376" })).unwrap().endpoint.as_deref(),
+            parse_engine(&json!({ "host": "tcp://10.0.0.8:2376" }))
+                .unwrap()
+                .endpoint
+                .as_deref(),
             Some("tcp://10.0.0.8:2376")
         );
         // Mutually exclusive endpoints are refused.
-        let error = parse_engine(&json!({ "socket": "/x.sock", "host": "1.2.3.4:2375" })).unwrap_err();
+        let error =
+            parse_engine(&json!({ "socket": "/x.sock", "host": "1.2.3.4:2375" })).unwrap_err();
         assert!(error.contains("mutually exclusive"), "{error}");
         // Charset gate: shell/cmd metacharacters never reach a script.
         assert!(parse_engine(&json!({ "cli": "podman; rm -rf /" })).is_err());
@@ -1234,19 +1268,32 @@ d4a7c9f1e2b3\tweb-nginx\tnginx:1.27\trunning\tUp 3 days\t0.0.0.0:8080->80/tcp\t2
         );
         // Podman + endpoint: cli interpolated, endpoint exported in-body so
         // the Quick Sudo retry (which passes the body as argv) keeps it.
-        let podman = parse_engine(&json!({ "cli": "podman", "socket": "/run/user/1000/podman.sock" })).unwrap();
+        let podman =
+            parse_engine(&json!({ "cli": "podman", "socket": "/run/user/1000/podman.sock" }))
+                .unwrap();
         let script = list_script(&podman);
         assert!(script.starts_with("sh -s <<'DBXDOCKER'"), "{script}");
         assert!(script.contains("command -v podman"), "{script}");
         assert!(script.contains("podman info"), "{script}");
         assert!(script.contains("podman ps -a --no-trunc"), "{script}");
-        assert!(script.contains("export DOCKER_HOST='unix:///run/user/1000/podman.sock'"), "{script}");
-        assert_eq!(list_body(&podman), script.trim_start_matches("sh -s <<'DBXDOCKER'\n").trim_end_matches("DBXDOCKER\n"));
+        assert!(
+            script.contains("export DOCKER_HOST='unix:///run/user/1000/podman.sock'"),
+            "{script}"
+        );
+        assert_eq!(
+            list_body(&podman),
+            script
+                .trim_start_matches("sh -s <<'DBXDOCKER'\n")
+                .trim_end_matches("DBXDOCKER\n")
+        );
         // Windows fallback: same interpolation, cmd set lines for endpoint.
         let win = win_list_script(&podman);
         assert!(win.contains("where /q podman"), "{win}");
         assert!(win.contains("podman ps -a"), "{win}");
-        assert!(win.contains("set DOCKER_HOST=unix:///run/user/1000/podman.sock"), "{win}");
+        assert!(
+            win.contains("set DOCKER_HOST=unix:///run/user/1000/podman.sock"),
+            "{win}"
+        );
         assert!(!win.contains("sh -s"), "{win}");
         let win_default = win_list_script(&default);
         assert!(win_default.contains("where /q docker"), "{win_default}");
@@ -1259,8 +1306,14 @@ d4a7c9f1e2b3\tweb-nginx\tnginx:1.27\trunning\tUp 3 days\t0.0.0.0:8080->80/tcp\t2
         let script = logs_script(&podman, "d4a7c9f1e2b3", 120).unwrap();
         assert!(script.starts_with("sh -s <<'DBXDOCKER'"), "{script}");
         assert!(script.contains("podman inspect d4a7c9f1e2b3"), "{script}");
-        assert!(script.contains("podman logs --tail 120 d4a7c9f1e2b3"), "{script}");
-        assert!(script.contains("export DOCKER_HOST='tcp://127.0.0.1:2375'"), "{script}");
+        assert!(
+            script.contains("podman logs --tail 120 d4a7c9f1e2b3"),
+            "{script}"
+        );
+        assert!(
+            script.contains("export DOCKER_HOST='tcp://127.0.0.1:2375'"),
+            "{script}"
+        );
         let clamped = logs_script(&podman, "d4a7c9f1e2b3", 99_999).unwrap();
         assert!(clamped.contains("podman logs --tail 2000"), "{clamped}");
         assert!(logs_script(&podman, "web-nginx", 100).is_err());
@@ -1268,7 +1321,10 @@ d4a7c9f1e2b3\tweb-nginx\tnginx:1.27\trunning\tUp 3 days\t0.0.0.0:8080->80/tcp\t2
         let body = sudo_logs_body(&podman, "d4a7c9f1e2b3", 120).unwrap();
         assert!(body.starts_with("PATH="), "{body}");
         assert!(body.contains("podman inspect d4a7c9f1e2b3"), "{body}");
-        assert!(body.contains("export DOCKER_HOST='tcp://127.0.0.1:2375'"), "{body}");
+        assert!(
+            body.contains("export DOCKER_HOST='tcp://127.0.0.1:2375'"),
+            "{body}"
+        );
         assert!(!body.contains("sh -s"), "{body}");
         assert!(sudo_logs_body(&podman, "web-nginx", 100).is_err());
     }

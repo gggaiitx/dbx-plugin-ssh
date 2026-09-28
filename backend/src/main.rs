@@ -1240,9 +1240,11 @@ impl Plugin {
                 let tail = optional_u64(&params, "tail", docker::TAIL_DEFAULT);
                 let engine = docker::parse_engine(&params)?;
                 if docker::parse_target(&params)? == docker::DockerTarget::Local {
-                    return self
-                        .runtime
-                        .block_on(docker::collect_logs_local(&engine, container_id, tail));
+                    return self.runtime.block_on(docker::collect_logs_local(
+                        &engine,
+                        container_id,
+                        tail,
+                    ));
                 }
                 let session_id = required_string(&params, "sessionId")?;
                 let script = docker::logs_script(&engine, container_id, tail)?;
@@ -1339,10 +1341,11 @@ impl Plugin {
                         &docker::action_command(&engine, action, container_id),
                     );
                     let started = std::time::Instant::now();
-                    return match self
-                        .runtime
-                        .block_on(docker::perform_action_local(&engine, container_id, action))
-                    {
+                    return match self.runtime.block_on(docker::perform_action_local(
+                        &engine,
+                        container_id,
+                        action,
+                    )) {
                         Ok(payload) => Ok(payload),
                         Err(error) => {
                             docker::audit_action_failure(
