@@ -143,9 +143,11 @@ describe("matchSpecLine · levels", () => {
     expect(match?.rows).toEqual([]);
   });
 
-  it("marks flag rows taking values without a trailing space", () => {
+  it("marks value-taking flag rows with a trailing space so acceptance enters the value layer", () => {
+    // review #120：带参 flag 接受后补空格，matchSpecLine 把它记作等待值
+    // 的 flag，浮层刷新即进入 value 层（不补空格会停留 flag 层出同一行）。
     const match = matchSpecLine("syn alpha --b", SYNTHETIC);
-    expect(match?.rows[0]).toMatchObject({ token: "--branch", space: false, description: "new branch (-b)" });
+    expect(match?.rows[0]).toMatchObject({ token: "--branch", space: true, description: "new branch (-b)" });
   });
 });
 
@@ -246,5 +248,40 @@ describe("lineWithTrailingTokenReplaced", () => {
 
   it("keeps the line unchanged apart from the token when no space follows", () => {
     expect(lineWithTrailingTokenReplaced("git st", "status", false)).toBe("git status");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// review #120 跟进：-- 终结符状态与 flag 接受语义的锁定测试。
+// ---------------------------------------------------------------------------
+
+describe("trailing -- terminator states", () => {
+  it("treats a trailing -- as the token being typed and stays in the flag layer", () => {
+    // 正在敲的 -- 还不是已生效的终结符：按 flag 层出全量候选。
+    const match = matchSpecLine("git checkout --", COMPLETION_SPECS);
+    expect(match?.level).toBe("flag");
+    expect(match?.rows.length).toBeGreaterThan(0);
+  });
+
+  it("closes flag parsing once -- is followed by more input", () => {
+    // -- 生效后不再出 flag 候选（含 -f 这类原本会被误判成 flag 的 token）。
+    const match = matchSpecLine("git checkout -- -f", COMPLETION_SPECS);
+    expect(match?.level).not.toBe("flag");
+    expect(match?.rows.every((row) => row.kind !== "flag")).toBe(true);
+  });
+
+  it("falls through to positional hints after a settled -- ", () => {
+    const match = matchSpecLine("git checkout -- ", COMPLETION_SPECS);
+    expect(match?.rows.some((row) => row.kind === "flag")).toBe(false);
+  });
+});
+
+describe("flag acceptance spacing", () => {
+  it("offers a trailing space for both bare and value-taking flags", () => {
+    // 带参 flag 接受后补空格，matchSpecLine 才会把它记作等待值并进入 value 层。
+    const flags = matchSpecLine("syn alpha --form", SYNTHETIC);
+    expect(flags?.rows.every((row) => row.space)).toBe(true);
+    const short = matchSpecLine("syn alpha -f", SYNTHETIC);
+    expect(short?.rows[0]).toEqual(expect.objectContaining({ token: "-f", space: true }));
   });
 });

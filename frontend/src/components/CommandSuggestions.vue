@@ -55,7 +55,10 @@ watchEffect(() => {
   }
   const viewportHeight = props.viewport?.height || el.parentElement?.clientHeight || 0;
   const cellHeight = anchor.cellHeight ?? 0;
-  const naturalHeight = el.offsetHeight;
+  // scrollHeight 而非 offsetHeight：浮层被 max-height 压扁后再次测量，
+  // offsetHeight 是受限高、scrollHeight 仍是内容真实高，条目增减时放置
+  // 决策不会被上一轮的限制污染。
+  const naturalHeight = el.scrollHeight;
   placement.value = chooseOverlayPlacement(anchor.y, cellHeight, naturalHeight, viewportHeight);
   overlayBottom.value = flippedOverlayBottom(anchor.y, viewportHeight);
   const available = overlayMaxHeight(placement.value, anchor.y, cellHeight, viewportHeight);
