@@ -154,7 +154,9 @@ import { cursorAbsoluteRow, cursorViewportRow } from "./lib/terminalAnchor";
 import { canShowSuggestions, createSuggestionGuardState, type SuggestionGuardState } from "./lib/suggestionGuard";
 // 结构化补全（对标 Warp/fig，线 2）：spec 命中时优先于历史建议浮层展示
 // 带描述的命令/flag/值候选；开关读 pluginStore（SettingsDialog 自治写入）。
-import { lineWithTrailingTokenReplaced, matchSpecLine, type CompletionLevel, type CompletionRow } from "./lib/completions/spec";
+import { matchSpecLine, SPEC_COMPLETION_MAX_ROWS, type CompletionLevel, type CompletionRow, type SpecMatch } from "./lib/completions/spec";
+import { pickDynamicCompletionProvider, registerDynamicCompletionProvider } from "./lib/completions/provider";
+import { createRemoteFsProvider } from "./lib/completions/remoteFsProvider";
 import { COMPLETION_SPECS } from "./lib/completions/specs";
 import { displayPathToWire, hasLossyChars, sanitizeNameEncoding, type SftpNameEncoding } from "./lib/sftpName";
 import { clampTransferConcurrency, clampTransferDownloadLimit, clampTransferMaxActive, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy } from "./lib/transferQueue";
@@ -915,6 +917,10 @@ const completionLevel = ref<CompletionLevel>("sub");
 const completionCommandPath = ref<string[]>([]);
 const completionActiveIndex = ref(0);
 const completionAnchor = ref<SuggestionAnchor | null>(null);
+// 候选 token 的 replacement 范围（parser 给出的行尾 token 边界，随菜单
+// 打开/刷新更新）：接受候选项时按范围精确替换，不再用 /\S+$ 反推边界
+// （review 第一批遗留）。null = 无范围（不发生，兜底走行尾 token 规则）。
+const completionReplaceRange = ref<{ start: number; end: number } | null>(null);
 
 function completionSpecEnabled(): boolean {
   try {
@@ -928,18 +934,64 @@ function closeCompletionMenu() {
   completionOpen.value = false;
   completionRows.value = [];
   completionActiveIndex.value = 0;
+  completionReplaceRange.value = null;
 }
 
-function openCompletionMenu(commandPath: string[], level: CompletionLevel, rows: CompletionRow[]) {
-  completionCommandPath.value = commandPath;
-  completionLevel.value = level;
-  completionRows.value = rows;
+function openCompletionMenu(match: SpecMatch) {
+  completionCommandPath.value = match.commandPath;
+  completionLevel.value = match.level;
+  completionRows.value = match.rows;
   completionActiveIndex.value = 0;
+  completionReplaceRange.value = { start: match.replaceStart, end: match.replaceEnd };
   completionAnchor.value = readTerminalSuggestionAnchor();
   completionOpen.value = true;
+  // hint 层（动态值）异步询问 provider：有注册的 provider 且返回候选时，
+  // 占位 hint 行被真实候选替换；未注册时保持 hint + Tab 透传（零回归）。
+  void fetchDynamicCompletionRows(match);
 }
 
-/** 结构化补全浮层的按键消费：↑↓ 选择、Tab/Enter 填充、Esc 关闭。 */
+// 动态 provider 询问（review 第三批地基）：递增 token 使过期响应作废
+// （菜单已关 / 行已变 / 更新的请求已发出时丢弃）；超时兜底防远端卡死。
+let dynamicCompletionFetchToken = 0;
+const DYNAMIC_COMPLETION_TIMEOUT_MS = 1200;
+
+async function fetchDynamicCompletionRows(match: SpecMatch) {
+  // 只对"整层都是 hint"的动态层询问 provider：静态枚举/子命令已有真实候选。
+  if (!match.dynamic || !match.rows.length || match.rows.some((row) => row.kind !== "hint")) return;
+  const provider = pickDynamicCompletionProvider({ commandPath: match.commandPath, target: match.dynamic, prefix: "" });
+  if (!provider) return;
+  const token = ++dynamicCompletionFetchToken;
+  const lineAtRequest = pendingTerminalInput;
+  let values: string[] | null = null;
+  try {
+    values = await Promise.race([
+      provider.complete({ commandPath: match.commandPath, target: match.dynamic, prefix: "" }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), DYNAMIC_COMPLETION_TIMEOUT_MS)),
+    ]);
+  } catch {
+    values = null;
+  }
+  if (token !== dynamicCompletionFetchToken || !values?.length) return;
+  if (!completionOpen.value || completionCommandPath.value.join(" ") !== match.commandPath.join(" ") || pendingTerminalInput !== lineAtRequest) return;
+  const providerRows: CompletionRow[] = values.slice(0, SPEC_COMPLETION_MAX_ROWS).map((value) => ({
+    kind: "value",
+    token: value,
+    space: true,
+    label: value,
+    description: provider.label,
+    score: 1000,
+  }));
+  completionRows.value = providerRows;
+  completionActiveIndex.value = 0;
+}
+
+/**
+ * 结构化补全浮层的按键消费（review #120 跟进：菜单自动出现 ≠ 接管键盘）：
+ * ↑↓ 选择、Tab 填充静态候选、Esc 关闭；**Enter 恒定放行 shell 执行当前行**
+ * （return false 不消费，回车字节照发 PTY）；动态 hint 行（token 空，本地
+ * 不可枚举）时 Tab 也放行——远程 shell 是最后一级 completion provider，
+ * 不吃掉它的 Tab。
+ */
 function handleCompletionKey(event: KeyboardEvent): boolean {
   if (event.type !== "keydown" || !completionOpen.value || !completionRows.value.length) return false;
   const rows = completionRows.value;
@@ -951,8 +1003,19 @@ function handleCompletionKey(event: KeyboardEvent): boolean {
     completionActiveIndex.value = (completionActiveIndex.value - 1 + rows.length) % rows.length;
     return true;
   }
-  if (event.key === "Tab" || event.key === "Enter") {
-    acceptCompletionRow(rows[completionActiveIndex.value]);
+  if (event.key === "Enter") {
+    // 执行当前输入行：关闭浮层后不消费，Enter 原样进 PTY。
+    closeCompletionMenu();
+    return false;
+  }
+  if (event.key === "Tab") {
+    const row = rows[completionActiveIndex.value];
+    if (!row.token) {
+      // 动态值（分支/文件/pod…）：本地只出占位提示，Tab 交给 shell 补全。
+      closeCompletionMenu();
+      return false;
+    }
+    acceptCompletionRow(row);
     return true;
   }
   if (event.key === "Escape") {
@@ -970,7 +1033,15 @@ function acceptCompletionRow(row: CompletionRow) {
     terminal?.focus();
     return;
   }
-  replaceTerminalLineWith(lineWithTrailingTokenReplaced(pendingTerminalInput, row.token, row.space), false);
+  // replacement 范围由 matchSpecLine 的 parser 精确给出（含引号/转义的
+  // token 表面）；范围越界视为行已漂移，回落行尾 token 规则兜底。
+  const line = pendingTerminalInput;
+  const range = completionReplaceRange.value;
+  const usable = range !== null && range.end <= line.length;
+  const start = usable ? range.start : (/\S+$/.exec(line)?.index ?? line.length);
+  const end = usable ? range.end : line.length;
+  const suffix = row.space ? " " : "";
+  replaceTerminalLineWith(line.slice(0, start) + row.token + suffix + line.slice(end), false);
   refreshCompletionMenu();
   if (!completionOpen.value) terminal?.focus();
 }
@@ -983,7 +1054,7 @@ function refreshCompletionMenu() {
   }
   const match = matchSpecLine(pendingTerminalInput, COMPLETION_SPECS);
   if (match && match.rows.length) {
-    openCompletionMenu(match.commandPath, match.level, match.rows);
+    openCompletionMenu(match);
   } else {
     closeCompletionMenu();
   }
@@ -2544,7 +2615,13 @@ function createTerminal() {
   terminalHost.value.addEventListener("mousedown", terminalMouseDownHandler);
   terminalMouseUpHandler = (event) => handleTerminalMouseUp(event);
   terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
-  resizeObserver = new ResizeObserver(scheduleFit);
+  // 终端宿主尺寸变化（窗口缩放/命令条让位）时：fit 重排行数之外，还要
+  // 重读建议浮层锚点——光标行/列的像素位置随行高与滚动变化，浮层开着时
+  // 停在旧位置会错位或越过新边界（review 第二批：resize 主动重定位）。
+  resizeObserver = new ResizeObserver(() => {
+    scheduleFit();
+    syncSuggestionAnchorsOnSettle();
+  });
   resizeObserver.observe(terminalHost.value);
   if (webglEnabled.value && !wallpaperActive.value) {
     webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon(), webglRecoveryOptions());
@@ -3029,7 +3106,7 @@ function refreshSuggestionsAfterInput(data: string, lineBefore: string) {
     if (specMatch && specMatch.rows.length) {
       suggestionOpen.value = false;
       suggestionItems.value = [];
-      openCompletionMenu(specMatch.commandPath, specMatch.level, specMatch.rows);
+      openCompletionMenu(specMatch);
       return;
     }
   }
@@ -3056,18 +3133,28 @@ function refreshSuggestionsAfterInput(data: string, lineBefore: string) {
  * 光标像素锚点：xterm 私有渲染尺寸（css.cell 宽高）× 光标缓冲坐标。
  * 读不到（渲染器未就绪/内部结构变化）返回 null，浮层降级贴终端底部。
  */
-/**
- * 建议浮层锚点（issue #120）：y 是光标行顶、cellHeight 是行高（翻转定位
- * 需要）。以 .xterm-screen（渲染内容区，位于 .xterm 内边距内侧）为原点，
- * 加光标网格坐标换算——自动计入内边距，贴合提示符/光标；textarea 平时被
- * xterm 移出屏幕（CSS left:-9999em，仅 IME 时定位），不可用作锚点。
- * 坐标相对终端宿主（浮层的 absolute 包含块）。
- */
 // 翻转定位用的可视底界（terminal-host 实际高度，含让位后的净高）：
 // anchor 计算时顺带刷新，两个建议浮层据此决定下方/上方放置。
 const suggestionViewport = ref({ height: 0 });
 
-function readTerminalSuggestionAnchor(): SuggestionAnchor | null {
+/** 光标格换算的共享参数：.xterm-screen 原点 + 单元格尺寸 + buffer 坐标。 */
+interface TerminalCellFrame {
+  originLeft: number;
+  originTop: number;
+  cellWidth: number;
+  cellHeight: number;
+  cursorX: number;
+  visibleRow: number;
+}
+
+/**
+ * 浮层与 ghost 共用的光标格锚点源（issue #120）：以 .xterm-screen（渲染
+ * 内容区，位于 .xterm 内边距内侧）为原点，加光标网格坐标——可配置的终端
+ * 内边距由 screen rect 自动计入，ghost 与两个建议浮层不再各自为政。
+ * textarea 平时被 xterm 移出屏幕（CSS left:-9999em，仅 IME 时定位），
+ * 不可用作锚点。
+ */
+function readTerminalCellFrame(): TerminalCellFrame | null {
   if (!terminal || !terminalHost.value) return null;
   try {
     const core = (terminal as unknown as { _core?: { _renderService?: { dimensions?: { css?: { cell?: { width?: number; height?: number } } } } } })._core;
@@ -3082,19 +3169,32 @@ function readTerminalSuggestionAnchor(): SuggestionAnchor | null {
     const hostRect = terminalHost.value.getBoundingClientRect();
     const origin = (screen ?? terminal.element)?.getBoundingClientRect();
     if (!origin) return null;
-    // 翻转定位的可视底界 = terminal-host 实际高度：batch-bar/标记条让位
-    // （inset-bottom）后它比包含块 pane 矮，必须用 host 高度，否则浮层会
-    // 越过终端文字区盖住 footer/批量条（issue #120 实机反馈）。
-    suggestionViewport.value = { height: terminalHost.value.clientHeight };
     return {
-      x: Math.round(origin.left - hostRect.left + buffer.cursorX * cellWidth),
-      y: Math.round(origin.top - hostRect.top + visibleRow * cellHeight),
-      cellHeight,
+      originLeft: origin.left - hostRect.left,
+      originTop: origin.top - hostRect.top,
       cellWidth,
+      cellHeight,
+      cursorX: buffer.cursorX,
+      visibleRow,
     };
   } catch {
     return null;
   }
+}
+
+function readTerminalSuggestionAnchor(): SuggestionAnchor | null {
+  const frame = readTerminalCellFrame();
+  if (!frame || !terminalHost.value) return null;
+  // 翻转定位的可视底界 = terminal-host 实际高度：batch-bar/标记条让位
+  // （inset-bottom）后它比包含块 pane 矮，必须用 host 高度，否则浮层会
+  // 越过终端文字区盖住 footer/批量条（issue #120 实机反馈）。
+  suggestionViewport.value = { height: terminalHost.value.clientHeight };
+  return {
+    x: Math.round(frame.originLeft + frame.cursorX * frame.cellWidth),
+    y: Math.round(frame.originTop + frame.visibleRow * frame.cellHeight),
+    cellHeight: frame.cellHeight,
+    cellWidth: frame.cellWidth,
+  };
 }
 
 /** 浮层开启时的按键消费：↑↓ 选择、Tab 填充、Enter 执行、Esc 关闭。 */
@@ -3114,8 +3214,10 @@ function handleSuggestionKey(event: KeyboardEvent): boolean {
     return true;
   }
   if (event.key === "Enter") {
-    executeSuggestion(items[suggestionActiveIndex.value]);
-    return true;
+    // 执行当前输入行（review #120：浮层自动出现 ≠ 接管 Enter）——关闭浮层
+    // 后不消费，回车字节原样进 PTY；要执行建议先 Tab 填充再回车。
+    closeSuggestions();
+    return false;
   }
   if (event.key === "Escape") {
     closeSuggestions();
@@ -3150,12 +3252,6 @@ function fillSuggestion(item: CommandSuggestion) {
   } else {
     closeSuggestions();
   }
-  terminal?.focus();
-}
-
-function executeSuggestion(item: CommandSuggestion) {
-  replaceTerminalLineWith(item.command, true);
-  closeSuggestions();
   terminal?.focus();
 }
 
@@ -3211,21 +3307,15 @@ function terminalCursorAtLineEnd(): boolean {
 }
 
 /** ghost 专用锚点：光标像素坐标（灰字从光标格起绘，y 取光标行行顶）。 */
+/** ghost 行内建议锚点：与建议浮层同一光标格换算（含 .xterm-screen 原点，
+ *  可配置内边距自动计入），盖在光标行上。 */
 function readGhostAnchor(): { x: number; y: number } | null {
-  if (!terminal || !terminalHost.value) return null;
-  try {
-    const core = (terminal as unknown as { _core?: { _renderService?: { dimensions?: { css?: { cell?: { width?: number; height?: number } } } } } })._core;
-    const cell = core?._renderService?.dimensions?.css?.cell;
-    const cellWidth = cell?.width ?? 0;
-    const cellHeight = cell?.height ?? 0;
-    if (!(cellWidth > 0) || !(cellHeight > 0)) return null;
-    const buffer = terminal.buffer.active;
-    // cursorY 已是视口内相对行；旧式 `cursorY - viewportY` 在回滚区出现后为负，ghost 画出画布。
-    const visibleRow = cursorViewportRow(buffer);
-    return { x: Math.round(buffer.cursorX * cellWidth), y: Math.round(visibleRow * cellHeight) };
-  } catch {
-    return null;
-  }
+  const frame = readTerminalCellFrame();
+  if (!frame) return null;
+  return {
+    x: Math.round(frame.originLeft + frame.cursorX * frame.cellWidth),
+    y: Math.round(frame.originTop + frame.visibleRow * frame.cellHeight),
+  };
 }
 
 /** onData 每次输入后调用：推进门状态并重算 ghost（与浮层建议同一采样点）。 */
@@ -11345,6 +11435,15 @@ async function initialize() {
   // 外观偏好的 CSS 部分（终端内边距变量）与宿主是否推送 appearance 无关，
   // 开机先落一次，否则用户设了内边距要等下次主题推送才生效。
   applyTerminalPaddingVars();
+  // 远端 fs 动态补全（review 第三批 14 首实现）：数据源为 SFTP 面板已加载
+  // 条目（零新增远端调用）；面板未就绪/目录不一致时 provider 返回 null，
+  // hint 行保持 + Tab 透传 shell。
+  registerDynamicCompletionProvider(
+    createRemoteFsProvider(() => {
+      if (!sftpPaneOpen.value) return null;
+      return { currentPath: currentPath.value, entries: entries.value };
+    }),
+  );
   if (api.appearance) applyAppearance(api.appearance);
   else if (isDbxPluginTheme(api.theme)) applyAppearance(themeToAppearance(api.theme));
   // 宿主可能在 init 前先应答 host.getContext（如重推连接期间 init 被延迟）：

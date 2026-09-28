@@ -2,7 +2,7 @@
 // matchSpecLine 层级匹配（根前缀 → 子命令 → flag → 值，评分排序与截断）。
 // 语法分支用内联合成 spec 精确断言；真实数据集另跑冒烟断言（specs/index）。
 import { describe, expect, it } from "vitest";
-import { lineWithTrailingTokenReplaced, matchSpecLine, splitCommandLine, SPEC_COMPLETION_MAX_ROWS, type CompletionSpecs } from "./spec";
+import { matchSpecLine, splitCommandLine, SPEC_COMPLETION_MAX_ROWS, type CompletionSpecs } from "./spec";
 import { COMPLETION_SPECS } from "./specs";
 
 // ---------------------------------------------------------------------------
@@ -143,9 +143,11 @@ describe("matchSpecLine · levels", () => {
     expect(match?.rows).toEqual([]);
   });
 
-  it("marks flag rows taking values without a trailing space", () => {
+  it("marks value-taking flag rows with a trailing space so acceptance enters the value layer", () => {
+    // review #120：带参 flag 接受后补空格，matchSpecLine 把它记作等待值
+    // 的 flag，浮层刷新即进入 value 层（不补空格会停留 flag 层出同一行）。
     const match = matchSpecLine("syn alpha --b", SYNTHETIC);
-    expect(match?.rows[0]).toMatchObject({ token: "--branch", space: false, description: "new branch (-b)" });
+    expect(match?.rows[0]).toMatchObject({ token: "--branch", space: true, description: "new branch (-b)" });
   });
 });
 
@@ -228,23 +230,71 @@ describe("matchSpecLine · bundled specs", () => {
   });
 });
 
+
 // ---------------------------------------------------------------------------
-// lineWithTrailingTokenReplaced（issue #120）：接受候选只替换行尾 token，
-// 命令前缀保留；尾空白/空行时追加。防回归：整行被换成单个 token 的旧 bug。
+// review #120 跟进：-- 终结符状态与 flag 接受语义的锁定测试。
 // ---------------------------------------------------------------------------
-describe("lineWithTrailingTokenReplaced", () => {
-  it("replaces only the trailing partial token and keeps the prefix", () => {
-    expect(lineWithTrailingTokenReplaced("git ch", "checkout", true)).toBe("git checkout ");
-    expect(lineWithTrailingTokenReplaced("git checkout --b", "--branch", true)).toBe("git checkout --branch ");
-    expect(lineWithTrailingTokenReplaced("kubectl get -o js", "json", true)).toBe("kubectl get -o json ");
+
+describe("trailing -- terminator states", () => {
+  it("treats a trailing -- as the token being typed and stays in the flag layer", () => {
+    // 正在敲的 -- 还不是已生效的终结符：按 flag 层出全量候选。
+    const match = matchSpecLine("git checkout --", COMPLETION_SPECS);
+    expect(match?.level).toBe("flag");
+    expect(match?.rows.length).toBeGreaterThan(0);
   });
 
-  it("appends after trailing whitespace or on an empty line", () => {
-    expect(lineWithTrailingTokenReplaced("git ", "add", true)).toBe("git add ");
-    expect(lineWithTrailingTokenReplaced("", "ls", true)).toBe("ls ");
+  it("closes flag parsing once -- is followed by more input", () => {
+    // -- 生效后不再出 flag 候选（含 -f 这类原本会被误判成 flag 的 token）。
+    const match = matchSpecLine("git checkout -- -f", COMPLETION_SPECS);
+    expect(match?.level).not.toBe("flag");
+    expect(match?.rows.every((row) => row.kind !== "flag")).toBe(true);
   });
 
-  it("keeps the line unchanged apart from the token when no space follows", () => {
-    expect(lineWithTrailingTokenReplaced("git st", "status", false)).toBe("git status");
+  it("falls through to positional hints after a settled -- ", () => {
+    const match = matchSpecLine("git checkout -- ", COMPLETION_SPECS);
+    expect(match?.rows.some((row) => row.kind === "flag")).toBe(false);
+  });
+});
+
+describe("flag acceptance spacing", () => {
+  it("offers a trailing space for both bare and value-taking flags", () => {
+    // 带参 flag 接受后补空格，matchSpecLine 才会把它记作等待值并进入 value 层。
+    const flags = matchSpecLine("syn alpha --form", SYNTHETIC);
+    expect(flags?.rows.every((row) => row.space)).toBe(true);
+    const short = matchSpecLine("syn alpha -f", SYNTHETIC);
+    expect(short?.rows[0]).toEqual(expect.objectContaining({ token: "-f", space: true }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// replacement range（review 第一批遗留）：parser 返回行尾 token 的精确边界，
+// 接受逻辑按范围替换、不再用 /\S+$ 反推（含引号/转义表面的正确性）。
+// ---------------------------------------------------------------------------
+describe("splitCommandLine token ranges & matchSpecLine replace range", () => {
+  it("reports the partial token range for plain tokens", () => {
+    const match = matchSpecLine("git ch", COMPLETION_SPECS);
+    expect(match?.replaceStart).toBe(4);
+    expect(match?.replaceEnd).toBe(6);
+  });
+
+  it("uses the end of the line as an insertion point after trailing whitespace", () => {
+    const match = matchSpecLine("git checkout ", COMPLETION_SPECS);
+    expect(match?.replaceStart).toBe(13);
+    expect(match?.replaceEnd).toBe(13);
+  });
+
+  it("covers the whole inline --flag=value surface", () => {
+    const match = matchSpecLine("kubectl get --output=j", COMPLETION_SPECS);
+    const line = "kubectl get --output=j";
+    expect(match?.replaceStart).toBe(line.indexOf("--output=j"));
+    expect(match?.replaceEnd).toBe(line.length);
+  });
+
+  it("covers quoted token surfaces including the quote characters", () => {
+    const tokens = splitCommandLine('git commit -m "hello world');
+    const last = tokens.tokens[tokens.tokens.length - 1];
+    expect(last.text).toBe("hello world");
+    expect(last.start).toBe(14); // 起点含开引号
+    expect(last.end).toBe(26); // 行尾（未闭引号）
   });
 });
