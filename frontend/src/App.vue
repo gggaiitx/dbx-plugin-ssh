@@ -154,7 +154,7 @@ import { cursorAbsoluteRow, cursorViewportRow } from "./lib/terminalAnchor";
 import { canShowSuggestions, createSuggestionGuardState, type SuggestionGuardState } from "./lib/suggestionGuard";
 // 结构化补全（对标 Warp/fig，线 2）：spec 命中时优先于历史建议浮层展示
 // 带描述的命令/flag/值候选；开关读 pluginStore（SettingsDialog 自治写入）。
-import { lineWithTrailingTokenReplaced, matchSpecLine, SPEC_COMPLETION_MAX_ROWS, type CompletionLevel, type CompletionRow, type SpecMatch } from "./lib/completions/spec";
+import { matchSpecLine, SPEC_COMPLETION_MAX_ROWS, type CompletionLevel, type CompletionRow, type SpecMatch } from "./lib/completions/spec";
 import { pickDynamicCompletionProvider } from "./lib/completions/provider";
 import { COMPLETION_SPECS } from "./lib/completions/specs";
 import { displayPathToWire, hasLossyChars, sanitizeNameEncoding, type SftpNameEncoding } from "./lib/sftpName";
@@ -916,6 +916,10 @@ const completionLevel = ref<CompletionLevel>("sub");
 const completionCommandPath = ref<string[]>([]);
 const completionActiveIndex = ref(0);
 const completionAnchor = ref<SuggestionAnchor | null>(null);
+// 候选 token 的 replacement 范围（parser 给出的行尾 token 边界，随菜单
+// 打开/刷新更新）：接受候选项时按范围精确替换，不再用 /\S+$ 反推边界
+// （review 第一批遗留）。null = 无范围（不发生，兜底走行尾 token 规则）。
+const completionReplaceRange = ref<{ start: number; end: number } | null>(null);
 
 function completionSpecEnabled(): boolean {
   try {
@@ -929,6 +933,7 @@ function closeCompletionMenu() {
   completionOpen.value = false;
   completionRows.value = [];
   completionActiveIndex.value = 0;
+  completionReplaceRange.value = null;
 }
 
 function openCompletionMenu(match: SpecMatch) {
@@ -936,6 +941,7 @@ function openCompletionMenu(match: SpecMatch) {
   completionLevel.value = match.level;
   completionRows.value = match.rows;
   completionActiveIndex.value = 0;
+  completionReplaceRange.value = { start: match.replaceStart, end: match.replaceEnd };
   completionAnchor.value = readTerminalSuggestionAnchor();
   completionOpen.value = true;
   // hint 层（动态值）异步询问 provider：有注册的 provider 且返回候选时，
@@ -1026,7 +1032,15 @@ function acceptCompletionRow(row: CompletionRow) {
     terminal?.focus();
     return;
   }
-  replaceTerminalLineWith(lineWithTrailingTokenReplaced(pendingTerminalInput, row.token, row.space), false);
+  // replacement 范围由 matchSpecLine 的 parser 精确给出（含引号/转义的
+  // token 表面）；范围越界视为行已漂移，回落行尾 token 规则兜底。
+  const line = pendingTerminalInput;
+  const range = completionReplaceRange.value;
+  const usable = range !== null && range.end <= line.length;
+  const start = usable ? range.start : (/\S+$/.exec(line)?.index ?? line.length);
+  const end = usable ? range.end : line.length;
+  const suffix = row.space ? " " : "";
+  replaceTerminalLineWith(line.slice(0, start) + row.token + suffix + line.slice(end), false);
   refreshCompletionMenu();
   if (!completionOpen.value) terminal?.focus();
 }

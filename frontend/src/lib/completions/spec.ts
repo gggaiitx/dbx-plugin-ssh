@@ -76,6 +76,13 @@ export interface SpecMatch {
   level: CompletionLevel;
   rows: CompletionRow[];
   /**
+   * 行尾正在输入 token 的原始行边界（UTF-16，end 排他）：候选 token 的
+   * replacement 范围。尾空格/空行时 start === end === 行长（纯插入点）。
+   * 由 parser 精确给出（含引号/转义表面），接受逻辑不再用 /\S+$ 反推。
+   */
+  replaceStart: number;
+  replaceEnd: number;
+  /**
    * 本层涉及动态值（本地不可枚举，spec 只出占位 hint）时的目标形状：
    * 供动态 provider（lib/completions/provider.ts）异步询问；无则为静态层。
    */
@@ -100,6 +107,13 @@ export interface CommandToken {
   quoted: boolean;
   /** 裸 "--" 终结符：本身不参与候选，仅对后续 token 关闭 flag 解析。 */
   terminator: boolean;
+  /**
+   * token 在原始行中的边界（UTF-16 索引，end 为排他）：表面范围含引号与
+   * 转义字符——replacement 替换用（review 第一批：不再让接受逻辑用
+   * /\S+$ 反推 token 边界）。
+   */
+  start: number;
+  end: number;
 }
 
 export interface SplitCommandLineResult {
@@ -116,20 +130,20 @@ export interface SplitCommandLineResult {
  */
 export function splitCommandLine(line: string): SplitCommandLineResult {
   const tokens: CommandToken[] = [];
-  let current: { text: string; quoted: boolean } | null = null;
+  let current: { text: string; quoted: boolean; start: number } | null = null;
   let trailingSpace = false;
   let terminated = false;
 
-  const pushCurrent = () => {
+  const pushCurrent = (end: number) => {
     if (!current) return;
     // 裸 "--" 是 flag 终结符：保留为 terminator 标记 token（可能是正在敲的
     // 半截 token，如 `git checkout --`——此时仍要按 flag 层出候选），仅对
     // 之后的 token 关闭 flag 解析。
     if (current.text === "--" && !current.quoted && !terminated) {
-      tokens.push({ text: current.text, isFlag: false, quoted: false, terminator: true });
+      tokens.push({ text: current.text, isFlag: false, quoted: false, terminator: true, start: current.start, end });
       terminated = true;
     } else {
-      tokens.push({ text: current.text, isFlag: !terminated && current.text.startsWith("-") && current.text !== "-", quoted: current.quoted, terminator: false });
+      tokens.push({ text: current.text, isFlag: !terminated && current.text.startsWith("-") && current.text !== "-", quoted: current.quoted, terminator: false, start: current.start, end });
     }
     current = null;
   };
@@ -137,73 +151,68 @@ export function splitCommandLine(line: string): SplitCommandLineResult {
   let inSingle = false;
   let inDouble = false;
   let escaped = false;
-  for (const char of line) {
+  // 手动索引推进（char.length 兼容代理对）：current.start 记录 token 在
+  // 原始行中的表面起点（含引号/转义字符），pushCurrent(end) 记录排他终点。
+  let i = 0;
+  while (i < line.length) {
+    const char = line[i];
     if (inSingle) {
       if (char === "'") {
         inSingle = false;
       } else {
-        current ??= { text: "", quoted: false };
+        current ??= { text: "", quoted: false, start: i };
         current.text += char;
         current.quoted = true;
       }
-      continue;
-    }
-    if (escaped) {
-      current ??= { text: "", quoted: false };
+    } else if (escaped) {
+      current ??= { text: "", quoted: false, start: i };
       current.text += char;
       escaped = false;
-      continue;
-    }
-    if (inDouble) {
+    } else if (inDouble) {
       if (char === "\\") {
         escaped = true;
-        current ??= { text: "", quoted: false };
+        current ??= { text: "", quoted: false, start: i };
         current.quoted = true;
       } else if (char === '"') {
         inDouble = false;
         if (current) current.quoted = true;
       } else if (char === " " || char === "\t") {
-        current ??= { text: "", quoted: false };
+        current ??= { text: "", quoted: false, start: i };
         current.text += char;
         current.quoted = true;
       } else {
-        current ??= { text: "", quoted: false };
+        current ??= { text: "", quoted: false, start: i };
         current.text += char;
       }
-      continue;
-    }
-    if (char === "'") {
-      current ??= { text: "", quoted: false };
+    } else if (char === "'") {
+      current ??= { text: "", quoted: false, start: i };
       current.quoted = true;
       inSingle = true;
-      continue;
-    }
-    if (char === '"') {
-      current ??= { text: "", quoted: false };
+    } else if (char === '"') {
+      current ??= { text: "", quoted: false, start: i };
       current.quoted = true;
       inDouble = true;
-      continue;
-    }
-    if (char === "\\") {
-      current ??= { text: "", quoted: false };
+    } else if (char === "\\") {
+      current ??= { text: "", quoted: false, start: i };
       escaped = true;
-      continue;
-    }
-    if (char === " " || char === "\t") {
-      pushCurrent();
+    } else if (char === " " || char === "\t") {
+      pushCurrent(i);
       trailingSpace = true;
+      i += char.length;
       continue;
+    } else {
+      current ??= { text: "", quoted: false, start: i };
+      current.text += char;
+      trailingSpace = false;
     }
-    current ??= { text: "", quoted: false };
-    current.text += char;
-    trailingSpace = false;
+    i += char.length;
   }
   if (escaped) {
     // 行尾悬空反斜杠：按字面量保留，避免吞 token。
-    current ??= { text: "", quoted: false };
+    current ??= { text: "", quoted: false, start: i };
     current.text += "\\";
   }
-  pushCurrent();
+  pushCurrent(line.length);
   return { tokens, trailingSpace, terminated };
 }
 
@@ -263,12 +272,17 @@ export function matchSpecLine(line: string, specs: CompletionSpecs): SpecMatch |
   // 当前正在敲的 token：尾空格（或空行）= 空前缀。
   const partial = trailingSpace ? "" : (tokens[tokens.length - 1]?.text ?? "");
   const completeTokens = trailingSpace ? tokens : tokens.slice(0, -1);
+  // replacement 范围（parser 给出的精确边界）：尾空格/空行 = 行尾插入点；
+  // 否则 = 行尾正在输入 token 的表面范围（含引号/转义字符）。
+  const partialToken = trailingSpace ? undefined : tokens[tokens.length - 1];
+  const replaceStart = partialToken ? partialToken.start : line.length;
+  const replaceEnd = partialToken ? partialToken.end : line.length;
 
   // 根命令尚未敲完（无完整 token 且非 flag）：对根名做前缀匹配（`gi` → git）。
   const first = completeTokens[0];
   if (!first) {
     if (!partial || partial.startsWith("-")) return null;
-    return { commandPath: [], level: "sub", rows: rootRows(specs, partial) };
+    return { commandPath: [], level: "sub", rows: rootRows(specs, partial), replaceStart, replaceEnd };
   }
   if (first.isFlag) return null;
   const root = specs.find((spec) => spec.name === first.text);
@@ -333,21 +347,21 @@ export function matchSpecLine(line: string, specs: CompletionSpecs): SpecMatch |
       const flag = findFlag(command, bareName);
       const valuePrefix = partial.slice(equals + 1);
       if (flag) {
-        return { commandPath, level: "value", rows: valueRows(flag, valuePrefix, typedFlagPrefix), dynamic: { kind: "flag-value", flag: flag.name } };
+        return { commandPath, level: "value", rows: valueRows(flag, valuePrefix, typedFlagPrefix), dynamic: { kind: "flag-value", flag: flag.name }, replaceStart, replaceEnd };
       }
-      return { commandPath, level: "value", rows: [] };
+      return { commandPath, level: "value", rows: [], replaceStart, replaceEnd };
     }
-    return { commandPath, level: "flag", rows: flagRows(command, partial) };
+    return { commandPath, level: "flag", rows: flagRows(command, partial), replaceStart, replaceEnd };
   }
   // value 层：上一个完整 token 是等待值的 flag（如 `kubectl get -o `）。
   if (pendingValueFlag) {
-    return { commandPath, level: "value", rows: valueRows(pendingValueFlag, partial, ""), dynamic: { kind: "flag-value", flag: pendingValueFlag.name } };
+    return { commandPath, level: "value", rows: valueRows(pendingValueFlag, partial, ""), dynamic: { kind: "flag-value", flag: pendingValueFlag.name }, replaceStart, replaceEnd };
   }
   // sub 层：子命令 + 位置参数候选（-- 终结符之后不再拿 flags 兜底）。
   const positionalDynamic = !positionalFilled && command.positional?.dynamic
     ? { kind: "positional", name: command.positional.name } as const
     : undefined;
-  return { commandPath, level: "sub", rows: terminated ? subRows(command, partial, positionalFilled, false) : subRows(command, partial, positionalFilled, true), dynamic: positionalDynamic };
+  return { commandPath, level: "sub", rows: terminated ? subRows(command, partial, positionalFilled, false) : subRows(command, partial, positionalFilled, true), dynamic: positionalDynamic, replaceStart, replaceEnd };
 }
 
 /** flag 候选：长名行 + （当前前缀恰为某短名时的短名行）；`--` 与 `-` 全量展开。 */
@@ -462,19 +476,3 @@ function rankRows(rows: CompletionRow[]): CompletionRow[] {
     .slice(0, SPEC_COMPLETION_MAX_ROWS);
 }
 
-// ---------------------------------------------------------------------------
-// 接受候选时的行替换（issue #120）：候选 token 只替换行尾正在输入的词，
-// 已敲的命令前缀必须原样保留——此前把整行换成单个 token，`git ch` + Enter
-// 接受 checkout 后行变成 `checkout `，命令前缀被抹掉（"之前的输入被覆盖"）。
-// ---------------------------------------------------------------------------
-
-/**
- * 把 line 的行尾非空白 token 替换为 token（space 为 true 时补一个空格进入
- * 下一层）；行尾是空白（或空行）时在原行后直接追加。与 matchSpecLine 的
- * 行尾 token 语义配套：candidate token 即「行尾正在输入的词」的替换文本。
- */
-export function lineWithTrailingTokenReplaced(line: string, token: string, space: boolean): string {
-  const trailing = /\S+$/.exec(line);
-  const start = trailing ? trailing.index : line.length;
-  return `${line.slice(0, start)}${token}${space ? " " : ""}`;
-}

@@ -2,7 +2,7 @@
 // matchSpecLine 层级匹配（根前缀 → 子命令 → flag → 值，评分排序与截断）。
 // 语法分支用内联合成 spec 精确断言；真实数据集另跑冒烟断言（specs/index）。
 import { describe, expect, it } from "vitest";
-import { lineWithTrailingTokenReplaced, matchSpecLine, splitCommandLine, SPEC_COMPLETION_MAX_ROWS, type CompletionSpecs } from "./spec";
+import { matchSpecLine, splitCommandLine, SPEC_COMPLETION_MAX_ROWS, type CompletionSpecs } from "./spec";
 import { COMPLETION_SPECS } from "./specs";
 
 // ---------------------------------------------------------------------------
@@ -230,26 +230,6 @@ describe("matchSpecLine · bundled specs", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// lineWithTrailingTokenReplaced（issue #120）：接受候选只替换行尾 token，
-// 命令前缀保留；尾空白/空行时追加。防回归：整行被换成单个 token 的旧 bug。
-// ---------------------------------------------------------------------------
-describe("lineWithTrailingTokenReplaced", () => {
-  it("replaces only the trailing partial token and keeps the prefix", () => {
-    expect(lineWithTrailingTokenReplaced("git ch", "checkout", true)).toBe("git checkout ");
-    expect(lineWithTrailingTokenReplaced("git checkout --b", "--branch", true)).toBe("git checkout --branch ");
-    expect(lineWithTrailingTokenReplaced("kubectl get -o js", "json", true)).toBe("kubectl get -o json ");
-  });
-
-  it("appends after trailing whitespace or on an empty line", () => {
-    expect(lineWithTrailingTokenReplaced("git ", "add", true)).toBe("git add ");
-    expect(lineWithTrailingTokenReplaced("", "ls", true)).toBe("ls ");
-  });
-
-  it("keeps the line unchanged apart from the token when no space follows", () => {
-    expect(lineWithTrailingTokenReplaced("git st", "status", false)).toBe("git status");
-  });
-});
 
 // ---------------------------------------------------------------------------
 // review #120 跟进：-- 终结符状态与 flag 接受语义的锁定测试。
@@ -283,5 +263,38 @@ describe("flag acceptance spacing", () => {
     expect(flags?.rows.every((row) => row.space)).toBe(true);
     const short = matchSpecLine("syn alpha -f", SYNTHETIC);
     expect(short?.rows[0]).toEqual(expect.objectContaining({ token: "-f", space: true }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// replacement range（review 第一批遗留）：parser 返回行尾 token 的精确边界，
+// 接受逻辑按范围替换、不再用 /\S+$ 反推（含引号/转义表面的正确性）。
+// ---------------------------------------------------------------------------
+describe("splitCommandLine token ranges & matchSpecLine replace range", () => {
+  it("reports the partial token range for plain tokens", () => {
+    const match = matchSpecLine("git ch", COMPLETION_SPECS);
+    expect(match?.replaceStart).toBe(4);
+    expect(match?.replaceEnd).toBe(6);
+  });
+
+  it("uses the end of the line as an insertion point after trailing whitespace", () => {
+    const match = matchSpecLine("git checkout ", COMPLETION_SPECS);
+    expect(match?.replaceStart).toBe(13);
+    expect(match?.replaceEnd).toBe(13);
+  });
+
+  it("covers the whole inline --flag=value surface", () => {
+    const match = matchSpecLine("kubectl get --output=j", COMPLETION_SPECS);
+    const line = "kubectl get --output=j";
+    expect(match?.replaceStart).toBe(line.indexOf("--output=j"));
+    expect(match?.replaceEnd).toBe(line.length);
+  });
+
+  it("covers quoted token surfaces including the quote characters", () => {
+    const tokens = splitCommandLine('git commit -m "hello world');
+    const last = tokens.tokens[tokens.tokens.length - 1];
+    expect(last.text).toBe("hello world");
+    expect(last.start).toBe(14); // 起点含开引号
+    expect(last.end).toBe(26); // 行尾（未闭引号）
   });
 });
