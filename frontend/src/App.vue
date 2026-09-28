@@ -3974,8 +3974,8 @@ function drainTerminalFrames() {
 }
 
 // 本地终端输出与 SSH 同一帧协议（stream + u64 sequence），复用乱序重组与
-// 空洞补发；补发失败或 State 帧到来即落退出态——本地会话重启成本极低，
-// 不需要 SSH 那套不可恢复横幅。
+// 空洞补发；State 帧到来即落退出态。补发不完整只 resync 到缓冲尾部——
+// 环形缓冲淘汰不可恢复，但活会话不能被误判成已退出。
 function drainLocalTerminalFrames() {
   let frame = localPendingFrames.get(localLastSequence.value + 1);
   while (frame) {
@@ -3989,36 +3989,53 @@ function drainLocalTerminalFrames() {
     frame = localPendingFrames.get(localLastSequence.value + 1);
   }
   if (localPendingFrames.size > TERMINAL_PENDING_FRAME_LIMIT) {
+    // 洪峰把有序帧一并丢弃后必须主动补拉一次：清空后 firstPending 变
+    // Infinity，下面的洞检测永不触发——会话活着、输入正常、画面停在洪峰前。
     localPendingFrames.clear();
+    requestLocalReplay(localLastSequence.value, null);
+    return;
   }
   const firstPending = Math.min(...localPendingFrames.keys());
-  if (Number.isFinite(firstPending) && firstPending > localLastSequence.value + 1 && !localReplayInFlight && localSession.value) {
-    const sessionId = localSession.value.sessionId;
-    localReplayInFlight = true;
-    const holeAt = localLastSequence.value;
-    void window.dbxPlugin
-      .invoke<ReplayResult>("local/terminal/replay", { sessionId, afterSequence: localLastSequence.value })
-      .then((result) => {
-        if (!result.complete) {
-          markLocalExited(null);
-          return;
-        }
-        if (localLastSequence.value === holeAt) {
-          localReplayNoProgress += 1;
-          if (localReplayNoProgress >= 3) {
-            localLastSequence.value = firstPending - 1;
-            localReplayNoProgress = 0;
-          }
-        } else {
+  if (Number.isFinite(firstPending) && firstPending > localLastSequence.value + 1) {
+    requestLocalReplay(localLastSequence.value, firstPending - 1);
+  }
+}
+
+// 本地会话统一的补发拉取：从 afterSequence 起 拉 sidecar 环形缓冲。
+// complete=false 表示缓冲淘汰过帧、[hole, firstAvailable) 不可恢复——resync
+// 到缓冲首帧继续收尾部（协议承诺 webview 重载可接回活 shell，判死即违背）；
+// complete=true 但洞始终补不上时保留"连续三轮无进展就跳洞"的梯子。
+function requestLocalReplay(holeAt: number, resyncTarget: number | null) {
+  const session = localSession.value;
+  if (!session || localReplayInFlight) return;
+  localReplayInFlight = true;
+  void window.dbxPlugin
+    .invoke<ReplayResult>(
+      "local/terminal/replay",
+      { sessionId: session.sessionId, afterSequence: holeAt },
+      // 启动引导路径会经过这里：桥丢响应时不能无限 pending 卡住工作台。
+      { timeoutMs: 10_000 },
+    )
+    .then((result) => {
+      if (!result.complete) {
+        localLastSequence.value = Math.max(0, result.firstAvailableSequence - 1);
+        return;
+      }
+      if (localLastSequence.value === holeAt) {
+        localReplayNoProgress += 1;
+        if (localReplayNoProgress >= 3 && resyncTarget !== null) {
+          localLastSequence.value = resyncTarget;
           localReplayNoProgress = 0;
         }
-      })
-      .catch(() => markLocalExited(null))
-      .finally(() => {
-        localReplayInFlight = false;
-        drainLocalTerminalFrames();
-      });
-  }
+      } else {
+        localReplayNoProgress = 0;
+      }
+    })
+    .catch(() => markLocalExited(null))
+    .finally(() => {
+      localReplayInFlight = false;
+      drainLocalTerminalFrames();
+    });
 }
 
 // 传输断开/会话被杀的统一入口：有界退避自动重连，梯子耗尽才落到
@@ -4693,7 +4710,7 @@ async function startLocalTerminal(shellOverride?: string) {
       // 与同文件其他交互调用一致地给超时，失败落入 catch 走 showError。
     }, { timeoutMs: 10_000 });
     if (disposed) {
-      void window.dbxPlugin.invoke("local/session/close", { sessionId: info.sessionId }).catch(() => undefined);
+      void window.dbxPlugin.invoke("local/session/close", { sessionId: info.sessionId }, { timeoutMs: 10_000 }).catch(() => undefined);
       return;
     }
     localSession.value = { sessionId: info.sessionId, shell: info.shell };
@@ -4723,7 +4740,7 @@ async function closeLocalTerminal() {
   sessionMenuOpen.value = false;
   sessionMenuShellOpen.value = false;
   if (!sessionId) return;
-  await window.dbxPlugin.invoke("local/session/close", { sessionId }).catch(() => undefined);
+  await window.dbxPlugin.invoke("local/session/close", { sessionId }, { timeoutMs: 10_000 }).catch(() => undefined);
   terminal?.focus();
 }
 
@@ -5307,7 +5324,9 @@ async function confirmLocalTerminal() {
 }
 
 // —— shell 选择器：多平台 shell 发现 + 偏好（VS Code terminal profiles 简化版）——
-async function openLocalShellPrefs() {
+// 发现清单两个入口（设置菜单 / dock「+」面板菜单）共用；失败静默降级为仅
+// 自动探测入口，loading 守卫防重入。
+async function loadLocalShells() {
   if (localShellsLoading.value || localShells.value.length) return;
   localShellsLoading.value = true;
   try {
@@ -5320,6 +5339,10 @@ async function openLocalShellPrefs() {
   }
 }
 
+async function openLocalShellPrefs() {
+  await loadLocalShells();
+}
+
 // Dock panel "+": opens another dock entry with the selected shell type via the bridge openWorkbench
 // (the host owns the surface: inside a panel webview -> a new dock entry; inside a tab -> a new tab).
 const localShellSurfaceOpen = ref(false);
@@ -5328,16 +5351,7 @@ const localShellSurfaceOpen = ref(false);
 const dockConnections = ref<Array<{ id: string; name: string; providerId: string; connectionType?: string; readOnly?: boolean }>>([]);
 async function openLocalShellSurfaceMenu() {
   localShellSurfaceOpen.value = true;
-  if (localShellsLoading.value || localShells.value.length) return;
-  localShellsLoading.value = true;
-  try {
-    const result = await window.dbxPlugin.invoke<{ shells: typeof localShells.value }>("local/shells/list", {}, { timeoutMs: 10_000 });
-    localShells.value = result.shells || [];
-  } catch {
-    // Legacy sidecars without discovery: the menu degrades to the auto-detect entry.
-  } finally {
-    localShellsLoading.value = false;
-  }
+  await loadLocalShells();
   try {
     const listed = await window.dbxPlugin.request<{ connections?: typeof dockConnections.value }>("host.listConnections");
     dockConnections.value = listed?.connections ?? [];
@@ -5417,8 +5431,10 @@ async function reattachLocalSession(): Promise<boolean> {
     localExitCode.value = null;
     localLastSequence.value = 0;
     localPendingFrames.clear();
-    const replay = await window.dbxPlugin.invoke<ReplayResult>("local/terminal/replay", { sessionId: match.sessionId, afterSequence: 0 });
-    if (!replay.complete) markLocalExited(null);
+    // 回放走统一补发路径（requestLocalReplay，自带超时与 resync）：环形缓冲
+    // 淘汰过帧的活会话（累计输出 > 2MiB 必然发生）接回尾部继续，而不是被
+    // !complete 误判成已退出——shell 在 sidecar 里还活着。
+    requestLocalReplay(0, null);
     await nextTick();
     scheduleFit();
     return true;
