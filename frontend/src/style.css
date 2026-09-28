@@ -517,6 +517,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
    z-50 统一参与根级排序，与右键菜单同档（菜单后挂载 DOM 序靠后自然盖住）。 */
 .transfer-popover { gap: 0; width: min(340px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 52px)); padding: 8px; overflow: auto; }
 .transfer-popover h3 { margin: 2px 4px 8px; font-size: 12px; }
+/* Docker 工具条弹层（鲸鱼入口）：容器表需要比侧栏宽的横向空间，关闭即卸载。 */
+.docker-toolbar-popover { gap: 0; width: min(760px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 52px)); padding: 10px; overflow: auto; }
 .transfer-card { display: grid; grid-template: "title actions" auto "progress progress" auto "meta meta" auto "path path" auto "error error" auto / minmax(0, 1fr) auto; position: relative; column-gap: 6px; row-gap: 4px; border-top: 1px solid var(--border); padding: 7px 4px; }
 .transfer-title { grid-area: title; min-width: 0; gap: 6px; }
 .transfer-title span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

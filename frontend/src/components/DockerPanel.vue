@@ -16,14 +16,23 @@ import {
   RefreshCw,
   RotateCw,
   ScrollText,
+  Settings,
   Square,
   Terminal,
   Trash2,
   X,
 } from "@lucide/vue";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import { Popover, PopoverAnchor, PopoverContent } from "./ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { normalizeBatchTargets } from "../lib/batchSend";
+import {
+  dockerEngineParams,
+  loadDockerEngineSettings,
+  saveDockerEngineSettings,
+  validateDockerEngineSettings,
+  type DockerEngineSettings,
+} from "../lib/dockerEngine";
 import {
   confirmDockerAction,
   requestDockerAction,
@@ -99,9 +108,11 @@ function dockerListPayload(raw: unknown): { available: boolean; needsSudo: boole
   };
 }
 
-/** 「在终端打开」命令：容器内挑一个可用 shell（与 NyaTerm 约定一致）。 */
+/** 「在终端打开」命令：容器内挑一个可用 shell（与 NyaTerm 约定一致）。
+ *  CLI 跟随引擎设置（podman 等自定义命令同样可进终端 exec）。 */
 function dockerExecCommand(containerId: string): string {
-  return `docker exec -it ${containerId} sh -lc 'bash || zsh || fish || ash || sh'`;
+  const cli = engineSettings.value.cli || "docker";
+  return `${cli} exec -it ${containerId} sh -lc 'bash || zsh || fish || ash || sh'`;
 }
 
 /** 状态徽标 class：已知状态着色，未知状态走中性灰。 */
@@ -111,27 +122,72 @@ function dockerStateClass(state: string): string {
 }
 
 // —— 会话解析（SideNavPanel 不透传 session，面板自取最近存活会话）———————
+// 无存活 SSH 会话时回落 target:"local"——查询 sidecar 所在机器的 docker
+// daemon（Docker Desktop/OrbStack），面板不再是「没连服务器就空转」。
+type PanelMode = "ssh" | "local";
 const sessionId = ref("");
-const sessionMissing = ref(false);
+const mode = ref<PanelMode>("ssh");
 
-async function resolveSession(): Promise<boolean> {
-  if (sessionId.value) return true;
+// —— 引擎连接设置（Podman / 自定义 socket / tcp host）———————————————————
+// 按连接持久化（connectionId 为键，local 模式 "local"）；随每次 docker 家族
+// invoke 以 cli/socket/host 附加参数下发，sidecar 负责归一与最终校验。
+const connectionKey = ref("");
+const engineSettings = ref<DockerEngineSettings>({ ...loadDockerEngineSettings("") });
+const engineOpen = ref(false);
+const engineDraft = ref<DockerEngineSettings>({ cli: "", socket: "", host: "" });
+const engineErrors = computed(() => validateDockerEngineSettings(engineDraft.value).errors);
+
+function toggleEngineSettings(): void {
+  engineOpen.value = !engineOpen.value;
+  if (engineOpen.value) engineDraft.value = { ...engineSettings.value };
+}
+
+/** 保存即生效并重采列表；非法草稿（红线不满足）不落盘。 */
+function applyEngineSettings(): void {
+  const { settings, errors } = validateDockerEngineSettings(engineDraft.value);
+  if (errors.cli || errors.endpoints) return;
+  engineSettings.value = settings;
+  saveDockerEngineSettings(connectionKey.value, settings);
+  void refresh();
+}
+
+async function resolveMode(): Promise<PanelMode> {
+  if (mode.value === "ssh" && sessionId.value) return "ssh";
   try {
     const response = await window.dbxPlugin.invoke<{ sessions: unknown }>("ssh/sessions/list");
     const targets = normalizeBatchTargets(response.sessions)
       .filter((target) => target.connected !== false)
       .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-    if (!targets.length) {
-      sessionMissing.value = true;
-      return false;
+    if (targets.length) {
+      sessionId.value = targets[0].sessionId;
+      mode.value = "ssh";
+      adoptConnection(targets[0].connectionId);
+      return "ssh";
     }
-    sessionId.value = targets[0].sessionId;
-    sessionMissing.value = false;
-    return true;
   } catch {
-    sessionMissing.value = true;
-    return false;
+    // 会话枚举失败（旧 sidecar 等）同样回落本机探测。
   }
+  mode.value = "local";
+  adoptConnection("");
+  return "local";
+}
+
+/** 切换持久化键并装载该连接的引擎设置（新连接不继承上一台主机配置）。 */
+function adoptConnection(connectionId: string): void {
+  const nextKey = connectionId || "local";
+  if (nextKey === connectionKey.value) return;
+  connectionKey.value = nextKey;
+  engineSettings.value = loadDockerEngineSettings(nextKey);
+  if (engineOpen.value) engineDraft.value = { ...engineSettings.value };
+}
+
+/** 按当前模式组装 docker 家族参数：local 不需要 sessionId；引擎设置随行。 */
+function dockerParams(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  const base =
+    mode.value === "local"
+      ? { target: "local" as const, ...extra }
+      : { sessionId: sessionId.value, ...extra };
+  return { ...base, ...dockerEngineParams(engineSettings.value) };
 }
 
 // —— 列表 + 轮询（10s；3 连败停轮询，弱化空态）——————————————
@@ -147,11 +203,15 @@ let consecutiveFailures = 0;
 
 async function refresh(): Promise<void> {
   if (loading.value) return;
-  if (!(await resolveSession())) return;
+  await resolveMode();
   loading.value = true;
   try {
     const payload = dockerListPayload(
-      await window.dbxPlugin.invoke<unknown>("docker/list", { sessionId: sessionId.value }, { timeoutMs: LIST_TIMEOUT_MS }),
+      await window.dbxPlugin.invoke<unknown>(
+        "docker/list",
+        dockerParams(),
+        { timeoutMs: LIST_TIMEOUT_MS },
+      ),
     );
     containers.value = payload.containers;
     available.value = payload.available;
@@ -215,12 +275,12 @@ function requestAction(container: DockerContainer, action: DockerActionName): vo
 }
 
 async function runAction(dispatch: DockerActionDispatch): Promise<void> {
-  if (!(await resolveSession())) return;
+  await resolveMode();
   busyContainerId.value = dispatch.id;
   try {
     await window.dbxPlugin.invoke<{ success: boolean; output: string }>(
       "docker/action",
-      { sessionId: sessionId.value, containerId: dispatch.id, action: dispatch.action },
+      dockerParams({ containerId: dispatch.id, action: dispatch.action }),
       { timeoutMs: ACTION_TIMEOUT_MS },
     );
     await refresh();
@@ -263,13 +323,14 @@ function openLogs(container: DockerContainer): void {
 
 async function loadLogs(): Promise<void> {
   const target = logsTarget.value;
-  if (!target || !(await resolveSession())) return;
+  if (!target) return;
+  await resolveMode();
   logsBusy.value = true;
   logsError.value = "";
   try {
     const payload = await window.dbxPlugin.invoke<{ logs?: string; container?: DockerInspectSummary | null }>(
       "docker/logs",
-      { sessionId: sessionId.value, containerId: target.id, tail: Number(logsTail.value) || 200 },
+      dockerParams({ containerId: target.id, tail: Number(logsTail.value) || 200 }),
       { timeoutMs: LOGS_TIMEOUT_MS },
     );
     logsText.value = typeof payload.logs === "string" ? payload.logs : "";
@@ -307,8 +368,12 @@ const running = (container: DockerContainer): boolean => container.state === "ru
   <div class="docker-panel">
     <div class="docker-header">
       <strong>{{ props.t("docker.title") }}</strong>
+      <span v-if="mode === 'local'" class="docker-source-badge">{{ props.t("docker.localSource") }}</span>
       <span v-if="available && containers.length" class="docker-count">{{ containers.length }}</span>
       <span class="docker-header-spacer" />
+      <button v-if="engineSettings.cli" type="button" class="docker-engine-badge" :title="props.t('docker.engineBadge', { cli: engineSettings.cli })" @click="toggleEngineSettings">
+        {{ engineSettings.cli }}
+      </button>
       <button
         v-if="pollPaused"
         type="button"
@@ -322,6 +387,50 @@ const running = (container: DockerContainer): boolean => container.state === "ru
         <Loader2 v-if="loading" class="spinning" />
         <RefreshCw v-else />
       </button>
+      <Popover :open="engineOpen" @update:open="(open: boolean) => { if (!open) engineOpen = false; }">
+        <PopoverAnchor as-child>
+          <button type="button" class="icon-button" :class="{ 'is-active': engineOpen }" :title="props.t('docker.engineSettings')" @click="toggleEngineSettings">
+            <Settings />
+          </button>
+        </PopoverAnchor>
+        <PopoverContent class="popover docker-engine-popover" align="end" :side-offset="5">
+          <h3>{{ props.t("docker.engineSettings") }}</h3>
+          <label class="docker-engine-field">
+            <span>{{ props.t("docker.engineCli") }}</span>
+            <input
+              v-model="engineDraft.cli"
+              class="mono"
+              :placeholder="props.t('docker.engineCliPlaceholder')"
+              spellcheck="false"
+              @change="applyEngineSettings"
+            />
+          </label>
+          <label class="docker-engine-field">
+            <span>{{ props.t("docker.engineSocket") }}</span>
+            <input
+              v-model="engineDraft.socket"
+              class="mono"
+              :placeholder="props.t('docker.engineSocketPlaceholder')"
+              spellcheck="false"
+              @change="applyEngineSettings"
+            />
+          </label>
+          <label class="docker-engine-field">
+            <span>{{ props.t("docker.engineHost") }}</span>
+            <input
+              v-model="engineDraft.host"
+              class="mono"
+              :placeholder="props.t('docker.engineHostPlaceholder')"
+              spellcheck="false"
+              @change="applyEngineSettings"
+            />
+          </label>
+          <p v-if="engineErrors.cli" class="docker-hint docker-hint-error">{{ props.t("docker.engineInvalidCli") }}</p>
+          <p v-else-if="engineErrors.endpoints === 'conflict'" class="docker-hint docker-hint-error">{{ props.t("docker.engineConflict") }}</p>
+          <p v-else-if="engineErrors.endpoints" class="docker-hint docker-hint-error">{{ props.t("docker.engineInvalidEndpoint") }}</p>
+          <p class="docker-hint">{{ props.t("docker.engineHint") }}</p>
+        </PopoverContent>
+      </Popover>
     </div>
 
     <p v-if="pollPaused" class="docker-hint docker-hint-warn">{{ props.t("docker.pollStopped") }}</p>
@@ -332,17 +441,16 @@ const running = (container: DockerContainer): boolean => container.state === "ru
       {{ props.t("docker.actionFailed", { error: actionError }) }}
     </p>
 
-    <!-- 会话缺失：无可操作对象 -->
-    <p v-if="sessionMissing && !loading" class="docker-empty">{{ props.t("docker.sessionMissing") }}</p>
-
     <!-- 加载中 -->
-    <p v-else-if="loading && available === null" class="docker-empty"><Loader2 class="spinning" />{{ props.t("docker.loading") }}</p>
+    <p v-if="loading && available === null" class="docker-empty"><Loader2 class="spinning" />{{ props.t("docker.loading") }}</p>
 
-    <!-- Docker 不可用：弱化空态，按探针结果解释原因 -->
+    <!-- Docker 不可用：弱化空态，按探针结果解释原因（本机 daemon 拒绝走本地文案） -->
     <div v-else-if="available === false" class="docker-empty">
       <p class="docker-empty-title">{{ props.t("docker.unavailableTitle") }}</p>
       <p class="docker-empty-hint">
-        {{ needsSudo ? props.t("docker.unavailableSudo") : props.t("docker.unavailableMissing") }}
+        <template v-if="!needsSudo">{{ props.t("docker.unavailableMissing") }}</template>
+        <template v-else-if="mode === 'local'">{{ props.t("docker.unavailableSudoLocal") }}</template>
+        <template v-else>{{ props.t("docker.unavailableSudo") }}</template>
       </p>
     </div>
 
@@ -427,6 +535,7 @@ const running = (container: DockerContainer): boolean => container.state === "ru
                 <ScrollText />
               </button>
               <button
+                v-if="mode === 'ssh'"
                 type="button"
                 class="icon-button"
                 :class="{ 'is-copied': fillRequestedId === container.id }"
@@ -440,7 +549,7 @@ const running = (container: DockerContainer): boolean => container.state === "ru
           </tr>
         </tbody>
       </table>
-      <p class="docker-hint">{{ props.t("docker.terminalHint") }}</p>
+      <p v-if="mode === 'ssh'" class="docker-hint">{{ props.t("docker.terminalHint") }}</p>
     </div>
 
     <!-- kill/rm 强制确认 -->
@@ -454,7 +563,7 @@ const running = (container: DockerContainer): boolean => container.state === "ru
           <button type="button" class="icon-button" :title="props.t('docker.cancel')" @click="confirmAction(false)"><X /></button>
         </div>
         <p class="docker-confirm-body mono">
-          {{ confirmTarget ? props.t("docker.confirmBody", { action: confirmTarget.action, name: confirmTarget.name }) : "" }}
+          {{ confirmTarget ? props.t("docker.confirmBody", { cli: engineSettings.cli || "docker", action: confirmTarget.action, name: confirmTarget.name }) : "" }}
         </p>
         <div class="docker-dialog-actions">
           <button type="button" class="docker-secondary-button" :disabled="confirmBusy" @click="confirmAction(false)">
@@ -528,6 +637,57 @@ const running = (container: DockerContainer): boolean => container.state === "ru
 .docker-count {
   font-size: 11px;
   opacity: 0.65;
+}
+
+.docker-source-badge {
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
+  background: rgba(90, 140, 220, 0.22);
+  white-space: nowrap;
+}
+
+/* 引擎设置（齿轮弹层）：紧凑表单，保存即生效。 */
+.docker-engine-badge {
+  border: none;
+  background: none;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+  background: rgba(90, 140, 220, 0.22);
+  white-space: nowrap;
+}
+
+.docker-engine-popover {
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.docker-engine-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+}
+
+.docker-engine-field input {
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--background, transparent);
+  color: inherit;
+}
+
+.docker-engine-field input::placeholder {
+  opacity: 0.45;
 }
 
 .docker-table-wrap {

@@ -576,6 +576,27 @@ Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
 
 `network` 速率为两次快照间的字节/秒；`rxTotal` / `txTotal` 为第二次快照的累计字节数。`processes` 为按 CPU 排序的前 8 进程，`topMemory` 为按内存占用排序的前 8 进程（两者字段同构，均为扩展字段，旧 sidecar 可能缺失——调用方按可选处理）。`disks[].inodeUsePercent` 为该挂载点的 inode 使用率（百分比数值），仅当 `df -iP` 采集到对应挂载时出现（GNU/busybox 列布局差异由解析端吸收）。`command` 截断到 120 字符。快照缓存仅存内存（每会话一份），会话关闭即清除。只读命令，只读连接同样可用。
 
+## Docker 管理面板
+
+Docker 家族（`docker/list` / `docker/logs` / `docker/action`）通过固定采集脚本 + 纯解析器驱动远端或本机容器 CLI，不接 daemon API、零新增依赖。三个方法都接受可选 `target` 与引擎/端点参数（`cli` / `socket` / `host`，兼容 Podman 与自定义 daemon）：
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `target` | string | 否 | `"ssh"`（默认）：按 `sessionId` 在远端主机执行；`"local"`：在 sidecar 所在机器执行（Docker Desktop / OrbStack / rootless），免 `sessionId`。非法值报 `Unsupported docker target` |
+| `cli` | string | 否 | 容器 CLI 命令名或全路径（默认 `"docker"`；如 `"podman"`、`"/usr/local/bin/podman"`）。字符白名单 `[A-Za-z0-9_.\\/:/-]`（1–256），shell/cmd 元字符一律拒绝 |
+| `socket` | string | 否 | daemon unix socket（如 `"/run/user/1000/podman/podman.sock"`；裸路径自动补 `unix://`；显式 `unix://` / `npipe:` 前缀直通）。与 `host` 互斥 |
+| `host` | string | 否 | daemon tcp 端点（如 `"127.0.0.1:2375"` 裸值自动补 `tcp://`；`tcp://` / `http(s)://` 直通）。与 `socket` 互斥 |
+
+端点下发机制：sidecar 把归一后的端点以环境变量形式传给 CLI——POSIX 采集脚本内 `export DOCKER_HOST=<ep> CONTAINER_HOST=<ep>`（sudo 提权重采同样烙在脚本体里，env_reset 剥不走），本机面直呼进程时 `.env()` 注入，Windows cmd 兜底用 `set` 行/`set …&&` 前缀。Docker 读 `DOCKER_HOST`、Podman 读 `CONTAINER_HOST`，一份设置两个引擎通用，且端点永不进命令行参数。
+
+- **docker/list**：返回 `{available, needsSudo, containers}`。采集脚本先探针（`command -v <cli>` + `<cli> info`，区分「未装 CLI」与「daemon socket 拒绝」），再 `<cli> ps -a --no-trunc --format` 七列制表输出（id/name/image/state/status/ports/createdAt）。脚本内预置 PATH 加固（`/usr/local/bin`、`/opt/homebrew/bin`、Docker.app、`~/.docker/bin`、OrbStack、snap 等），修复 macOS GUI 子进程与 sshd 非交互 shell 的残缺 PATH 误报「未安装」。本机面（`target:"local"`）由 `find_local_cli` 按 cli 名/路径发现 CLI（路径形态直接探测、名字形态走 PATH + 同源目录）、argv 直呼进程（无 shell、Windows 可用）。
+- **Windows 远端兜底**：输出不含 `DBXDOCKER_PROBE` 标记（cmd/PowerShell 跑不了 heredoc 的唯一签名）时，自动多花一个往返改用 cmd 版采集器（`where /q <cli>` + `<cli> info` + `<cli> ps`，CRLF 由解析端逐字段吸收；配置端点时以 `set` 行注入）；POSIX 主机恒有标记，不会触发。
+- **Quick Sudo 提权**：探针为 found-but-denied（`needsSudo: true`）且连接配置了 Quick Sudo 时，list 自动用 `sudo -S -p '' sh -c '<脚本体>'` 提权重采（密码走 stdin、脚本体走 argv）；logs 在输出命中 daemon 权限签名时同样提权重采。只读连接、sudoers 白名单拒绝、提权失败一律退回原 payload 保留提示，只读调用不报错。
+- **docker/logs**：`{sessionId|target, containerId, tail?, cli?, socket?, host?}`，返回 `{logs, container?}`；`tail` 钳制到 [10, 2000]（默认 200）。inspect 失败（容器消失）降级 `container: null`。
+- **docker/action**：`{sessionId|target, containerId, action, cli?, socket?, host?}`，动词白名单 `start/stop/restart/kill/rm`；`containerId` 必须 12–64 位小写十六进制（容器名一律拒绝）；执行前写审计（意图行 + 失败行，审计文本为 `<cli> <动词> <id>` 短形态，端点 export 只在执行文本里）。plain 失败且命中 daemon 权限签名才回落 Quick Sudo 管线（重放同一条含端点 export 的执行文本；其余失败重试可能把半执行动作应用两次）；本机面无提权管线，daemon 拒绝返回指引文案。kill/rm 由前端/MCP 确认门强制二次确认，只读连接直接拒绝。
+
+MCP 面 `docker_list` / `docker_action` 同语义，schema 同步声明 `cli` / `socket` / `host` 可选属性；`target:"local"` 免连接选择器（schema `anyOf` 首选 `{"required":["target"]}`），`docker_list` 在 needsSudo 时用可解析的 Quick Sudo 凭据自动提权。MCP 确认门的审批文本取 `<cli> <动词> <id>`（Podman 审批显示 `podman rm …`）。
+
 ## 二进制通道
 
 - `ssh/terminal/in/{sessionId}`：原始终端输入。

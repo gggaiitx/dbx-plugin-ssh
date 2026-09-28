@@ -683,6 +683,38 @@ def main() -> None:
         print("ssh_alert_triage intent recognition ok (cpu/memory/disk/network/oom/service/generic)")
         print("ssh_alert_triage offline round-trip ok")
 
+        # Docker family target:"local" (0.7.1-beta.10): the daemon on the
+        # machine the sidecar runs on — Docker Desktop, OrbStack, rootless.
+        # Offline-safe: shape assertions only, because a dev box may or may
+        # not have a local docker CLI / running daemon.
+        send(proc, {
+            "jsonrpc": "2.0", "id": 9100, "method": "tools/call",
+            "params": {"name": "docker_list", "arguments": {"target": "local"}},
+        })
+        local_list = recv(proc, 9100)
+        assert not local_list.get("error"), f"docker_list target=local failed: {local_list}"
+        local_result = local_list["result"]
+        assert not local_result.get("isError", False), f"local list errored: {local_result}"
+        local_payload = json.loads(local_result["content"][0]["text"])
+        assert isinstance(local_payload.get("available"), bool), local_payload
+        assert isinstance(local_payload.get("needsSudo"), bool), local_payload
+        assert isinstance(local_payload.get("containers"), list), local_payload
+        print("docker_list target=local shape ok")
+
+        # The schema must advertise the local selector next to the SSH ones.
+        docker_schema_any_of = by_name["docker_list"]["inputSchema"]["anyOf"]
+        assert {"required": ["target"]} in docker_schema_any_of, docker_schema_any_of
+        print("docker_list target selector schema ok")
+
+        # Unknown target values must fail before any process/connection I/O.
+        send(proc, {
+            "jsonrpc": "2.0", "id": 9101, "method": "tools/call",
+            "params": {"name": "docker_list", "arguments": {"target": "bogus"}},
+        })
+        target_error = recv(proc, 9101)["error"]["message"]
+        assert "Unsupported docker target" in target_error, target_error
+        print("docker target validation ok")
+
         # Global Quick Sudo profiles: save/list/delete round-trip with a
         # runtime-assembled test secret; responses must never echo it.
         secret = f"smoke-{uuid.uuid4().hex}"

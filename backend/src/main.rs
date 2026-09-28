@@ -1156,30 +1156,96 @@ impl Plugin {
                     .block_on(self.ssh.metrics_history(session_id, limit))
             }
             // Docker 管理面板（IMPL_PLAN Task P2-4）。列表/日志是只读采集
-            // 脚本（探针区分「未装 docker」与「daemon socket 拒绝」）；动作
+            // 脚本（探针区分「未装容器 CLI」与「daemon socket 拒绝」）；动作
             // 走白名单动词 + 容器 id 严格校验 + 只读连接直接拒绝 + 执行前
             // 审计，plain 失败且命中 daemon 权限签名时才回落 Quick Sudo
             // 管线（密码只走 stdin，绝不拼进命令行）。
+            // `target: "local"` 切换到 sidecar 所在本机 daemon（Docker
+            // Desktop/OrbStack/无 SSH 会话场景）：无需 sessionId，动作仍过
+            // 审计与同一套白名单/id 门。可选 cli/socket/host 参数切换引擎
+            // 与 daemon 端点（Podman / 自定义 socket / tcp host）。
             "docker/list" => {
+                let engine = docker::parse_engine(&params)?;
+                if docker::parse_target(&params)? == docker::DockerTarget::Local {
+                    return self.runtime.block_on(docker::collect_list_local(&engine));
+                }
                 let session_id = required_string(&params, "sessionId")?;
                 let response = self.runtime.block_on(self.ssh.exec(
                     session_id,
                     None,
-                    docker::LIST_SCRIPT,
+                    &docker::list_script(&engine),
                     false,
                     Some(docker::LIST_TIMEOUT.as_secs()),
                 ))?;
-                let output = response
+                let mut output = response
                     .get("output")
                     .and_then(Value::as_str)
-                    .unwrap_or_default();
-                Ok(docker::list_payload(output))
+                    .unwrap_or_default()
+                    .to_string();
+                // Windows OpenSSH 默认 shell 没有 sh，heredoc 输不出任何
+                // 探针标记：多花一个往返用 cmd 版采集器重试。
+                if docker::needs_windows_fallback(&output) {
+                    if let Ok(win_response) = self.runtime.block_on(self.ssh.exec(
+                        session_id,
+                        None,
+                        &docker::win_list_script(&engine),
+                        false,
+                        Some(docker::LIST_TIMEOUT.as_secs()),
+                    )) {
+                        let win_output = win_response
+                            .get("output")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !docker::needs_windows_fallback(win_output) {
+                            output = win_output.to_string();
+                        }
+                    }
+                }
+                let payload = docker::list_payload(&output);
+                if payload["needsSudo"] != true {
+                    return Ok(payload);
+                }
+                // found-but-denied 且本连接配置了 Quick Sudo：用同一管线
+                // （sudo -S sh -c '<body>'，密码走 stdin、脚本体走 argv）
+                // 提权重采。只读连接/白名单拒绝/提权失败都退回原 payload，
+                // 保留 needsSudo 提示而不是让只读调用报错。
+                let body = docker::list_body(&engine);
+                if self
+                    .runtime
+                    .block_on(self.ssh.ensure_sudo_allowed(session_id, &body))
+                    .is_err()
+                {
+                    return Ok(payload);
+                }
+                if let Ok(sudo_response) = self.runtime.block_on(self.ssh.exec(
+                    session_id,
+                    None,
+                    &body,
+                    true,
+                    Some(docker::LIST_TIMEOUT.as_secs()),
+                )) {
+                    let sudo_output = sudo_response
+                        .get("output")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let sudo_payload = docker::list_payload(sudo_output);
+                    if sudo_payload["available"] == true {
+                        return Ok(sudo_payload);
+                    }
+                }
+                Ok(payload)
             }
             "docker/logs" => {
-                let session_id = required_string(&params, "sessionId")?;
                 let container_id = required_string(&params, "containerId")?;
                 let tail = optional_u64(&params, "tail", docker::TAIL_DEFAULT);
-                let script = docker::logs_script(container_id, tail)?;
+                let engine = docker::parse_engine(&params)?;
+                if docker::parse_target(&params)? == docker::DockerTarget::Local {
+                    return self
+                        .runtime
+                        .block_on(docker::collect_logs_local(&engine, container_id, tail));
+                }
+                let session_id = required_string(&params, "sessionId")?;
+                let script = docker::logs_script(&engine, container_id, tail)?;
                 let response = self.runtime.block_on(self.ssh.exec(
                     session_id,
                     None,
@@ -1187,21 +1253,116 @@ impl Plugin {
                     false,
                     Some(docker::LOGS_TIMEOUT.as_secs()),
                 ))?;
-                let output = response
+                let mut output = response
                     .get("output")
                     .and_then(Value::as_str)
-                    .unwrap_or_default();
-                Ok(docker::logs_payload(output))
+                    .unwrap_or_default()
+                    .to_string();
+                // Windows 兜底：heredoc 报废时把 inspect/logs 两步拆成裸
+                // 命令直跑（cmd 可执行），本地拼回标记文本复用同一解析；
+                // 端点经 cmd set 前缀带过（charset 白名单保证 cmd 惰性）。
+                if docker::needs_windows_fallback(&output) {
+                    let tail_clamped = docker::clamp_tail(tail).to_string();
+                    let inspect = self.runtime.block_on(self.ssh.exec(
+                        session_id,
+                        None,
+                        &format!(
+                            "{}{} inspect {container_id}",
+                            engine.cmd_env_prefix(),
+                            engine.cli
+                        ),
+                        false,
+                        Some(docker::LOGS_TIMEOUT.as_secs()),
+                    ));
+                    let logs = self.runtime.block_on(self.ssh.exec(
+                        session_id,
+                        None,
+                        &format!(
+                            "{}{} logs --tail {tail_clamped} {container_id}",
+                            engine.cmd_env_prefix(),
+                            engine.cli
+                        ),
+                        false,
+                        Some(docker::LOGS_TIMEOUT.as_secs()),
+                    ));
+                    if let (Ok(inspect), Ok(logs)) = (inspect, logs) {
+                        output = format!(
+                            "DBXDOCKER_INSPECT\n{}\nDBXDOCKER_LOGS\n{}",
+                            inspect
+                                .get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            logs.get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                // daemon socket 权限签名（logs 段 2>&1 合并了错误）→ Quick
+                // Sudo 提权重采；任何失败都退回原输出，payload 恒良构。
+                if docker::is_daemon_permission_failure(1, &output) {
+                    let body = docker::sudo_logs_body(&engine, container_id, tail)?;
+                    if self
+                        .runtime
+                        .block_on(self.ssh.ensure_sudo_allowed(session_id, &body))
+                        .is_ok()
+                    {
+                        if let Ok(sudo_response) = self.runtime.block_on(self.ssh.exec(
+                            session_id,
+                            None,
+                            &body,
+                            true,
+                            Some(docker::LOGS_TIMEOUT.as_secs()),
+                        )) {
+                            let sudo_output = sudo_response
+                                .get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if sudo_output.contains("DBXDOCKER_LOGS") {
+                                return Ok(docker::logs_payload(sudo_output));
+                            }
+                        }
+                    }
+                }
+                Ok(docker::logs_payload(&output))
             }
             "docker/action" => {
-                let session_id = required_string(&params, "sessionId")?;
                 let container_id = required_string(&params, "containerId")?;
                 docker::validate_container_id(container_id)?;
                 let action = docker::parse_action(required_string(&params, "action")?)?;
+                let engine = docker::parse_engine(&params)?;
+                if docker::parse_target(&params)? == docker::DockerTarget::Local {
+                    // 本机动作同样先审计再执行；本机没有只读连接语义，
+                    // 破坏性确认由前端/MCP 确认门承担。
+                    docker::audit_action_intent(
+                        &self.ssh.data_dir(),
+                        &docker::action_command(&engine, action, container_id),
+                    );
+                    let started = std::time::Instant::now();
+                    return match self
+                        .runtime
+                        .block_on(docker::perform_action_local(&engine, container_id, action))
+                    {
+                        Ok(payload) => Ok(payload),
+                        Err(error) => {
+                            docker::audit_action_failure(
+                                &self.ssh.data_dir(),
+                                &docker::action_command(&engine, action, container_id),
+                                &error,
+                                started.elapsed().as_millis() as u64,
+                            );
+                            Err(error)
+                        }
+                    };
+                }
+                let session_id = required_string(&params, "sessionId")?;
                 // 只读连接直接拒绝：动作会改变远端容器状态。
                 self.runtime
                     .block_on(self.ssh.ensure_writable(session_id))?;
-                let command = docker::action_command(action, container_id);
+                // 审计/展示文本用短形态（cli 动词 id）；实际执行命令额外
+                // 带端点 export 前缀（POSIX），sudo 回落重放同一条文本。
+                let command = docker::action_command(&engine, action, container_id);
+                let exec_text = docker::exec_command(&engine, action, container_id);
                 // 执行前写审计（意图行）：即使 sidecar 中途退出，账本上也留
                 // 有一条记录；失败时补一行带错误详情的失败行。
                 docker::audit_action_intent(&self.ssh.data_dir(), &command);
@@ -1209,7 +1370,7 @@ impl Plugin {
                 let plain = self.runtime.block_on(self.ssh.exec(
                     session_id,
                     None,
-                    &command,
+                    &exec_text,
                     false,
                     Some(docker::ACTION_TIMEOUT.as_secs()),
                 ))?;
@@ -1237,11 +1398,11 @@ impl Plugin {
                     // ssh/exec 同一条 Quick Sudo 管线（编排凭据、use_pty、
                     // keepalive 全部复用），连接级 sudoers 白名单同语义生效。
                     self.runtime
-                        .block_on(self.ssh.ensure_sudo_allowed(session_id, &command))?;
+                        .block_on(self.ssh.ensure_sudo_allowed(session_id, &exec_text))?;
                     return match self.runtime.block_on(self.ssh.exec(
                         session_id,
                         None,
-                        &command,
+                        &exec_text,
                         true,
                         Some(docker::ACTION_TIMEOUT.as_secs()),
                     )) {
@@ -1256,7 +1417,8 @@ impl Plugin {
                     };
                 }
                 Err(failure(format!(
-                    "docker {} failed (exit {}): {}",
+                    "{} {} failed (exit {}): {}",
+                    engine.cli,
                     action.as_str(),
                     exit_code,
                     output

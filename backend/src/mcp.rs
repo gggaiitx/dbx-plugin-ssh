@@ -1158,14 +1158,17 @@ impl McpState {
                 "command"
             };
             // docker_action carries no `command` argument: derive the exact
-            // approval text (`docker rm <id>`) from the validated action so
+            // approval text (`docker rm <id>`, or the configured container
+            // CLI for podman/custom daemons) from the validated action so
             // the dialog shows precisely what will run, and a malformed
-            // id/action fails here instead of after approval.
+            // id/action/engine parameter fails here instead of after
+            // approval.
             let command: String = if name == "docker_action" {
                 let container_id = required_str(arguments, "containerId")?;
                 docker::validate_container_id(container_id)?;
                 let action = docker::parse_action(required_str(arguments, "action")?)?;
-                docker::action_command(action, container_id)
+                let engine = docker::parse_engine(arguments)?;
+                docker::action_command(&engine, action, container_id)
             } else {
                 required_str(arguments, command_key)?.to_string()
             };
@@ -1641,10 +1644,30 @@ impl McpState {
                         })
                     }
                     "docker_list" => {
-                        // Read-only collection on the pooled connection; the
-                        // probe degrades to available:false instead of erroring.
-                        let connection = self.connection(arguments).await?;
-                        docker::collect_list(&connection).await
+                        // target:"local" queries the daemon on the machine
+                        // the sidecar runs on — no connection to resolve.
+                        // Otherwise read-only collection on the pooled
+                        // connection; the probe degrades to available:false
+                        // instead of erroring. Optional cli/socket/host
+                        // parameters retarget Podman or a custom daemon.
+                        let engine = docker::parse_engine(arguments)?;
+                        if docker::parse_target(arguments)? == docker::DockerTarget::Local {
+                            docker::collect_list_local(&engine).await
+                        } else {
+                            let connection = self.connection(arguments).await?;
+                            // Quick Sudo credentials resolve from local
+                            // sources only; resolution failure degrades to
+                            // None and the collector keeps the needsSudo
+                            // hint instead of elevating.
+                            let stored = self
+                                .registered_connection_by_ref(arguments)
+                                .await
+                                .ok()
+                                .flatten();
+                            let sudo_auth =
+                                self.resolve_sudo_auth(arguments, None, stored).await.ok();
+                            docker::collect_list(&connection, sudo_auth.as_ref(), &engine).await
+                        }
                     }
                     "docker_action" => {
                         // Validation before any connection I/O (same
@@ -1652,26 +1675,33 @@ impl McpState {
                         let container_id = required_str(arguments, "containerId")?;
                         docker::validate_container_id(container_id)?;
                         let action = docker::parse_action(required_str(arguments, "action")?)?;
-                        let connection = self.connection(arguments).await?;
-                        // Quick Sudo credentials resolve up front from local
-                        // sources only (registry + profile store); a resolution
-                        // failure degrades to None and the fallback surfaces
-                        // the configuration guidance. No password argument
-                        // exists on this tool by contract.
-                        let stored = self
-                            .registered_connection_by_ref(arguments)
+                        let engine = docker::parse_engine(arguments)?;
+                        if docker::parse_target(arguments)? == docker::DockerTarget::Local {
+                            docker::perform_action_local(&engine, container_id, action).await
+                        } else {
+                            let connection = self.connection(arguments).await?;
+                            // Quick Sudo credentials resolve up front from local
+                            // sources only (registry + profile store); a resolution
+                            // failure degrades to None and the fallback surfaces
+                            // the configuration guidance. No password argument
+                            // exists on this tool by contract.
+                            let stored = self
+                                .registered_connection_by_ref(arguments)
+                                .await
+                                .ok()
+                                .flatten();
+                            let sudo_auth =
+                                self.resolve_sudo_auth(arguments, None, stored).await.ok();
+                            docker::perform_action(
+                                &connection,
+                                sudo_auth.as_ref(),
+                                false,
+                                &engine,
+                                container_id,
+                                action,
+                            )
                             .await
-                            .ok()
-                            .flatten();
-                        let sudo_auth = self.resolve_sudo_auth(arguments, None, stored).await.ok();
-                        docker::perform_action(
-                            &connection,
-                            sudo_auth.as_ref(),
-                            false,
-                            container_id,
-                            action,
-                        )
-                        .await
+                        }
                     }
                     other => self.sftp_tool(other, arguments).await,
                 };
@@ -4636,6 +4666,45 @@ fn connection_selector_requirements() -> Value {
     ])
 }
 
+/// Selector anyOf for the docker family: unlike pure SSH tools it also
+/// accepts `{"target": "local"}` — the daemon on the machine the sidecar
+/// runs on (Docker Desktop, OrbStack) — so agents can reach local docker
+/// without inventing an SSH connection.
+fn docker_selector_requirements() -> Value {
+    json!([
+        { "required": ["target"] },
+        { "required": ["connectionId"] },
+        { "required": ["connectionName"] },
+        { "required": ["host", "username"] },
+    ])
+}
+
+const TARGET_PROPERTY: (&str, &str, &str) = (
+    "target",
+    "string",
+    "\"local\" to query the Docker daemon on the machine this MCP server runs on (Docker Desktop, OrbStack, rootless); omit or \"ssh\" to target the SSH connection selected by connectionId/connectionName/host+username. Exactly one of target/local-connection arguments must be present",
+);
+
+/// Engine/endpoint properties shared by the docker family: they retarget
+/// the call to Podman or a custom daemon (rootless socket, remote tcp
+/// daemon) without inventing a new tool. The endpoint rides the engine's
+/// own env var (DOCKER_HOST / CONTAINER_HOST), never a shell flag.
+const DOCKER_CLI_PROPERTY: (&str, &str, &str) = (
+    "cli",
+    "string",
+    "Container CLI to run on the target machine: binary name or full path (default \"docker\"; e.g. \"podman\", \"/usr/local/bin/podman\", \"C:\\\\Program Files\\\\Podman\\\\podman.exe\"). Letters, digits and _ . / \\ : - only",
+);
+const DOCKER_SOCKET_PROPERTY: (&str, &str, &str) = (
+    "socket",
+    "string",
+    "Daemon unix socket for this call (e.g. \"/run/user/1000/podman/podman.sock\"; a bare path gains unix://). Mutually exclusive with host; applied via DOCKER_HOST/CONTAINER_HOST env vars",
+);
+const DOCKER_HOSTTCP_PROPERTY: (&str, &str, &str) = (
+    "host",
+    "string",
+    "Daemon tcp endpoint for this call (e.g. \"127.0.0.1:2375\" or \"tcp://10.0.0.8:2376\"). Mutually exclusive with socket; applied via DOCKER_HOST/CONTAINER_HOST env vars",
+);
+
 /// Advisory MCP tool annotations (spec "Tool annotations"): per-tool hints
 /// clients may use to pre-approve read-only tools or gate destructive ones.
 /// Advisory only — the server-side gates (mcp_safety whitelist, confirm
@@ -4719,8 +4788,8 @@ fn tool_title(name: &str) -> Option<&'static str> {
         "ssh_run_bg" => "Start background SSH task",
         "ssh_task_status" => "Poll background SSH task",
         "ssh_metrics" => "Collect server metrics",
-        "docker_list" => "List Docker containers",
-        "docker_action" => "Manage Docker container",
+        "docker_list" => "List containers (Docker/Podman; SSH host or local daemon)",
+        "docker_action" => "Manage container (Docker/Podman; SSH host or local daemon)",
         "ssh_alert_triage" => "SSH alert triage",
         "ssh_close" => "Close SSH connection",
         "ssh_test_connection" => "Test SSH connection",
@@ -4851,24 +4920,28 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "docker_list",
-            "description": "List Docker containers on a remote host (docker ps -a via read-only shell collection): name, image, state, status, ports, creation time. When the docker CLI is missing or the daemon socket is denied, available=false and containers=[] instead of an error; needsSudo=true marks the denied case, where lifecycle actions can still run through the connection's Quick Sudo credentials.",
+            "description": "List containers on a remote SSH host, or on the local machine with {\"target\":\"local\"} (docker/podman ps -a via read-only shell collection): name, image, state, status, ports, creation time. Works with Docker and Podman: pass cli (e.g. \"podman\") and optionally socket or host (mutually exclusive) to retarget the daemon — the endpoint rides DOCKER_HOST/CONTAINER_HOST env vars, never a shell flag. When the CLI is missing or the daemon socket is denied, available=false and containers=[] instead of an error; needsSudo=true marks the denied case, where lifecycle actions can still run through the connection's Quick Sudo credentials.",
             "inputSchema": {
                 "type": "object",
-                "properties": connection_properties(&[]),
-                "anyOf": connection_selector_requirements(),
+                "properties": connection_properties(&[TARGET_PROPERTY, DOCKER_CLI_PROPERTY, DOCKER_SOCKET_PROPERTY, DOCKER_HOSTTCP_PROPERTY]),
+                "anyOf": docker_selector_requirements(),
             },
         },
         {
             "name": "docker_action",
-            "description": "Run a lifecycle action (start | stop | restart | kill | rm) on one remote Docker container. DESTRUCTIVE for rm (removes the container) and kill (SIGKILL): get explicit human confirmation in the frontend/dialog before sending them - start/stop/restart are reversible and do not need one. containerId must be 12-64 lowercase hex characters; the tool never accepts passwords. Plain execution first; only a daemon-socket permission failure retries through the connection's Quick Sudo credentials (piped over stdin, never the command line). Read-only connections are refused.",
+            "description": "Run a lifecycle action (start | stop | restart | kill | rm) on one container on a remote SSH host, or on the local machine with {\"target\":\"local\"}. Works with Docker and Podman: pass cli (e.g. \"podman\") and optionally socket or host (mutually exclusive) to retarget the daemon. DESTRUCTIVE for rm (removes the container) and kill (SIGKILL): get explicit human confirmation in the frontend/dialog before sending them - start/stop/restart are reversible and do not need one. containerId must be 12-64 lowercase hex characters; the tool never accepts passwords. Plain execution first; only a daemon-socket permission failure retries through the connection's Quick Sudo credentials (piped over stdin, never the command line). Read-only connections are refused.",
             "inputSchema": {
                 "type": "object",
                 "properties": connection_properties(&[
+                    TARGET_PROPERTY,
+                    DOCKER_CLI_PROPERTY,
+                    DOCKER_SOCKET_PROPERTY,
+                    DOCKER_HOSTTCP_PROPERTY,
                     ("containerId", "string", "Container id (12-64 lowercase hex characters, as returned by docker_list)"),
                     ("action", "string", "Lifecycle action: start | stop | restart | kill | rm. rm/kill are destructive and need explicit human confirmation"),
                 ]),
                 "required": ["containerId", "action"],
-                "anyOf": connection_selector_requirements(),
+                "anyOf": docker_selector_requirements(),
             },
         },
         {

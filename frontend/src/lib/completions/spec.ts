@@ -447,3 +447,20 @@ function rankRows(rows: CompletionRow[]): CompletionRow[] {
     .sort((a, b) => (b.score - a.score) || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0))
     .slice(0, SPEC_COMPLETION_MAX_ROWS);
 }
+
+// ---------------------------------------------------------------------------
+// 接受候选时的行替换（issue #120）：候选 token 只替换行尾正在输入的词，
+// 已敲的命令前缀必须原样保留——此前把整行换成单个 token，`git ch` + Enter
+// 接受 checkout 后行变成 `checkout `，命令前缀被抹掉（"之前的输入被覆盖"）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 把 line 的行尾非空白 token 替换为 token（space 为 true 时补一个空格进入
+ * 下一层）；行尾是空白（或空行）时在原行后直接追加。与 matchSpecLine 的
+ * 行尾 token 语义配套：candidate token 即「行尾正在输入的词」的替换文本。
+ */
+export function lineWithTrailingTokenReplaced(line: string, token: string, space: boolean): string {
+  const trailing = /\S+$/.exec(line);
+  const start = trailing ? trailing.index : line.length;
+  return `${line.slice(0, start)}${token}${space ? " " : ""}`;
+}
