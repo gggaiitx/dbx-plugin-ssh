@@ -154,7 +154,8 @@ import { cursorAbsoluteRow, cursorViewportRow } from "./lib/terminalAnchor";
 import { canShowSuggestions, createSuggestionGuardState, type SuggestionGuardState } from "./lib/suggestionGuard";
 // 结构化补全（对标 Warp/fig，线 2）：spec 命中时优先于历史建议浮层展示
 // 带描述的命令/flag/值候选；开关读 pluginStore（SettingsDialog 自治写入）。
-import { lineWithTrailingTokenReplaced, matchSpecLine, type CompletionLevel, type CompletionRow } from "./lib/completions/spec";
+import { lineWithTrailingTokenReplaced, matchSpecLine, SPEC_COMPLETION_MAX_ROWS, type CompletionLevel, type CompletionRow, type SpecMatch } from "./lib/completions/spec";
+import { pickDynamicCompletionProvider } from "./lib/completions/provider";
 import { COMPLETION_SPECS } from "./lib/completions/specs";
 import { displayPathToWire, hasLossyChars, sanitizeNameEncoding, type SftpNameEncoding } from "./lib/sftpName";
 import { clampTransferConcurrency, clampTransferDownloadLimit, clampTransferMaxActive, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy } from "./lib/transferQueue";
@@ -930,13 +931,51 @@ function closeCompletionMenu() {
   completionActiveIndex.value = 0;
 }
 
-function openCompletionMenu(commandPath: string[], level: CompletionLevel, rows: CompletionRow[]) {
-  completionCommandPath.value = commandPath;
-  completionLevel.value = level;
-  completionRows.value = rows;
+function openCompletionMenu(match: SpecMatch) {
+  completionCommandPath.value = match.commandPath;
+  completionLevel.value = match.level;
+  completionRows.value = match.rows;
   completionActiveIndex.value = 0;
   completionAnchor.value = readTerminalSuggestionAnchor();
   completionOpen.value = true;
+  // hint 层（动态值）异步询问 provider：有注册的 provider 且返回候选时，
+  // 占位 hint 行被真实候选替换；未注册时保持 hint + Tab 透传（零回归）。
+  void fetchDynamicCompletionRows(match);
+}
+
+// 动态 provider 询问（review 第三批地基）：递增 token 使过期响应作废
+// （菜单已关 / 行已变 / 更新的请求已发出时丢弃）；超时兜底防远端卡死。
+let dynamicCompletionFetchToken = 0;
+const DYNAMIC_COMPLETION_TIMEOUT_MS = 1200;
+
+async function fetchDynamicCompletionRows(match: SpecMatch) {
+  // 只对"整层都是 hint"的动态层询问 provider：静态枚举/子命令已有真实候选。
+  if (!match.dynamic || !match.rows.length || match.rows.some((row) => row.kind !== "hint")) return;
+  const provider = pickDynamicCompletionProvider({ commandPath: match.commandPath, target: match.dynamic, prefix: "" });
+  if (!provider) return;
+  const token = ++dynamicCompletionFetchToken;
+  const lineAtRequest = pendingTerminalInput;
+  let values: string[] | null = null;
+  try {
+    values = await Promise.race([
+      provider.complete({ commandPath: match.commandPath, target: match.dynamic, prefix: "" }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), DYNAMIC_COMPLETION_TIMEOUT_MS)),
+    ]);
+  } catch {
+    values = null;
+  }
+  if (token !== dynamicCompletionFetchToken || !values?.length) return;
+  if (!completionOpen.value || completionCommandPath.value.join(" ") !== match.commandPath.join(" ") || pendingTerminalInput !== lineAtRequest) return;
+  const providerRows: CompletionRow[] = values.slice(0, SPEC_COMPLETION_MAX_ROWS).map((value) => ({
+    kind: "value",
+    token: value,
+    space: true,
+    label: value,
+    description: provider.label,
+    score: 1000,
+  }));
+  completionRows.value = providerRows;
+  completionActiveIndex.value = 0;
 }
 
 /**
@@ -1000,7 +1039,7 @@ function refreshCompletionMenu() {
   }
   const match = matchSpecLine(pendingTerminalInput, COMPLETION_SPECS);
   if (match && match.rows.length) {
-    openCompletionMenu(match.commandPath, match.level, match.rows);
+    openCompletionMenu(match);
   } else {
     closeCompletionMenu();
   }
@@ -2561,7 +2600,13 @@ function createTerminal() {
   terminalHost.value.addEventListener("mousedown", terminalMouseDownHandler);
   terminalMouseUpHandler = (event) => handleTerminalMouseUp(event);
   terminalHost.value.addEventListener("mouseup", terminalMouseUpHandler);
-  resizeObserver = new ResizeObserver(scheduleFit);
+  // 终端宿主尺寸变化（窗口缩放/命令条让位）时：fit 重排行数之外，还要
+  // 重读建议浮层锚点——光标行/列的像素位置随行高与滚动变化，浮层开着时
+  // 停在旧位置会错位或越过新边界（review 第二批：resize 主动重定位）。
+  resizeObserver = new ResizeObserver(() => {
+    scheduleFit();
+    syncSuggestionAnchorsOnSettle();
+  });
   resizeObserver.observe(terminalHost.value);
   if (webglEnabled.value && !wallpaperActive.value) {
     webglRenderer.value = attachWebglRenderer(terminal, () => new WebglAddon(), webglRecoveryOptions());
@@ -3046,7 +3091,7 @@ function refreshSuggestionsAfterInput(data: string, lineBefore: string) {
     if (specMatch && specMatch.rows.length) {
       suggestionOpen.value = false;
       suggestionItems.value = [];
-      openCompletionMenu(specMatch.commandPath, specMatch.level, specMatch.rows);
+      openCompletionMenu(specMatch);
       return;
     }
   }

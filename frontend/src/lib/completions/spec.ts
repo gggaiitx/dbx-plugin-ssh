@@ -75,7 +75,15 @@ export interface SpecMatch {
   commandPath: string[];
   level: CompletionLevel;
   rows: CompletionRow[];
+  /**
+   * 本层涉及动态值（本地不可枚举，spec 只出占位 hint）时的目标形状：
+   * 供动态 provider（lib/completions/provider.ts）异步询问；无则为静态层。
+   */
+  dynamic?: DynamicCompletionTarget;
 }
+
+// provider.ts 只导出类型、无运行时依赖（避免 spec → provider 的运行时耦合）。
+import type { DynamicCompletionTarget } from "./provider";
 
 export const SPEC_COMPLETION_MAX_ROWS = 20;
 
@@ -325,7 +333,7 @@ export function matchSpecLine(line: string, specs: CompletionSpecs): SpecMatch |
       const flag = findFlag(command, bareName);
       const valuePrefix = partial.slice(equals + 1);
       if (flag) {
-        return { commandPath, level: "value", rows: valueRows(flag, valuePrefix, typedFlagPrefix) };
+        return { commandPath, level: "value", rows: valueRows(flag, valuePrefix, typedFlagPrefix), dynamic: { kind: "flag-value", flag: flag.name } };
       }
       return { commandPath, level: "value", rows: [] };
     }
@@ -333,10 +341,13 @@ export function matchSpecLine(line: string, specs: CompletionSpecs): SpecMatch |
   }
   // value 层：上一个完整 token 是等待值的 flag（如 `kubectl get -o `）。
   if (pendingValueFlag) {
-    return { commandPath, level: "value", rows: valueRows(pendingValueFlag, partial, "") };
+    return { commandPath, level: "value", rows: valueRows(pendingValueFlag, partial, ""), dynamic: { kind: "flag-value", flag: pendingValueFlag.name } };
   }
   // sub 层：子命令 + 位置参数候选（-- 终结符之后不再拿 flags 兜底）。
-  return { commandPath, level: "sub", rows: terminated ? subRows(command, partial, positionalFilled, false) : subRows(command, partial, positionalFilled, true) };
+  const positionalDynamic = !positionalFilled && command.positional?.dynamic
+    ? { kind: "positional", name: command.positional.name } as const
+    : undefined;
+  return { commandPath, level: "sub", rows: terminated ? subRows(command, partial, positionalFilled, false) : subRows(command, partial, positionalFilled, true), dynamic: positionalDynamic };
 }
 
 /** flag 候选：长名行 + （当前前缀恰为某短名时的短名行）；`--` 与 `-` 全量展开。 */

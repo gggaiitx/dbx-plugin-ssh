@@ -41,6 +41,7 @@ const rootEl = ref<HTMLElement | null>(null);
 const placement = ref<"below" | "above">("below");
 const overlayBottom = ref(0);
 const constrainedHeight = ref(0);
+const clampedLeft = ref(0);
 
 // DOM 更新后按浮层实际高度选放置侧：条目数/锚点变化都重测。宿主高度取
 // 包含块（terminal-pane）实测，不依赖外部下发，batch-bar 让位等也自动正确。
@@ -67,10 +68,18 @@ watchEffect(() => {
 
 const style = computed(() => {
   if (!props.anchor) return undefined;
-  const left = `${overlayLeft(props.anchor.x, props.anchor.cellWidth ?? 0)}px`;
+  // 右边缘越界（review 第二批）：浮层右缘超出可视区时整体左移，两侧各留
+  // 8px 边距；宁向左展开也不被右缘裁切。同步读取包含块宽与自身宽
+  // （不可测时不 clamp，保持光标贴合的默认行为）。
+  let left = overlayLeft(props.anchor.x, props.anchor.cellWidth ?? 0);
+  const el = rootEl.value;
+  const viewportWidth = el?.parentElement?.clientWidth ?? 0;
+  if (el && viewportWidth > 0) {
+    left = Math.min(left, Math.max(8, viewportWidth - el.offsetWidth - 8));
+  }
   const maxHeight = constrainedHeight.value > 0 ? { maxHeight: `${constrainedHeight.value}px` } : undefined;
-  if (placement.value === "above") return { left, bottom: `${overlayBottom.value}px`, ...maxHeight };
-  return { left, top: `${overlayBelowTop(props.anchor.y, props.anchor.cellHeight ?? 0)}px`, ...maxHeight };
+  if (placement.value === "above") return { left: `${left}px`, bottom: `${overlayBottom.value}px`, ...maxHeight };
+  return { left: `${left}px`, top: `${overlayBelowTop(props.anchor.y, props.anchor.cellHeight ?? 0)}px`, ...maxHeight };
 });
 
 const levelLabel = computed(() => {
