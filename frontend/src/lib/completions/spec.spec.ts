@@ -2,7 +2,7 @@
 // matchSpecLine 层级匹配（根前缀 → 子命令 → flag → 值，评分排序与截断）。
 // 语法分支用内联合成 spec 精确断言；真实数据集另跑冒烟断言（specs/index）。
 import { describe, expect, it } from "vitest";
-import { matchSpecLine, splitCommandLine, SPEC_COMPLETION_MAX_ROWS, type CompletionSpecs } from "./spec";
+import { lineWithTrailingTokenReplaced, matchSpecLine, splitCommandLine, SPEC_COMPLETION_MAX_ROWS, type CompletionSpecs } from "./spec";
 import { COMPLETION_SPECS } from "./specs";
 
 // ---------------------------------------------------------------------------
@@ -225,5 +225,26 @@ describe("matchSpecLine · bundled specs", () => {
   it("never yields rows for inputs outside the bundled set", () => {
     expect(matchSpecLine("htop --tree", COMPLETION_SPECS)).toBeNull();
     expect(matchSpecLine("git status --short ", COMPLETION_SPECS)?.rows.length ?? 0).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// lineWithTrailingTokenReplaced（issue #120）：接受候选只替换行尾 token，
+// 命令前缀保留；尾空白/空行时追加。防回归：整行被换成单个 token 的旧 bug。
+// ---------------------------------------------------------------------------
+describe("lineWithTrailingTokenReplaced", () => {
+  it("replaces only the trailing partial token and keeps the prefix", () => {
+    expect(lineWithTrailingTokenReplaced("git ch", "checkout", true)).toBe("git checkout ");
+    expect(lineWithTrailingTokenReplaced("git checkout --b", "--branch", true)).toBe("git checkout --branch ");
+    expect(lineWithTrailingTokenReplaced("kubectl get -o js", "json", true)).toBe("kubectl get -o json ");
+  });
+
+  it("appends after trailing whitespace or on an empty line", () => {
+    expect(lineWithTrailingTokenReplaced("git ", "add", true)).toBe("git add ");
+    expect(lineWithTrailingTokenReplaced("", "ls", true)).toBe("ls ");
+  });
+
+  it("keeps the line unchanged apart from the token when no space follows", () => {
+    expect(lineWithTrailingTokenReplaced("git st", "status", false)).toBe("git status");
   });
 });

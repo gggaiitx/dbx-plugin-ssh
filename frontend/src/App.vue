@@ -154,7 +154,7 @@ import { cursorAbsoluteRow, cursorViewportRow } from "./lib/terminalAnchor";
 import { canShowSuggestions, createSuggestionGuardState, type SuggestionGuardState } from "./lib/suggestionGuard";
 // 结构化补全（对标 Warp/fig，线 2）：spec 命中时优先于历史建议浮层展示
 // 带描述的命令/flag/值候选；开关读 pluginStore（SettingsDialog 自治写入）。
-import { matchSpecLine, type CompletionLevel, type CompletionRow } from "./lib/completions/spec";
+import { lineWithTrailingTokenReplaced, matchSpecLine, type CompletionLevel, type CompletionRow } from "./lib/completions/spec";
 import { COMPLETION_SPECS } from "./lib/completions/specs";
 import { displayPathToWire, hasLossyChars, sanitizeNameEncoding, type SftpNameEncoding } from "./lib/sftpName";
 import { clampTransferConcurrency, clampTransferDownloadLimit, clampTransferMaxActive, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy } from "./lib/transferQueue";
@@ -299,10 +299,13 @@ import { collectQuickSelectHits, type QuickSelectHit } from "./lib/quickSelect";
 import TerminalGutter from "./components/TerminalGutter.vue";
 import CommandSuggestions from "./components/CommandSuggestions.vue";
 import CompletionMenu from "./components/CompletionMenu.vue";
+import type { SuggestionAnchor } from "./lib/overlayPlacement";
 import ConnectingCard from "./components/ConnectingCard.vue";
 import GpuNpuMonitor from "./components/GpuNpuMonitor.vue";
 import FolderPickerDialog from "./components/FolderPickerDialog.vue";
 import SideNavPanel, { type SftpSideQuickPath } from "./components/SideNavPanel.vue";
+import DockerPanel from "./components/DockerPanel.vue";
+import DockerWhaleLogo from "./components/DockerWhaleLogo.vue";
 import { Switch } from "./components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "./components/ui/context-menu";
@@ -875,7 +878,7 @@ const filteredQuickCommands = computed(() => filterQuickCommands(quickCommands.v
 const suggestionOpen = ref(false);
 const suggestionItems = ref<CommandSuggestion[]>([]);
 const suggestionActiveIndex = ref(0);
-const suggestionAnchor = ref<{ x: number; y: number } | null>(null);
+const suggestionAnchor = ref<SuggestionAnchor | null>(null);
 const suggestionQuery = ref("");
 // 抑制门锁存（跟随型程序命中后保持抑制，Ctrl+C/q 解除）：非响应式即可，
 // 只有 canShowSuggestions 的返回值会进渲染。
@@ -911,7 +914,7 @@ const completionRows = ref<CompletionRow[]>([]);
 const completionLevel = ref<CompletionLevel>("sub");
 const completionCommandPath = ref<string[]>([]);
 const completionActiveIndex = ref(0);
-const completionAnchor = ref<{ x: number; y: number } | null>(null);
+const completionAnchor = ref<SuggestionAnchor | null>(null);
 
 function completionSpecEnabled(): boolean {
   try {
@@ -959,14 +962,15 @@ function handleCompletionKey(event: KeyboardEvent): boolean {
   return false;
 }
 
-/** 接受候选项：替换当前 token 并按新行内容刷新（无后续候选则关闭）。 */
+/** 接受候选项：替换行尾 token（保留命令前缀，issue #120「Enter 覆盖输入」）
+ *  并按新行内容刷新（无后续候选则关闭）。 */
 function acceptCompletionRow(row: CompletionRow) {
   if (!row.token) {
     closeCompletionMenu();
     terminal?.focus();
     return;
   }
-  replaceTerminalLineWith(row.token + (row.space ? " " : ""), false);
+  replaceTerminalLineWith(lineWithTrailingTokenReplaced(pendingTerminalInput, row.token, row.space), false);
   refreshCompletionMenu();
   if (!completionOpen.value) terminal?.focus();
 }
@@ -1571,11 +1575,26 @@ const selectedShellInjectable = computed<boolean | undefined>(() => {
 // 挂起 gutter/关键词高亮/动作链接扫描；回落到 64KiB 以下自动恢复并补扫一次。
 const outputGate = createOutputGate();
 let outputInFlightBytes = 0;
+// 建议浮层锚点的回显同步（issue #120「浮层离焦点太远」）：onData 时刻回显
+// 往往还在路上（SSH RTT），buffer 光标停在旧位置，浮层锚点持续滞后于输入；
+// 每批输出解析完成（settleOutputChunk）后重读锚点，浮层吸附到真实光标位。
+// rAF 合帧：大量输出（tail -f）时每帧至多测一次 rect。
+let suggestionAnchorSyncScheduled = false;
+function syncSuggestionAnchorsOnSettle() {
+  if (suggestionAnchorSyncScheduled) return;
+  suggestionAnchorSyncScheduled = true;
+  requestAnimationFrame(() => {
+    suggestionAnchorSyncScheduled = false;
+    if (suggestionOpen.value) suggestionAnchor.value = readTerminalSuggestionAnchor();
+    if (completionOpen.value) completionAnchor.value = readTerminalSuggestionAnchor();
+  });
+}
 function settleOutputChunk(chunk: Uint8Array) {
   outputInFlightBytes = Math.max(0, outputInFlightBytes - chunk.byteLength);
   // 写入完成回调同时是模式复评点；恢复时挂起的扫描由 onOutputGateRelease 补上。
   if (outputGate.feed(outputInFlightBytes) && outputGate.mode === "normal") onOutputGateRelease();
   stampGutterWrittenRows();
+  syncSuggestionAnchorsOnSettle();
 }
 function onOutputGateRelease() {
   showNotice(t("backpressure.released"));
@@ -3037,7 +3056,18 @@ function refreshSuggestionsAfterInput(data: string, lineBefore: string) {
  * 光标像素锚点：xterm 私有渲染尺寸（css.cell 宽高）× 光标缓冲坐标。
  * 读不到（渲染器未就绪/内部结构变化）返回 null，浮层降级贴终端底部。
  */
-function readTerminalSuggestionAnchor(): { x: number; y: number } | null {
+/**
+ * 建议浮层锚点（issue #120）：y 是光标行顶、cellHeight 是行高（翻转定位
+ * 需要）。以 .xterm-screen（渲染内容区，位于 .xterm 内边距内侧）为原点，
+ * 加光标网格坐标换算——自动计入内边距，贴合提示符/光标；textarea 平时被
+ * xterm 移出屏幕（CSS left:-9999em，仅 IME 时定位），不可用作锚点。
+ * 坐标相对终端宿主（浮层的 absolute 包含块）。
+ */
+// 翻转定位用的可视底界（terminal-host 实际高度，含让位后的净高）：
+// anchor 计算时顺带刷新，两个建议浮层据此决定下方/上方放置。
+const suggestionViewport = ref({ height: 0 });
+
+function readTerminalSuggestionAnchor(): SuggestionAnchor | null {
   if (!terminal || !terminalHost.value) return null;
   try {
     const core = (terminal as unknown as { _core?: { _renderService?: { dimensions?: { css?: { cell?: { width?: number; height?: number } } } } } })._core;
@@ -3048,7 +3078,20 @@ function readTerminalSuggestionAnchor(): { x: number; y: number } | null {
     const buffer = terminal.buffer.active;
     // cursorY 已是视口内相对行；旧式 `cursorY - viewportY` 在回滚区出现后为负，浮层画出画布。
     const visibleRow = cursorViewportRow(buffer);
-    return { x: Math.round(buffer.cursorX * cellWidth), y: Math.round((visibleRow + 1) * cellHeight) };
+    const screen = terminal.element?.querySelector(".xterm-screen");
+    const hostRect = terminalHost.value.getBoundingClientRect();
+    const origin = (screen ?? terminal.element)?.getBoundingClientRect();
+    if (!origin) return null;
+    // 翻转定位的可视底界 = terminal-host 实际高度：batch-bar/标记条让位
+    // （inset-bottom）后它比包含块 pane 矮，必须用 host 高度，否则浮层会
+    // 越过终端文字区盖住 footer/批量条（issue #120 实机反馈）。
+    suggestionViewport.value = { height: terminalHost.value.clientHeight };
+    return {
+      x: Math.round(origin.left - hostRect.left + buffer.cursorX * cellWidth),
+      y: Math.round(origin.top - hostRect.top + visibleRow * cellHeight),
+      cellHeight,
+      cellWidth,
+    };
   } catch {
     return null;
   }
@@ -5913,6 +5956,11 @@ function openAlertTriage() {
 // 端口映射（-L/-R）管理弹窗：全部逻辑在 components/PortForwardDialog.vue，
 // 这里只保留工具栏入口的开关状态。
 const forwardsOpen = ref(false);
+
+// Docker 容器面板（P2-4 迁移）：入口从 SFTP 侧栏 tab 独立为工具条鲸鱼按钮
+// （终端上方常驻，SFTP 面板关闭时也可见），面板本体仍由 DockerPanel 自治
+// （会话解析/轮询/动作/引擎设置都在组件内），关闭即卸载并停轮询。
+const dockerPanelOpen = ref(false);
 
 async function runAlertTriage() {
   if (alertTriageBusy.value) return;
@@ -10941,6 +10989,8 @@ function closeToolbarPopovers() {
   sessionMenuOpen.value = false;
   sessionMenuShellOpen.value = false;
   localShellSurfaceOpen.value = false;
+  // Docker 鲸鱼入口弹层：点空白/切 tab 等全局收口时一并关闭（幂等）。
+  dockerPanelOpen.value = false;
 }
 
 function closeMenus() {
@@ -10953,9 +11003,11 @@ function closeMenus() {
 }
 
 /** document click 收口：reka 菜单/弹层内容 portal 到 body，内部点击会冒泡到
- *  document——旧实现面板上有 @click.stop，内部点击从不触发这里的清扫，保持语义一致。 */
+ *  document——旧实现面板上有 @click.stop，内部点击从不触发这里的清扫，保持语义一致。
+ *  dialog-content 同样排除：模态弹窗（如 Docker 面板的日志抽屉/kill 确认）
+ *  portal 在工具条 popover 之外，点弹窗内部不该把背后的工具条弹层连带收掉。 */
 function onDocumentClickCloseMenus(event: MouseEvent) {
-  if ((event.target as HTMLElement | null)?.closest?.('[data-slot="context-menu-content"], [data-slot="popover-content"]')) return;
+  if ((event.target as HTMLElement | null)?.closest?.('[data-slot="context-menu-content"], [data-slot="popover-content"], [data-slot="dialog-content"]')) return;
   closeMenus();
 }
 
@@ -11706,6 +11758,19 @@ onBeforeUnmount(() => {
         <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('alertTriage.title')" @click="openAlertTriage"><Siren /></button>
         <!-- main 新增的端口转发入口同属 SSH 专属：沿用 A4 惯例在本地模式整体隐藏。 -->
         <button v-if="!localUiMode" class="icon-button icon-cyan" :title="t('forwards.title')" :disabled="!session" @click="forwardsOpen = true"><Network /></button>
+        <!-- Docker 容器面板（鲸鱼 logo 独立入口）：挂在终端上方工具条，SFTP
+             面板关闭时也可达；local 模式保留——本机 daemon（Docker Desktop/
+             OrbStack）场景照常可用。面板自治，v-if 关闭即停轮询。 -->
+        <div>
+          <Popover :open="dockerPanelOpen" @update:open="(open) => (dockerPanelOpen = open)">
+            <PopoverAnchor as-child>
+              <button class="icon-button icon-blue" :class="{ 'is-active': dockerPanelOpen }" :title="t('docker.toolbarTitle')" :aria-pressed="dockerPanelOpen" @click.stop="dockerPanelOpen = !dockerPanelOpen"><DockerWhaleLogo /></button>
+            </PopoverAnchor>
+            <PopoverContent class="popover docker-toolbar-popover" align="end" :side-offset="5">
+              <DockerPanel v-if="dockerPanelOpen" :t="t" />
+            </PopoverContent>
+          </Popover>
+        </div>
         <label v-if="!localUiMode" class="follow-directory-control" :title="t('followTerminal')">
           <Switch size="sm" :model-value="followDirectory" :disabled="!connected || panelSurface" @update:model-value="setDirectoryTracking" />
           <span>{{ t("followTerminal") }}</span>
@@ -11921,6 +11986,7 @@ onBeforeUnmount(() => {
           :items="suggestionItems"
           :active-index="suggestionActiveIndex"
           :anchor="suggestionAnchor"
+          :viewport="suggestionViewport"
           :t="t"
           @activate="(index) => (suggestionActiveIndex = index)"
           @fill="fillSuggestion"
@@ -11934,6 +12000,7 @@ onBeforeUnmount(() => {
           :command-path="completionCommandPath"
           :active-index="completionActiveIndex"
           :anchor="completionAnchor"
+          :viewport="suggestionViewport"
           :t="t"
           @activate="(index) => (completionActiveIndex = index)"
           @accept="acceptCompletionRow"

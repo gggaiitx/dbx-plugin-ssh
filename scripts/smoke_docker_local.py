@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Workbench-plane smoke for the docker family `target:"local"` plane.
+
+Drives the sidecar over the stdio-framed protocol (sidecar_client.py) and
+exercises the local-daemon path end to end: list → logs → idempotent start
+action → input validation. Offline-safe: a box without docker still passes
+the shape assertions (list degrades to available:false).
+
+Usage:
+    python3 scripts/smoke_docker_local.py [--binary path/to/dbx-plugin-ssh]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from sidecar_client import SidecarClient  # noqa: E402
+
+
+def docker_payload(result: dict) -> dict:
+    """Extracts the JSON body from a workbench invoke response."""
+    if isinstance(result, dict) and "output" not in result and "content" in result:
+        return json.loads(result["content"][0]["text"])
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", default=None, help="sidecar binary path")
+    args = parser.parse_args()
+
+    client = SidecarClient.start(binary=args.binary)
+    try:
+        client.initialize()
+
+        # 1) target:"local" list — shape always; contents only when a local
+        # docker daemon is actually reachable.
+        listed = client.request("docker/list", {"target": "local"}, timeout=30)
+        assert isinstance(listed, dict), f"list not a dict: {listed!r}"
+        assert isinstance(listed.get("available"), bool), listed
+        assert isinstance(listed.get("needsSudo"), bool), listed
+        assert isinstance(listed.get("containers"), list), listed
+        print(f"docker/list target=local ok: available={listed['available']}, "
+              f"{len(listed['containers'])} containers")
+
+        running = None
+        if listed["available"] and listed["containers"]:
+            rows = listed["containers"]
+            first = rows[0]
+            for key in ("id", "name", "image", "state", "status", "ports", "createdAt"):
+                assert key in first, f"missing column {key}: {first}"
+            running = next((c for c in rows if c.get("state") == "running"), None)
+            print(f"row shape ok ({len(rows)} rows)")
+
+        if running is None:
+            print("no reachable local daemon — skipping logs/action (shape-only pass)")
+            return 0
+
+        # 2) local logs: inspect summary + log tail.
+        logs = client.request(
+            "docker/logs",
+            {"target": "local", "containerId": running["id"], "tail": 20},
+            timeout=40,
+        )
+        assert isinstance(logs.get("logs"), str), logs
+        if logs.get("container") is not None:
+            assert logs["container"].get("id"), logs
+        print(f"docker/logs target=local ok: {len(logs['logs'])} bytes from "
+              f"{(logs.get('container') or {}).get('name', running['name'])}")
+
+        # 3) local action: `start` on a running container is idempotent and
+        # state-preserving (no destructive verb in smoke).
+        action = client.request(
+            "docker/action",
+            {"target": "local", "containerId": running["id"], "action": "start"},
+            timeout=70,
+        )
+        assert action.get("success") is True, action
+        print(f"docker/action target=local ok: start {running['name']}")
+
+        # 4) validation: unknown target and non-hex container names are
+        # refused before any process is spawned.
+        for method, params, expect in (
+            ("docker/list", {"target": "bogus"}, "Unsupported docker target"),
+            ("docker/action", {"target": "local", "containerId": "web-nginx", "action": "stop"},
+             "Invalid containerId"),
+        ):
+            try:
+                client.request(method, params, timeout=20)
+                raise AssertionError(f"{method} accepted invalid params: {params}")
+            except Exception as error:  # noqa: BLE001 - sidecar errors surface as exceptions
+                assert expect in str(error), f"{method}: unexpected error {error}"
+        print("validation ok (bogus target / non-hex id refused)")
+
+        # 5) engine/endpoint params (podman compat): mutually exclusive
+        # endpoints are refused up front; a shell-metacharacter cli never
+        # reaches a script; a podman-shaped list keeps the graceful
+        # available:false degrade when the named CLI is absent.
+        try:
+            client.request(
+                "docker/list",
+                {"target": "local", "socket": "/run/podman.sock", "host": "127.0.0.1:2375"},
+                timeout=20,
+            )
+            raise AssertionError("docker/list accepted socket+host together")
+        except Exception as error:  # noqa: BLE001
+            assert "mutually exclusive" in str(error), f"unexpected error {error}"
+        try:
+            client.request(
+                "docker/list",
+                {"target": "local", "cli": "podman; rm -rf /"},
+                timeout=20,
+            )
+            raise AssertionError("docker/list accepted metacharacter cli")
+        except Exception as error:  # noqa: BLE001
+            assert "Invalid cli" in str(error), f"unexpected error {error}"
+        podman_list = client.request(
+            "docker/list", {"target": "local", "cli": "definitely-not-a-real-cli"}, timeout=30
+        )
+        assert podman_list.get("available") is False, podman_list
+        assert podman_list.get("containers") == [], podman_list
+        print("engine params ok (conflict/metachar refused; missing-cli degrade)")
+        return 0
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -3,13 +3,21 @@
 // sub（子命令）/ flag（flag）/ value（静态枚举值）+ hint（动态占位提示，如
 // <branch>）。纯展示组件：键盘（↑↓/Tab/Enter/Esc）由 App 的
 // handleTerminalKey 在浮层开启时优先消费，浮层只反映 activeIndex 并把
-// 点击/悬停上抛；定位复用 CommandSuggestions 的光标像素锚点语义
-// （anchor=null 降级贴终端底部）。样式沿用既有建议浮层的面板视觉（同一
-// --panel/--border/--accent 变量体系），不引 reka 弹层——避免与 xterm
-// 键盘捕获争焦点。
-import { computed } from "vue";
+// 点击/悬停上抛；定位复用 CommandSuggestions 的光标像素锚点语义（y 为行
+// 顶；下方放不下翻到光标上方，两侧都不够选更大侧收窄内滚，issue #120）。
+// 样式沿用既有建议浮层的面板视觉（同一 --popover/--border/--accent 令牌
+// 体系，随宿主主题），不引 reka 弹层——避免与 xterm 键盘捕获争焦点。
+import { computed, ref, watchEffect } from "vue";
 import { ChevronRight, CornerDownRight, Flag, Info, SlidersHorizontal } from "@lucide/vue";
 import type { CompletionLevel, CompletionRow } from "../lib/completions/spec";
+import {
+  chooseOverlayPlacement,
+  flippedOverlayBottom,
+  overlayBelowTop,
+  overlayLeft,
+  overlayMaxHeight,
+  type SuggestionAnchor,
+} from "../lib/overlayPlacement";
 
 const props = defineProps<{
   rows: CompletionRow[];
@@ -17,8 +25,10 @@ const props = defineProps<{
   /** 解析到的命令节点路径（如 ["git", "checkout"]），作菜单头面包屑。 */
   commandPath: string[];
   activeIndex: number;
-  /** 光标像素坐标（相对终端宿主）；null = 定位不可用，贴终端底部。 */
-  anchor: { x: number; y: number } | null;
+  /** 光标格像素坐标（y 为光标行顶）；null = 定位不可用，贴终端底部。 */
+  anchor: SuggestionAnchor | null;
+  /** 终端可视底界（terminal-host 净高）；缺省时回落实测包含块高度。 */
+  viewport?: { height: number };
   t: (key: string, values?: Record<string, string | number>) => string;
 }>();
 
@@ -27,9 +37,37 @@ const emit = defineEmits<{
   accept: [row: CompletionRow];
 }>();
 
+const rootEl = ref<HTMLElement | null>(null);
+const placement = ref<"below" | "above">("below");
+const overlayBottom = ref(0);
+const constrainedHeight = ref(0);
+
+// DOM 更新后按浮层实际高度选放置侧：条目数/锚点变化都重测。宿主高度取
+// 包含块（terminal-pane）实测，不依赖外部下发，batch-bar 让位等也自动正确。
+watchEffect(() => {
+  const el = rootEl.value;
+  const anchor = props.anchor;
+  void props.rows.length;
+  if (!el || !anchor) {
+    placement.value = "below";
+    constrainedHeight.value = 0;
+    return;
+  }
+  const viewportHeight = props.viewport?.height || el.parentElement?.clientHeight || 0;
+  const cellHeight = anchor.cellHeight ?? 0;
+  const naturalHeight = el.offsetHeight;
+  placement.value = chooseOverlayPlacement(anchor.y, cellHeight, naturalHeight, viewportHeight);
+  overlayBottom.value = flippedOverlayBottom(anchor.y, viewportHeight);
+  const available = overlayMaxHeight(placement.value, anchor.y, cellHeight, viewportHeight);
+  constrainedHeight.value = available > 0 && available < naturalHeight ? available : 0;
+}, { flush: "post" });
+
 const style = computed(() => {
   if (!props.anchor) return undefined;
-  return { left: `${Math.max(0, props.anchor.x)}px`, top: `${Math.max(0, props.anchor.y)}px` };
+  const left = `${overlayLeft(props.anchor.x, props.anchor.cellWidth ?? 0)}px`;
+  const maxHeight = constrainedHeight.value > 0 ? { maxHeight: `${constrainedHeight.value}px` } : undefined;
+  if (placement.value === "above") return { left, bottom: `${overlayBottom.value}px`, ...maxHeight };
+  return { left, top: `${overlayBelowTop(props.anchor.y, props.anchor.cellHeight ?? 0)}px`, ...maxHeight };
 });
 
 const levelLabel = computed(() => {
@@ -49,7 +87,7 @@ function rowIcon(kind: CompletionRow["kind"]) {
 </script>
 
 <template>
-  <div class="completion-menu" :class="{ 'anchor-fallback': anchor === null }" :style="style" role="listbox" :aria-label="t('completionMenu.title')">
+  <div ref="rootEl" class="completion-menu" :class="{ 'anchor-fallback': anchor === null }" :style="style" role="listbox" :aria-label="t('completionMenu.title')">
     <div class="completion-head">
       <span class="completion-crumb mono">{{ breadcrumb }}</span>
       <span class="completion-level">{{ levelLabel }}</span>
@@ -76,6 +114,8 @@ function rowIcon(kind: CompletionRow["kind"]) {
 </template>
 
 <style scoped>
+/* 面板色随宿主主题（issue #120）：与 .notice/.metrics-float 同用
+   --popover/--border/--shadow-popover 令牌；文字色显式配对面板底。 */
 .completion-menu {
   position: absolute;
   z-index: 30;
@@ -83,10 +123,11 @@ function rowIcon(kind: CompletionRow["kind"]) {
   min-width: 280px;
   max-height: 44vh;
   overflow-y: auto;
-  background: var(--panel, #161b22);
-  border: 1px solid var(--border, #30363d);
+  background: var(--popover);
+  border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+  box-shadow: var(--shadow-popover);
+  color: var(--foreground);
   padding: 4px;
   display: flex;
   flex-direction: column;
@@ -104,7 +145,7 @@ function rowIcon(kind: CompletionRow["kind"]) {
   justify-content: space-between;
   gap: 8px;
   padding: 4px 8px 2px;
-  border-bottom: 1px solid var(--border, #30363d);
+  border-bottom: 1px solid var(--border);
 }
 
 .completion-crumb {
@@ -140,7 +181,7 @@ function rowIcon(kind: CompletionRow["kind"]) {
 }
 
 .completion-row.active {
-  background: var(--accent, #2f6feb33);
+  background: var(--accent);
 }
 
 .completion-row.hint .completion-label {

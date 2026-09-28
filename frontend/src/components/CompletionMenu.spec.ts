@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { mount } from "@vue/test-utils";
 import CompletionMenu from "./CompletionMenu.vue";
 import type { CompletionRow } from "../lib/completions/spec";
+import type { SuggestionAnchor } from "../lib/overlayPlacement";
 
 const t = (key: string) => {
   const table: Record<string, string> = {
@@ -23,7 +24,7 @@ const rows: CompletionRow[] = [
   { kind: "hint", token: "", space: false, label: "<branch>", description: "Dynamic value", score: 0 },
 ];
 
-function mountMenu(activeIndex = 0, level: "sub" | "flag" | "value" = "sub", anchor: { x: number; y: number } | null = { x: 40, y: 80 }) {
+function mountMenu(activeIndex = 0, level: "sub" | "flag" | "value" = "sub", anchor: SuggestionAnchor | null = { x: 40, y: 80, cellHeight: 18 }) {
   return mount(CompletionMenu, {
     props: { rows, level, commandPath: ["git", "checkout"], activeIndex, anchor, t },
   });
@@ -62,9 +63,10 @@ describe("CompletionMenu", () => {
     expect(wrapper.find(".completion-menu").attributes("style")).toBeUndefined();
   });
 
-  it("positions the panel at the cursor anchor when available", () => {
-    const wrapper = mountMenu(0, "sub", { x: 40, y: 80 });
-    expect(wrapper.find(".completion-menu").attributes("style")).toContain("left: 40px");
-    expect(wrapper.find(".completion-menu").attributes("style")).toContain("top: 80px");
+  it("positions the panel just below the cursor row when available", () => {
+    // 锚点 y 为光标行顶（textarea rect 语义）：top = 行顶 + 行高 + gap（issue #120）
+    const wrapper = mountMenu(0, "sub", { x: 40, y: 80, cellHeight: 18 });
+    expect(wrapper.find(".completion-menu").attributes("style")).toContain("left: 46px");
+    expect(wrapper.find(".completion-menu").attributes("style")).toContain("top: 104px");
   });
 });
