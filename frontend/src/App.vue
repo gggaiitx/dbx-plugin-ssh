@@ -155,7 +155,8 @@ import { canShowSuggestions, createSuggestionGuardState, type SuggestionGuardSta
 // 结构化补全（对标 Warp/fig，线 2）：spec 命中时优先于历史建议浮层展示
 // 带描述的命令/flag/值候选；开关读 pluginStore（SettingsDialog 自治写入）。
 import { matchSpecLine, SPEC_COMPLETION_MAX_ROWS, type CompletionLevel, type CompletionRow, type SpecMatch } from "./lib/completions/spec";
-import { pickDynamicCompletionProvider } from "./lib/completions/provider";
+import { pickDynamicCompletionProvider, registerDynamicCompletionProvider } from "./lib/completions/provider";
+import { createRemoteFsProvider } from "./lib/completions/remoteFsProvider";
 import { COMPLETION_SPECS } from "./lib/completions/specs";
 import { displayPathToWire, hasLossyChars, sanitizeNameEncoding, type SftpNameEncoding } from "./lib/sftpName";
 import { clampTransferConcurrency, clampTransferDownloadLimit, clampTransferMaxActive, runTransfers, sanitizeTransferDuplicatePolicy, type TransferDuplicatePolicy } from "./lib/transferQueue";
@@ -11432,6 +11433,15 @@ async function initialize() {
   // 外观偏好的 CSS 部分（终端内边距变量）与宿主是否推送 appearance 无关，
   // 开机先落一次，否则用户设了内边距要等下次主题推送才生效。
   applyTerminalPaddingVars();
+  // 远端 fs 动态补全（review 第三批 14 首实现）：数据源为 SFTP 面板已加载
+  // 条目（零新增远端调用）；面板未就绪/目录不一致时 provider 返回 null，
+  // hint 行保持 + Tab 透传 shell。
+  registerDynamicCompletionProvider(
+    createRemoteFsProvider(() => {
+      if (!sftpPaneOpen.value) return null;
+      return { currentPath: currentPath.value, entries: entries.value };
+    }),
+  );
   if (api.appearance) applyAppearance(api.appearance);
   else if (isDbxPluginTheme(api.theme)) applyAppearance(themeToAppearance(api.theme));
   // 宿主可能在 init 前先应答 host.getContext（如重推连接期间 init 被延迟）：

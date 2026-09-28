@@ -14,8 +14,9 @@ import { cargoSpec } from "./cargo";
 import { tmuxSpec } from "./tmux";
 import { curlSpec } from "./curl";
 import { grepSpec } from "./grep";
+import { cdSpec } from "./cd";
 
 /** 首批结构化补全 spec（顺序即同分排序外的稳定展示序）。 */
-export const COMPLETION_SPECS: CompletionSpecs = [gitSpec, dockerSpec, kubectlSpec, sshSpec, systemctlSpec, tmuxSpec, cargoSpec, npmSpec, pnpmSpec, yarnSpec, curlSpec, grepSpec];
+export const COMPLETION_SPECS: CompletionSpecs = [gitSpec, cdSpec, dockerSpec, kubectlSpec, sshSpec, systemctlSpec, tmuxSpec, cargoSpec, npmSpec, pnpmSpec, yarnSpec, curlSpec, grepSpec];
 
 export type { SpecCommand };
